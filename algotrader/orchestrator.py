@@ -166,10 +166,20 @@ class Orchestrator:
 
     def _import_strategies(self) -> None:
         """Import strategy modules to trigger @register_strategy decorators."""
-        try:
-            import algotrader.strategies.pairs_trading  # noqa: F401
-        except ImportError:
-            self._log.warning("pairs_trading_import_failed")
+        strategy_modules = [
+            "algotrader.strategies.pairs_trading",
+            "algotrader.strategies.gap_reversal",
+            "algotrader.strategies.momentum",
+            "algotrader.strategies.vwap_reversion",
+            "algotrader.strategies.options_premium",
+            "algotrader.strategies.sector_rotation",
+            "algotrader.strategies.event_driven",
+        ]
+        for module in strategy_modules:
+            try:
+                __import__(module)
+            except ImportError:
+                self._log.warning("strategy_import_failed", module=module)
 
     def warm_up(self) -> None:
         """Warm up all strategies with historical data."""

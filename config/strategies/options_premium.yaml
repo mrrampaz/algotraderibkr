@@ -1,0 +1,46 @@
+enabled: true
+capital_allocation_pct: 15.0
+max_positions: 3
+params:
+  # Underlyings
+  underlyings:
+    - SPY
+    - QQQ
+    - IWM
+
+  # Structure
+  structure: "credit_spread"      # "credit_spread" or "iron_condor"
+  short_delta_target: 14          # Target delta for short strike (10-16)
+  wing_width: 5                   # Points between short and long strikes
+
+  # Entry window
+  entry_start_hour: 10
+  entry_start_minute: 15
+  entry_end_hour: 10
+  entry_end_minute: 45
+
+  # DTE
+  target_dte: 0                   # 0DTE (same day expiry)
+  max_dte: 2                      # Fallback if 0DTE not available
+
+  # Filters
+  min_vix_proxy: 15.0             # Only sell when vol is elevated enough
+  use_sma5_filter: true           # Contrarian SMA5 filter
+
+  # Exit
+  profit_target_pct: 50.0         # Close at 50% of max profit
+  stop_loss_pct: 200.0            # Close at 200% of credit received (loss)
+  close_before_minutes: 15        # Close 15 min before market close
+
+  # Sizing
+  max_risk_per_trade: 500         # Max dollar risk per spread
+  max_contracts: 5                # Max contracts per position
+
+  # Regime filter
+  allowed_regimes:
+    - high_vol
+    - ranging
+    - trending_up
+    - trending_down
+  blocked_regimes:
+    - event_day                    # Don't sell premium on FOMC/CPI days

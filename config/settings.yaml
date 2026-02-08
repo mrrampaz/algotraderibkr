@@ -27,6 +27,8 @@ logging:
   json_format: true
 
 # Strategy configs can also be loaded from config/strategies/<name>.yaml
+# Total allocation = 95%. Strategies won't all be active simultaneously
+# (regime filtering). Actual deployed capital at any time should be 50-80%.
 strategies:
   pairs_trading:
     enabled: true
@@ -43,3 +45,39 @@ strategies:
       per_pair_capital_pct: 2.0
       max_simultaneous_pairs: 5
       bar_timeframe: "5Min"
+
+  gap_reversal:
+    enabled: true
+    capital_allocation_pct: 12.0
+    max_positions: 3
+    params: {}  # Uses defaults from strategy or config/strategies/gap_reversal.yaml
+
+  momentum:
+    enabled: true
+    capital_allocation_pct: 15.0
+    max_positions: 4
+    params: {}
+
+  vwap_reversion:
+    enabled: true
+    capital_allocation_pct: 10.0
+    max_positions: 3
+    params: {}
+
+  options_premium:
+    enabled: true
+    capital_allocation_pct: 15.0
+    max_positions: 3
+    params: {}
+
+  sector_rotation:
+    enabled: true
+    capital_allocation_pct: 10.0
+    max_positions: 4
+    params: {}
+
+  event_driven:
+    enabled: true
+    capital_allocation_pct: 8.0
+    max_positions: 2
+    params: {}

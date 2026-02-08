@@ -1,0 +1,40 @@
+enabled: true
+capital_allocation_pct: 10.0
+max_positions: 3
+params:
+  # Universe - large-cap only
+  universe:
+    - SPY
+    - QQQ
+    - AAPL
+    - MSFT
+    - AMZN
+    - GOOG
+    - META
+    - NVDA
+    - JPM
+    - V
+
+  # Entry
+  min_z_score: 2.0               # Z-score from VWAP for entry
+  min_volume_ratio: 1.0          # At least average volume
+  max_spread_pct: 0.15           # Tight spread for mean reversion
+
+  # Exit
+  exit_z_score: 0.5              # Close when z reverts to 0.5
+  stop_pct: 0.5                  # Hard stop at 0.5% against
+  target_pct: 1.0                # Target 1% profit
+
+  # Time
+  earliest_entry_hour: 10        # Don't trade first 30 min
+  earliest_entry_minute: 0
+  close_by_hour: 15
+  close_by_minute: 30
+
+  bar_timeframe: "5Min"
+  vwap_lookback_bars: 78         # Full day of 5-min bars (6.5 hrs)
+
+  # Regime filter - ONLY ranging/low-vol
+  allowed_regimes:
+    - ranging
+    - low_vol

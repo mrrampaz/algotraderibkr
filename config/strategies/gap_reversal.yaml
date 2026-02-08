@@ -1,0 +1,28 @@
+enabled: true
+capital_allocation_pct: 12.0
+max_positions: 3
+params:
+  min_gap_pct: 2.0              # Minimum gap to consider
+  max_gap_pct: 8.0              # Gaps > 8% are too risky to fade
+  min_volume: 500000            # Pre-market volume filter
+
+  # Gap-and-Go parameters
+  go_entry_bar: 5               # Enter on break of first N-min candle high/low
+  go_stop_atr_mult: 1.0         # Stop = entry - ATR * this
+  go_target_rr: 2.0             # Risk-reward target
+
+  # Gap Fade parameters
+  fade_wait_minutes: 15          # Wait N minutes before fading
+  fade_fill_target_pct: 50.0    # Target 50% gap fill
+  fade_stop_pct: 0.5            # Stop at 0.5% beyond gap extreme
+
+  # Time management
+  close_by_hour: 11             # Close all gap trades by 11 AM ET
+  close_by_minute: 0
+
+  # Regime filter
+  allowed_regimes:
+    - trending_up
+    - trending_down
+    - ranging
+    - low_vol

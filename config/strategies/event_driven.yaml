@@ -1,0 +1,30 @@
+enabled: true
+capital_allocation_pct: 8.0
+max_positions: 2
+params:
+  # Event types to trade
+  trade_fomc: true
+  trade_cpi: true
+  trade_earnings: false            # Earnings are stock-specific, riskier
+
+  # Pre-event (position before announcement)
+  pre_event_entry_hours: 2         # Enter 2 hours before event
+  pre_event_strategy: "straddle_direction"
+
+  # Post-event (trade after announcement)
+  post_event_wait_minutes: 5       # Wait 5 min after event for dust to settle
+  post_event_entry_window: 30      # Enter within 30 min after event
+  post_event_move_threshold: 0.3   # SPY must move > 0.3% for confirmation
+
+  # Sizing - reduced
+  position_size_pct: 1.0           # Small positions (1% of capital)
+  max_loss_pct: 0.3                # Tight stop: 0.3% max loss
+
+  # Targets
+  target_rr: 2.0                   # 2:1 reward/risk
+  time_limit_hours: 2              # Close within 2 hours of entry
+
+  # Instruments
+  instruments:
+    - SPY
+    - QQQ

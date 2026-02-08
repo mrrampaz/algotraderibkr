@@ -1,0 +1,36 @@
+enabled: true
+capital_allocation_pct: 15.0
+max_positions: 4
+params:
+  # Breakout detection
+  min_volume_ratio: 1.5          # Volume must be 1.5x+ 20d average
+  min_consolidation_days: 3      # Range must have held 3+ days
+  max_spread_pct: 0.2            # Max bid-ask spread
+
+  # Entry
+  entry_confirmation_bars: 1     # Wait N bars above breakout level
+  entry_buffer_pct: 0.1          # Enter at breakout + buffer%
+
+  # Stop
+  stop_type: "atr"               # "atr" or "vwap" or "breakout_level"
+  stop_atr_mult: 1.5             # Stop = entry - 1.5 * ATR
+
+  # Target & trailing
+  use_trailing_stop: true
+  trail_atr_mult: 2.0            # Trail stop distance = 2.0 * ATR
+  trail_activation_rr: 1.0       # Activate trail after 1R profit
+  fixed_target_rr: 3.0           # If not trailing, fixed 3R target
+
+  # Time
+  close_by_hour: 15              # Close by 3:30 PM unless swing criteria met
+  close_by_minute: 30
+
+  # Scan interval
+  scan_interval_minutes: 15      # Run breakout scan every 15 min
+  bar_timeframe: "5Min"
+
+  # Regime filter
+  allowed_regimes:
+    - trending_up
+    - trending_down
+    - high_vol

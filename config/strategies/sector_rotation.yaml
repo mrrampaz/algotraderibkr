@@ -1,0 +1,35 @@
+enabled: true
+capital_allocation_pct: 10.0
+max_positions: 4                  # 2 long + 2 short typically
+params:
+  # Sector ETFs
+  sectors:
+    XLK: "Technology"
+    XLF: "Financials"
+    XLE: "Energy"
+    XLV: "Healthcare"
+    XLI: "Industrials"
+    XLP: "Consumer Staples"
+    XLU: "Utilities"
+    XLB: "Materials"
+    XLRE: "Real Estate"
+    XLC: "Communication"
+    XLY: "Consumer Discretionary"
+
+  benchmark: "SPY"
+
+  # Relative strength
+  rs_lookback_days: 5             # 5-day rolling relative strength
+  rs_long_threshold: 1.5          # Long sectors with RS% > 1.5%
+  rs_short_threshold: -1.5        # Short sectors with RS% < -1.5%
+  min_divergence_pct: 2.0         # Min spread between best and worst
+
+  # Position management
+  rebalance_interval_hours: 4     # Recheck every 4 hours
+  stop_pct: 2.0                   # Stop loss per position
+
+  # Regime filter
+  allowed_regimes:
+    - trending_up
+    - trending_down
+    - ranging
