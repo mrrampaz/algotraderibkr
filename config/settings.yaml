@@ -26,6 +26,29 @@ logging:
   file: "data/logs/algotrader.log"
   json_format: true
 
+strategy_selector:
+  enabled: true
+  regime_config: "config/regimes.yaml"
+
+  # Minimum score to receive capital allocation
+  min_activation_score: 0.35
+
+  # Mid-day review
+  review_hour: 12              # Noon ET
+  review_minute: 0
+
+  # Allocation bounds
+  min_allocation_pct: 3.0      # Floor: 3% if active
+  max_total_deployment_pct: 80.0  # Max total deployed (matches risk.max_gross_exposure_pct)
+
+  # Performance-based scaling
+  scale_down_threshold_pct: -0.5    # Scale down if losing > 0.5% of allocation
+  disable_threshold_pct: -0.8       # Disable if losing > 0.8%
+  scale_up_threshold_pct: 0.3       # Scale up if winning > 0.3%
+  scale_up_factor: 1.25             # Scale up by 25%
+  scale_down_factor: 0.5            # Scale down by 50%
+  min_trades_for_review: 2          # Need at least 2 trades before judging
+
 # Strategy configs can also be loaded from config/strategies/<name>.yaml
 # Total allocation = 95%. Strategies won't all be active simultaneously
 # (regime filtering). Actual deployed capital at any time should be 50-80%.

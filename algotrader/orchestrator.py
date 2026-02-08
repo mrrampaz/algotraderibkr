@@ -13,7 +13,7 @@ from datetime import datetime
 import pytz
 import structlog
 
-from algotrader.core.config import Settings, StrategyConfig, load_strategy_config
+from algotrader.core.config import Settings, StrategyConfig, load_strategy_config, load_yaml
 from algotrader.core.events import EventBus, KILL_SWITCH, STRATEGY_DISABLED
 from algotrader.core.logging import setup_logging
 from algotrader.core.models import MarketRegime, RegimeType
@@ -30,6 +30,9 @@ from algotrader.risk.portfolio_risk import PortfolioRiskManager
 from algotrader.risk.position_sizer import PositionSizer
 from algotrader.strategies.base import StrategyBase
 from algotrader.strategies.registry import registry
+from algotrader.strategy_selector.scorer import StrategyScorer
+from algotrader.strategy_selector.allocator import CapitalAllocator
+from algotrader.strategy_selector.reviewer import MidDayReviewer
 from algotrader.tracking.journal import TradeJournal
 from algotrader.tracking.portfolio import PortfolioTracker
 
@@ -113,6 +116,47 @@ class Orchestrator:
         self._news_client = AlpacaNewsClient(data_provider=self._data_provider)
         self._event_calendar = EventCalendar()
         self._current_regime: MarketRegime | None = None
+
+        # Strategy selector (Phase 4)
+        self._scorer: StrategyScorer | None = None
+        self._allocator: CapitalAllocator | None = None
+        self._reviewer: MidDayReviewer | None = None
+        if settings.strategy_selector.enabled:
+            try:
+                regime_config = load_yaml(settings.strategy_selector.regime_config)
+                self._scorer = StrategyScorer(
+                    regime_config=regime_config,
+                    trade_journal=self._trade_journal,
+                    event_calendar=self._event_calendar,
+                    total_capital=settings.trading.total_capital,
+                )
+                self._allocator = CapitalAllocator(
+                    total_capital=settings.trading.total_capital,
+                    risk_config=settings.risk,
+                    strategy_configs=settings.strategies,
+                    min_allocation_pct=settings.strategy_selector.min_allocation_pct,
+                )
+                self._reviewer = MidDayReviewer(
+                    scorer=self._scorer,
+                    allocator=self._allocator,
+                    event_bus=self._event_bus,
+                    strategy_configs=settings.strategies,
+                    total_capital=settings.trading.total_capital,
+                    review_hour=settings.strategy_selector.review_hour,
+                    review_minute=settings.strategy_selector.review_minute,
+                    scale_down_threshold_pct=settings.strategy_selector.scale_down_threshold_pct,
+                    disable_threshold_pct=settings.strategy_selector.disable_threshold_pct,
+                    scale_up_threshold_pct=settings.strategy_selector.scale_up_threshold_pct,
+                    scale_up_factor=settings.strategy_selector.scale_up_factor,
+                    scale_down_factor=settings.strategy_selector.scale_down_factor,
+                    min_trades_for_review=settings.strategy_selector.min_trades_for_review,
+                )
+                self._log.info("strategy_selector_initialized")
+            except Exception:
+                self._log.exception("strategy_selector_init_failed")
+                self._scorer = None
+                self._allocator = None
+                self._reviewer = None
 
         # Strategies
         self._strategies: dict[str, StrategyBase] = {}
@@ -256,6 +300,29 @@ class Orchestrator:
         # Check pending orders
         self._order_manager.check_orders()
 
+        # Mid-day review (strategy selector)
+        if self._reviewer:
+            try:
+                if self._reviewer.needs_review:
+                    actions = self._reviewer.review(
+                        strategies=self._strategies,
+                        regime=self._current_regime,
+                        vix_level=self._current_regime.vix_level if self._current_regime else None,
+                    )
+                    if actions:
+                        for a in actions:
+                            if a.action != "no_change":
+                                self._log.info(
+                                    "review_action",
+                                    strategy=a.strategy_name,
+                                    action=a.action,
+                                    old_capital=a.old_capital,
+                                    new_capital=a.new_capital,
+                                    reason=a.reason,
+                                )
+            except Exception:
+                self._log.exception("midday_review_failed")
+
         # Run risk checks
         strategy_statuses = [s.get_status() for s in self._strategies.values()]
         account = self._executor.get_account()
@@ -350,6 +417,30 @@ class Orchestrator:
         except Exception:
             self._log.exception("news_fetch_failed")
 
+        # 6. Score strategies and allocate capital based on initial regime
+        if self._scorer and self._allocator and self._current_regime:
+            try:
+                strategy_names = list(self._strategies.keys())
+                scores = self._scorer.score_strategies(
+                    strategy_names,
+                    self._current_regime,
+                    vix_level=self._current_regime.vix_level,
+                )
+                account = self._executor.get_account()
+                allocations = self._allocator.allocate(scores, current_equity=account.equity)
+                self._allocator.apply_allocations(allocations, self._strategies)
+
+                self._log.info(
+                    "pre_market_allocations",
+                    allocations={
+                        a.strategy_name: f"{a.allocation_pct:.1f}%"
+                        for a in allocations if a.is_active
+                    },
+                )
+            except Exception:
+                self._log.exception("pre_market_allocation_failed")
+                # Fallback: keep static YAML allocations (already set in initialize())
+
         self._log.info("pre_market_intelligence_complete")
 
     def shutdown(self) -> None:
@@ -378,6 +469,22 @@ class Orchestrator:
             )
         except Exception:
             self._log.exception("summary_generation_failed")
+
+        # Log final strategy status
+        try:
+            for name, strategy in self._strategies.items():
+                status = strategy.get_status()
+                self._log.info(
+                    "strategy_final_status",
+                    name=name,
+                    enabled=status.enabled,
+                    capital=strategy._total_capital,
+                    daily_pnl=round(status.daily_pnl, 2),
+                    trades=status.daily_trades,
+                    win_rate=f"{status.win_rate:.0%}",
+                )
+        except Exception:
+            self._log.exception("strategy_status_log_failed")
 
         # Clean up
         self._trade_journal.close()

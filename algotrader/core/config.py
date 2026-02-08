@@ -81,6 +81,24 @@ class StrategyConfig(BaseModel):
     params: dict[str, Any] = Field(default_factory=dict)
 
 
+class StrategySelectorConfig(BaseModel):
+    """Config for the Phase 4 strategy selection engine."""
+
+    enabled: bool = True
+    regime_config: str = "config/regimes.yaml"
+    min_activation_score: float = 0.35
+    review_hour: int = 12
+    review_minute: int = 0
+    min_allocation_pct: float = 3.0
+    max_total_deployment_pct: float = 80.0
+    scale_down_threshold_pct: float = -0.5
+    disable_threshold_pct: float = -0.8
+    scale_up_threshold_pct: float = 0.3
+    scale_up_factor: float = 1.25
+    scale_down_factor: float = 0.5
+    min_trades_for_review: int = 2
+
+
 class Settings(BaseModel):
     """Top-level application settings."""
 
@@ -91,6 +109,7 @@ class Settings(BaseModel):
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     alpaca: AlpacaConfig = Field(default_factory=AlpacaConfig)
     strategies: dict[str, StrategyConfig] = Field(default_factory=dict)
+    strategy_selector: StrategySelectorConfig = Field(default_factory=StrategySelectorConfig)
 
 
 # ── Loader ───────────────────────────────────────────────────────────────────
