@@ -1,0 +1,45 @@
+trading:
+  paper_mode: true
+  total_capital: 60000
+  timezone: "America/New_York"
+
+data:
+  provider: "alpaca"
+  feed: "iex"  # or "sip"
+  cycle_interval_seconds: 300  # 5 min for IEX
+
+risk:
+  max_daily_loss_pct: 2.0
+  max_drawdown_pct: 8.0
+  max_gross_exposure_pct: 80.0
+  max_single_position_pct: 5.0
+  max_correlated_positions: 3
+  strategy_daily_loss_limit_pct: 1.0
+
+execution:
+  broker: "alpaca"
+  max_spread_pct: 0.3
+  use_marketable_limits: true
+
+logging:
+  level: "INFO"
+  file: "data/logs/algotrader.log"
+  json_format: true
+
+# Strategy configs can also be loaded from config/strategies/<name>.yaml
+strategies:
+  pairs_trading:
+    enabled: true
+    capital_allocation_pct: 25.0
+    max_positions: 5
+    params:
+      lookback_bars: 252
+      z_entry_threshold: 1.2
+      z_exit_threshold: 0.2
+      z_stop_threshold: 2.8
+      max_bars_in_position: 80
+      min_correlation: 0.7
+      cointegration_pvalue: 0.05
+      per_pair_capital_pct: 2.0
+      max_simultaneous_pairs: 5
+      bar_timeframe: "5Min"

@@ -1,0 +1,34 @@
+enabled: true
+capital_allocation_pct: 25.0
+max_positions: 5
+params:
+  # Lookback period for cointegration test (daily bars)
+  lookback_bars: 252
+
+  # Z-score thresholds
+  z_entry_threshold: 1.2     # Enter when |z| > this
+  z_exit_threshold: 0.2      # Exit when |z| < this (profit target)
+  z_stop_threshold: 2.8      # Exit when |z| > this (stop loss)
+
+  # Position management
+  max_bars_in_position: 80   # Time-based exit
+  max_simultaneous_pairs: 5  # Max concurrent pair positions
+
+  # Statistical requirements
+  min_correlation: 0.7       # Minimum Pearson correlation
+  cointegration_pvalue: 0.05 # Max p-value for Engle-Granger test
+
+  # Sizing
+  per_pair_capital_pct: 2.0  # % of total capital per pair
+
+  # Data
+  bar_timeframe: "5Min"      # Intraday bar interval
+
+  # Pairs universe — override default pairs here
+  # pairs:
+  #   - symbol_a: "XOM"
+  #     symbol_b: "CVX"
+  #     sector: "energy"
+  #   - symbol_a: "JPM"
+  #     symbol_b: "BAC"
+  #     sector: "financials"
