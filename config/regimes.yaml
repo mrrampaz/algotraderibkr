@@ -1,0 +1,94 @@
+# Regime-to-strategy fitness weights (0.0 = never, 1.0 = ideal)
+# These are base weights — scorer applies modifiers on top
+
+regime_weights:
+  trending_up:
+    pairs_trading: 0.6
+    gap_reversal: 0.7       # Gap-and-go works well in uptrends
+    momentum: 0.9            # Breakouts confirm in trends
+    vwap_reversion: 0.2      # Mean reversion fails in trends
+    options_premium: 0.6     # Sell puts in uptrend (bullish bias)
+    sector_rotation: 0.7     # Strong sector divergence in trends
+    event_driven: 0.3        # Only if event day
+
+  trending_down:
+    pairs_trading: 0.6
+    gap_reversal: 0.7        # Gap fades work well in downtrends
+    momentum: 0.8            # Short-side breakdowns
+    vwap_reversion: 0.2
+    options_premium: 0.6     # Sell calls in downtrend (bearish bias)
+    sector_rotation: 0.7     # Defensive rotation clear
+    event_driven: 0.3
+
+  ranging:
+    pairs_trading: 0.9       # Pairs thrive in range-bound markets
+    gap_reversal: 0.5
+    momentum: 0.2            # False breakouts in ranges
+    vwap_reversion: 0.9      # Mean reversion is ideal
+    options_premium: 0.8     # Premium selling loves low movement
+    sector_rotation: 0.5
+    event_driven: 0.3
+
+  high_vol:
+    pairs_trading: 0.4       # Correlations can break in high vol
+    gap_reversal: 0.3        # Gaps too large, stop distances too wide
+    momentum: 0.3            # Whipsaws kill momentum
+    vwap_reversion: 0.2      # VWAP deviations don't revert reliably
+    options_premium: 0.9     # Premium is richest here — sell it
+    sector_rotation: 0.4
+    event_driven: 0.5        # Events cause high vol
+
+  low_vol:
+    pairs_trading: 0.8       # Stable correlations
+    gap_reversal: 0.5        # Smaller gaps, less opportunity
+    momentum: 0.5            # Need vol expansion for breakouts
+    vwap_reversion: 0.8      # Clean mean reversion in calm markets
+    options_premium: 0.3     # Premium too thin to sell
+    sector_rotation: 0.6
+    event_driven: 0.2
+
+  event_day:
+    pairs_trading: 0.3       # Reduce — correlations can spike
+    gap_reversal: 0.2        # Too unpredictable
+    momentum: 0.2            # Wait for post-event clarity
+    vwap_reversion: 0.1      # VWAP meaningless on event days
+    options_premium: 0.1     # IV crush kills premium sellers pre-event
+    sector_rotation: 0.2
+    event_driven: 1.0        # This is its moment
+
+# Minimum score threshold — strategies below this get zero allocation
+min_activation_score: 0.35
+
+# Score modifiers (applied on top of base regime weights)
+modifiers:
+  # VIX-based modifier: adjusts scores when VIX is extreme
+  vix_high_boost:            # Applied when VIX > 25
+    options_premium: 0.15    # Boost premium selling
+    momentum: -0.2           # Penalize momentum
+    vwap_reversion: -0.15
+
+  vix_low_penalty:           # Applied when VIX < 13
+    options_premium: -0.2    # Penalize (no premium)
+    pairs_trading: 0.1       # Slight boost
+
+  # Recent performance modifier
+  # Strategies that have been winning get a small boost
+  # Strategies that have been losing get penalized
+  performance_lookback_days: 5
+  performance_boost_per_pct: 0.02    # +0.02 score per 1% recent return
+  performance_penalty_per_pct: 0.03  # -0.03 score per 1% recent loss
+  max_performance_modifier: 0.15     # Cap at +/-0.15
+
+  # Time-of-day modifier
+  morning_session:           # 9:30-11:00 AM
+    gap_reversal: 0.2        # Gaps are morning plays
+    momentum: 0.1            # Breakouts often in AM
+  afternoon_session:         # 2:00-3:30 PM
+    gap_reversal: -0.3       # Gaps are done by afternoon
+    vwap_reversion: 0.1      # Afternoon reversion common
+    options_premium: -0.1    # Close premium, don't open new
+
+  # Event proximity modifier (applied day before major event)
+  pre_event_day:
+    options_premium: -0.2    # Don't sell premium day before FOMC
+    event_driven: 0.3        # Start positioning
