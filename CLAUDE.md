@@ -11,7 +11,7 @@ An adaptive, multi-strategy algorithmic trading system for Alpaca Markets API. I
 **Phase 1 — Foundation**: COMPLETE. Core abstractions, data layer, execution layer, orchestrator, pairs trading strategy.
 **Phase 2 — Intelligence Layer**: COMPLETE. Regime detector, gap/volume/breakout scanners, news client, event calendar.
 **Phase 3 — Strategy Arsenal**: COMPLETE. 6 strategies (gap reversal, momentum, VWAP reversion, options premium, sector rotation, event-driven), 3 bug fixes (VIX proxy, executor protocol, news API).
-**Phase 4 — Strategy Selection**: Next up. Scorer, allocator, mid-day reviewer.
+**Phase 4 — Strategy Selection**: COMPLETE. Regime-strategy scorer, score-weighted capital allocator, mid-day reviewer with regime-change reallocation.
 
 ## Tech Stack
 
@@ -220,11 +220,14 @@ All strategies implement StrategyBase with @register_strategy decorator:
 5. **Sector Rotation** (`algotrader/strategies/sector_rotation.py`): RS-based long/short sector ETFs, 4-hour rebalance
 6. **Event-Driven** (`algotrader/strategies/event_driven.py`): Post-FOMC/CPI directional trades with 2:1 R/R
 
-### Phase 4 — Strategy Selection
+### Phase 4 — Strategy Selection (COMPLETE)
 
-1. Strategy scorer (regime → strategy fitness scores)
-2. Capital allocator (distribute across active strategies)
-3. Mid-day reviewer (disable losers, scale winners)
+1. **Regime config** (`config/regimes.yaml`): Regime-to-strategy weight matrix (0.0-1.0) + score modifiers for VIX, performance, time-of-day, event proximity
+2. **Strategy scorer** (`algotrader/strategy_selector/scorer.py`): Score = clamp(base_weight + vix_mod + perf_mod + time_mod + event_mod, 0, 1). Strategies below 0.35 get zero allocation.
+3. **Capital allocator** (`algotrader/strategy_selector/allocator.py`): Score-weighted capital distribution with 3% floor, per-strategy ceiling, excess redistribution
+4. **Mid-day reviewer** (`algotrader/strategy_selector/reviewer.py`): Noon ET review: scale down losers (>-0.5%), disable severe losers (>-0.8%), scale up winners (>+0.3% with 50%+ WR). Regime change triggers full reallocation via event bus.
+5. **Config** (`algotrader/core/config.py`): `StrategySelectorConfig` pydantic model with all thresholds configurable
+6. **Orchestrator integration**: Pre-market scoring/allocation, per-cycle mid-day review, shutdown status logging, fallback to static YAML when disabled
 
 ### Phase 5 — Learning & Dashboard
 
