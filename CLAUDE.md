@@ -8,11 +8,14 @@ An adaptive, multi-strategy algorithmic trading system for Alpaca Markets API. I
 
 ## Current Status
 
-**Phase 1 — Foundation**: Building core abstractions, data layer, execution layer, orchestrator, and migrating pairs trading as the first strategy.
+**Phase 1 — Foundation**: COMPLETE. Core abstractions, data layer, execution layer, orchestrator, pairs trading strategy.
+**Phase 2 — Intelligence Layer**: COMPLETE. Regime detector, gap/volume/breakout scanners, news client, event calendar.
+**Phase 3 — Strategy Arsenal**: COMPLETE. 6 strategies (gap reversal, momentum, VWAP reversion, options premium, sector rotation, event-driven), 3 bug fixes (VIX proxy, executor protocol, news API).
+**Phase 4 — Strategy Selection**: Next up. Scorer, allocator, mid-day reviewer.
 
 ## Tech Stack
 
-- **Python 3.12+** with **uv** for package management
+- **Python 3.11+** with **uv** for package management
 - **alpaca-py** for broker API
 - **pandas, numpy, scipy** for quantitative analysis
 - **httpx + beautifulsoup4** for async web scraping
@@ -171,9 +174,9 @@ algotrader/
 
 ## Build Phases
 
-### Phase 1 — Foundation (BUILD THIS FIRST)
+### Phase 1 — Foundation (COMPLETE)
 
-Build in this exact order:
+Built in this exact order:
 
 1. **Project setup**: pyproject.toml with all dependencies, .env.example, directory structure, __init__.py files
 2. **Core models** (`algotrader/core/models.py`): Pydantic models for Bar, Quote, Snapshot, Order, OrderSide, OrderStatus, Position, Signal, TradeRecord, MarketRegime, RegimeType
@@ -197,24 +200,25 @@ Build in this exact order:
 20. **Config files**: settings.yaml (global), pairs_trading.yaml (strategy config), .env.example
 21. **Entry point** (`scripts/run.py`): Load config, init components, start orchestrator
 
-### Phase 2 — Intelligence Layer
+### Phase 2 — Intelligence Layer (COMPLETE)
 
-1. **Regime detector** (`algotrader/intelligence/regime.py`): Classify using VIX level, SPY trend (SMA20 slope), intraday range vs ATR. Output: RegimeType (trending_up, trending_down, ranging, high_vol, low_vol, event_day)
+1. **Regime detector** (`algotrader/intelligence/regime.py`): Classify using SPY realized vol (VIX proxy), SPY trend (SMA20 slope), intraday range vs ATR. Output: RegimeType (trending_up, trending_down, ranging, high_vol, low_vol, event_day)
 2. **Gap scanner** (`algotrader/intelligence/scanners/gap_scanner.py`): Pre-market scan for stocks gapping >2% with volume >500K. Use Alpaca snapshots API.
 3. **Volume scanner** (`algotrader/intelligence/scanners/volume_scanner.py`): Detect unusual volume (>2x 20-day average) during market hours
-4. **Alpaca news client** (`algotrader/intelligence/news/alpaca_news.py`): Pull news feed, categorize by symbol and sector
-5. **Web scraper** (`algotrader/intelligence/news/scraper.py`): Scrape Finviz screener (gaps, unusual volume), Yahoo Finance earnings calendar
-6. **Event calendar** (`algotrader/intelligence/calendar/events.py`): Track FOMC, CPI, PPI, earnings dates with impact scores
+4. **Breakout scanner** (`algotrader/intelligence/scanners/breakout_scanner.py`): Detect consolidation range breakouts with volume confirmation
+5. **Alpaca news client** (`algotrader/intelligence/news/alpaca_news.py`): Pull news feed, categorize by symbol and sector
+6. **Web scraper** (`algotrader/intelligence/news/scraper.py`): Scrape Finviz screener (gaps, unusual volume), Yahoo Finance earnings calendar
+7. **Event calendar** (`algotrader/intelligence/calendar/events.py`): Track FOMC, CPI, PPI, earnings dates with impact scores
 
-### Phase 3 — Strategy Arsenal
+### Phase 3 — Strategy Arsenal (COMPLETE)
 
-Build each strategy implementing StrategyBase:
-1. Gap & Reversal
-2. Momentum / Breakout
-3. VWAP Mean Reversion (improved)
-4. Options Premium Selling
-5. Sector Rotation
-6. Event-Driven
+All strategies implement StrategyBase with @register_strategy decorator:
+1. **Gap & Reversal** (`algotrader/strategies/gap_reversal.py`): Gap-and-go (catalyst) + gap fade (no catalyst), time-limited to 11 AM ET
+2. **Momentum / Breakout** (`algotrader/strategies/momentum.py`): Consolidation breakouts with ATR trailing stops
+3. **VWAP Mean Reversion** (`algotrader/strategies/vwap_reversion.py`): Z-score deviation trades, ranging/low-vol regimes only
+4. **Options Premium Selling** (`algotrader/strategies/options_premium.py`): Credit spreads with SMA5 contrarian filter (simulated until IBKR)
+5. **Sector Rotation** (`algotrader/strategies/sector_rotation.py`): RS-based long/short sector ETFs, 4-hour rebalance
+6. **Event-Driven** (`algotrader/strategies/event_driven.py`): Post-FOMC/CPI directional trades with 2:1 R/R
 
 ### Phase 4 — Strategy Selection
 
