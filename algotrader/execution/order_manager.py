@@ -70,11 +70,7 @@ class OrderManager:
                 continue
 
             # Order not in open orders — check if it was filled or cancelled
-            # Try to get the order directly
             try:
-                from alpaca.trading.client import TradingClient
-                # We need to check the order's final status
-                # Since it's not in open orders, it's in a terminal state
                 updated = self._get_order_status(order_id)
                 if updated:
                     tracked_order.status = updated.status
@@ -105,12 +101,9 @@ class OrderManager:
                 self._failed_orders[order_id] = order
 
     def _get_order_status(self, order_id: str) -> Order | None:
-        """Try to get final order status from broker."""
+        """Try to get final order status from broker via Executor protocol."""
         try:
-            # Access the underlying client to get order by ID
-            if hasattr(self._executor, '_client'):
-                result = self._executor._client.get_order_by_id(order_id)
-                return self._executor._convert_order(result)
+            return self._executor.get_order(order_id)
         except Exception:
             self._log.debug("order_status_fetch_failed", order_id=order_id)
         return None

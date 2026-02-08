@@ -305,6 +305,17 @@ class AlpacaExecutor:
             pattern_day_trader=bool(account.pattern_day_trader),
         )
 
+    def get_order(self, order_id: str) -> Order | None:
+        """Get an order by ID (any status)."""
+        try:
+            result = self._client.get_order_by_id(order_id)
+            return self._convert_order(result)
+        except APIError:
+            return None
+        except Exception:
+            self._log.exception("get_order_error", order_id=order_id)
+            return None
+
     def get_open_orders(self, symbol: str | None = None) -> list[Order]:
         """Get open orders, optionally filtered by symbol."""
         try:

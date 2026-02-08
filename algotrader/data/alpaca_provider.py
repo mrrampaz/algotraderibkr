@@ -316,7 +316,11 @@ class AlpacaDataProvider:
         symbols: list[str] | None = None,
         limit: int = 50,
     ) -> list[NewsItem]:
-        """Get news from Alpaca news API."""
+        """Get news from Alpaca news API.
+
+        Tries the StockHistoricalDataClient first; falls back to a
+        dedicated NewsClient if the data client doesn't support news.
+        """
         try:
             from alpaca.data.requests import NewsRequest
 
@@ -325,10 +329,21 @@ class AlpacaDataProvider:
                 request_params["symbols"] = symbols
 
             request = NewsRequest(**request_params)
-            news = self._data_client.get_news(request)
+
+            # Try data client first, fall back to dedicated NewsClient
+            try:
+                news = self._data_client.get_news(request)
+            except (AttributeError, TypeError):
+                from alpaca.data.news import NewsClient
+                news_client = NewsClient(
+                    api_key=self._config.api_key,
+                    secret_key=self._config.secret_key,
+                )
+                news = news_client.get_news(request)
 
             items = []
-            for article in news.news:
+            news_list = news.news if hasattr(news, "news") else news
+            for article in news_list:
                 items.append(NewsItem(
                     id=str(article.id),
                     headline=article.headline,

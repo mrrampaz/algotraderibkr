@@ -66,6 +66,10 @@ class Executor(Protocol):
         """Get account info (equity, cash, buying power)."""
         ...
 
+    def get_order(self, order_id: str) -> Order | None:
+        """Get an order by ID (any status)."""
+        ...
+
     def get_open_orders(self, symbol: str | None = None) -> list[Order]:
         """Get open orders, optionally filtered by symbol."""
         ...

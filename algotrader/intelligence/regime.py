@@ -174,18 +174,28 @@ class RegimeDetector:
         return round(np.mean(scores) if scores else 0.5, 2)
 
     def _get_vix_level(self) -> float | None:
-        """Get current VIX level from VIX proxy ETF."""
-        try:
-            snapshot = self._data.get_snapshot(self._vix_symbol)
-            if snapshot and snapshot.latest_trade_price:
-                return snapshot.latest_trade_price
+        """Estimate VIX-equivalent level from SPY realized volatility.
 
-            # Fallback to latest bar
-            bars = self._data.get_bars(self._vix_symbol, "1Day", 1)
-            if not bars.empty:
-                return float(bars["close"].iloc[-1])
+        Calculate 20-day annualized realized vol of SPY and map to
+        approximate VIX-equivalent levels (realized vol typically runs
+        ~70-80% of implied vol / VIX).
+        """
+        try:
+            bars = self._data.get_bars(self._spy_symbol, "1Day", 25)
+            if bars.empty or len(bars) < 10:
+                return None
+            returns = bars["close"].pct_change().dropna()
+            realized_vol = float(returns.std() * np.sqrt(252) * 100)  # annualized %
+            # Map realized vol to VIX-equivalent
+            vix_estimate = realized_vol / 0.75
+            self._log.debug(
+                "vix_proxy_estimated",
+                realized_vol=round(realized_vol, 2),
+                vix_estimate=round(vix_estimate, 2),
+            )
+            return vix_estimate
         except Exception:
-            self._log.exception("vix_fetch_failed")
+            self._log.exception("vix_proxy_failed")
         return None
 
     def _get_spy_trend(self) -> float | None:
