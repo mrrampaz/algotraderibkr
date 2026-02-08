@@ -2,7 +2,7 @@
 name = "algotrader"
 version = "0.1.0"
 description = "Adaptive multi-strategy algorithmic trading system for Alpaca Markets"
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 dependencies = [
     "alpaca-py>=0.28.0",
     "pandas>=2.2.0",
