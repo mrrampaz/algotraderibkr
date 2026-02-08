@@ -21,6 +21,11 @@ from algotrader.data.alpaca_provider import AlpacaDataProvider
 from algotrader.data.cache import DataCache
 from algotrader.execution.alpaca_executor import AlpacaExecutor
 from algotrader.execution.order_manager import OrderManager
+from algotrader.intelligence.regime import RegimeDetector
+from algotrader.intelligence.scanners.gap_scanner import GapScanner
+from algotrader.intelligence.scanners.volume_scanner import VolumeScanner
+from algotrader.intelligence.news.alpaca_news import AlpacaNewsClient
+from algotrader.intelligence.calendar.events import EventCalendar
 from algotrader.risk.portfolio_risk import PortfolioRiskManager
 from algotrader.risk.position_sizer import PositionSizer
 from algotrader.strategies.base import StrategyBase
@@ -97,6 +102,17 @@ class Orchestrator:
             starting_equity=starting_equity,
         )
         self._trade_journal = TradeJournal()
+
+        # Intelligence layer
+        self._regime_detector = RegimeDetector(
+            data_provider=self._data_provider,
+            event_bus=self._event_bus,
+        )
+        self._gap_scanner = GapScanner(data_provider=self._data_provider)
+        self._volume_scanner = VolumeScanner(data_provider=self._data_provider)
+        self._news_client = AlpacaNewsClient(data_provider=self._data_provider)
+        self._event_calendar = EventCalendar()
+        self._current_regime: MarketRegime | None = None
 
         # Strategies
         self._strategies: dict[str, StrategyBase] = {}
@@ -176,6 +192,9 @@ class Orchestrator:
         self.initialize()
         self.warm_up()
 
+        # Pre-market intelligence
+        self._run_pre_market_intelligence()
+
         self._running = True
         cycle_interval = self._settings.data.cycle_interval_seconds
         self._log.info("trading_loop_starting", cycle_seconds=cycle_interval)
@@ -218,6 +237,12 @@ class Orchestrator:
             self._log.warning("risk_killed_skipping_cycle")
             return
 
+        # Update regime detection
+        try:
+            self._current_regime = self._regime_detector.detect()
+        except Exception:
+            self._log.exception("regime_detection_failed")
+
         # Check pending orders
         self._order_manager.check_orders()
 
@@ -230,13 +255,13 @@ class Orchestrator:
             self._log.warning("risk_blocked", status=risk_result["status"])
             return
 
-        # Run each active strategy
+        # Run each active strategy with current regime
         for name, strategy in self._strategies.items():
             if not strategy.is_enabled:
                 continue
 
             try:
-                signals = strategy.run_cycle(regime=None)
+                signals = strategy.run_cycle(regime=self._current_regime)
                 if signals:
                     self._log.info("signals_generated", strategy=name, count=len(signals))
             except Exception:
@@ -244,6 +269,78 @@ class Orchestrator:
 
         # Evict expired cache entries periodically
         self._data_cache.evict_expired()
+
+    def _run_pre_market_intelligence(self) -> None:
+        """Run pre-market intelligence gathering.
+
+        Detects regime, scans for gaps, checks event calendar, fetches news.
+        Called once before the trading loop starts.
+        """
+        self._log.info("pre_market_intelligence_starting")
+
+        # 1. Check event calendar
+        try:
+            today_events = self._event_calendar.get_events_for_date()
+            if today_events:
+                self._log.info(
+                    "events_today",
+                    count=len(today_events),
+                    max_impact=self._event_calendar.max_impact_today(),
+                )
+                # Mark event day for regime detector
+                if self._event_calendar.is_event_day():
+                    import pytz as _pytz
+                    today_str = datetime.now(_pytz.timezone("America/New_York")).strftime("%Y-%m-%d")
+                    self._regime_detector.mark_event_day(today_str)
+
+            upcoming = self._event_calendar.get_upcoming_events(7)
+            if upcoming:
+                self._log.info("upcoming_events", count=len(upcoming))
+        except Exception:
+            self._log.exception("event_calendar_check_failed")
+
+        # 2. Detect initial regime
+        try:
+            self._current_regime = self._regime_detector.detect()
+            self._log.info(
+                "initial_regime",
+                regime=self._current_regime.regime_type.value,
+                confidence=self._current_regime.confidence,
+            )
+        except Exception:
+            self._log.exception("initial_regime_detection_failed")
+
+        # 3. Scan for gaps
+        try:
+            gaps = self._gap_scanner.scan()
+            if gaps:
+                self._log.info(
+                    "pre_market_gaps",
+                    count=len(gaps),
+                    top_gap=f"{gaps[0].symbol} {gaps[0].gap_pct:+.1f}%" if gaps else "",
+                )
+        except Exception:
+            self._log.exception("gap_scan_failed")
+
+        # 4. Warm up volume scanner with average volumes
+        try:
+            self._volume_scanner.warm_up()
+        except Exception:
+            self._log.exception("volume_scanner_warmup_failed")
+
+        # 5. Fetch recent news
+        try:
+            news = self._news_client.fetch_news(limit=30)
+            self._log.info(
+                "pre_market_news",
+                total=len(news.items),
+                bullish=news.bullish_count,
+                bearish=news.bearish_count,
+            )
+        except Exception:
+            self._log.exception("news_fetch_failed")
+
+        self._log.info("pre_market_intelligence_complete")
 
     def shutdown(self) -> None:
         """Graceful shutdown: save state, log summary."""
