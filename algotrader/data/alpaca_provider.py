@@ -122,11 +122,23 @@ class AlpacaDataProvider:
         result = self._retry(_fetch)
 
         # Convert to DataFrame
-        if not result or symbol not in result:
+        result_data = result.data if hasattr(result, 'data') else result
+        if not result_data or symbol not in result_data:
             self._log.warning("no_bars_returned", symbol=symbol, timeframe=timeframe)
             return pd.DataFrame(columns=["open", "high", "low", "close", "volume", "vwap", "trade_count"])
 
-        df = result[symbol].df if hasattr(result[symbol], 'df') else result.df
+        bars_obj = result[symbol]
+        if hasattr(bars_obj, 'df'):
+            df = bars_obj.df
+        elif isinstance(bars_obj, list):
+            # alpaca-py >= 0.43 returns list of Bar objects
+            df = pd.DataFrame([{
+                "open": b.open, "high": b.high, "low": b.low,
+                "close": b.close, "volume": b.volume,
+                "vwap": b.vwap, "trade_count": b.trade_count,
+            } for b in bars_obj], index=pd.DatetimeIndex([b.timestamp for b in bars_obj], name="timestamp"))
+        else:
+            df = result.df
 
         # Handle multi-index if present
         if isinstance(df.index, pd.MultiIndex):

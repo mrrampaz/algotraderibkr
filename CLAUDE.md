@@ -115,8 +115,7 @@ algotrader/
 │   │   ├── news/
 │   │   │   ├── __init__.py
 │   │   │   ├── alpaca_news.py        # Alpaca news API client
-│   │   │   ├── scraper.py            # Finviz/Yahoo web scraper
-│   │   │   └── sentiment.py          # Keyword-based sentiment scoring
+│   │   │   └── scraper.py            # Finviz/Yahoo web scraper
 │   │   └── calendar/
 │   │       ├── __init__.py
 │   │       └── events.py             # Economic + earnings calendar
@@ -131,14 +130,12 @@ algotrader/
 │   │   ├── vwap_reversion.py         # VWAP mean reversion
 │   │   ├── options_premium.py        # Credit spreads / iron condors
 │   │   ├── event_driven.py           # FOMC/CPI/earnings plays
-│   │   ├── sector_rotation.py        # Sector relative strength
-│   │   └── overnight.py              # Swing / overnight holds
+│   │   └── sector_rotation.py        # Sector relative strength
 │   │
 │   ├── risk/                         # Risk management
 │   │   ├── __init__.py
 │   │   ├── portfolio_risk.py         # Portfolio-level: drawdown, exposure, kill switch
-│   │   ├── position_sizer.py         # Risk-based position sizing with conviction
-│   │   └── correlation.py            # Real-time correlation monitoring
+│   │   └── position_sizer.py         # Risk-based position sizing with conviction
 │   │
 │   ├── strategy_selector/            # Strategy selection engine
 │   │   ├── __init__.py
@@ -269,6 +266,8 @@ Store all timestamps in UTC. Display in ET.
 3. **Ghost positions**: `close_position()` should return success when broker says "position not found".
 4. **Quote validation**: Always check bid/ask > 0 before placing limit orders.
 5. **IEX delays**: Options quotes are 15-min delayed. Plan for this in options strategies.
+6. **alpaca-py 0.43+ BarSet**: `symbol in result` is broken on `BarSet` objects; use `symbol in result.data`. Also `result[symbol]` returns `list[Bar]` (no `.df` attribute) — convert manually to DataFrame.
+7. **alpaca-py 0.43+ News**: `StockHistoricalDataClient.get_news()` and `alpaca.data.news.NewsClient` no longer exist. News fetch gracefully fails and returns empty list (non-critical).
 
 ### Code Patterns
 
@@ -345,9 +344,20 @@ uv sync
 cp .env.example .env
 # Edit .env with ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_PAPER_TRADE=True
 
-# Run
-python scripts/run.py
+# Run trading loop
+.venv/Scripts/python.exe scripts/run.py      # Windows
+# .venv/bin/python scripts/run.py             # Linux/macOS
+
+# Run dashboard
+.venv/Scripts/python.exe -m streamlit run dashboard/app.py
 ```
+
+### VS Code Setup
+A `.vscode/launch.json` is provided with two debug configurations:
+- **Run AlgoTrader** — launches `scripts/run.py` with correct cwd and .env
+- **Run Dashboard** — launches Streamlit dashboard
+
+Select the `.venv` Python interpreter in the VS Code status bar (bottom right) before running.
 
 ## Global Settings (config/settings.yaml)
 
