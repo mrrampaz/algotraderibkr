@@ -12,6 +12,7 @@ An adaptive, multi-strategy algorithmic trading system for Alpaca Markets API. I
 **Phase 2 — Intelligence Layer**: COMPLETE. Regime detector, gap/volume/breakout scanners, news client, event calendar.
 **Phase 3 — Strategy Arsenal**: COMPLETE. 6 strategies (gap reversal, momentum, VWAP reversion, options premium, sector rotation, event-driven), 3 bug fixes (VIX proxy, executor protocol, news API).
 **Phase 4 — Strategy Selection**: COMPLETE. Regime-strategy scorer, score-weighted capital allocator, mid-day reviewer with regime-change reallocation.
+**Phase 5 — Learning & Dashboard**: COMPLETE. Performance metrics, attribution, strategy weight learner, alerting system, Streamlit dashboard, utility scripts.
 
 ## Tech Stack
 
@@ -150,7 +151,9 @@ algotrader/
 │       ├── portfolio.py              # Live portfolio state
 │       ├── journal.py                # Trade journal (SQLite-backed)
 │       ├── metrics.py                # Performance metrics calculation
-│       └── learner.py                # Strategy weight adjustment from history
+│       ├── attribution.py            # P&L attribution by strategy/regime/session
+│       ├── learner.py                # Strategy weight adjustment from history
+│       └── alerts.py                 # Alert manager with log/file/webhook backends
 │
 ├── dashboard/
 │   └── app.py                        # Streamlit dashboard
@@ -158,6 +161,7 @@ algotrader/
 ├── scripts/
 │   ├── check_live.py                 # Query live positions/orders/account
 │   ├── cleanup.py                    # Cancel all orders, close all positions
+│   ├── analyze_trades.py             # Historical trade analysis + CSV export
 │   └── run.py                        # Main entry point
 │
 ├── tests/
@@ -229,12 +233,16 @@ All strategies implement StrategyBase with @register_strategy decorator:
 5. **Config** (`algotrader/core/config.py`): `StrategySelectorConfig` pydantic model with all thresholds configurable
 6. **Orchestrator integration**: Pre-market scoring/allocation, per-cycle mid-day review, shutdown status logging, fallback to static YAML when disabled
 
-### Phase 5 — Learning & Dashboard
+### Phase 5 — Learning & Dashboard (COMPLETE)
 
-1. Performance attribution
-2. Strategy weight learner
-3. Streamlit dashboard
-4. Alerting
+1. **Performance metrics** (`algotrader/tracking/metrics.py`): MetricsCalculator — Sharpe ratio, profit factor, expectancy, max drawdown, win streaks, avg hold time. Supports filtering by strategy, date range, and regime.
+2. **Performance attribution** (`algotrader/tracking/attribution.py`): Daily/weekly P&L attribution by strategy, regime, and session (morning/midday/afternoon). Regime accuracy scoring.
+3. **Strategy weight learner** (`algotrader/tracking/learner.py`): Conservative regime-strategy weight adjustment from trade history. Min 20 trades per combo, max ±0.10 per cycle, confidence gating, YAML backup before writes.
+4. **Alerting system** (`algotrader/tracking/alerts.py`): AlertManager with log/file/webhook backends. Auto-subscribes to EventBus (kill switch, regime change, strategy disabled). Big win/loss detection, daily summary alerts.
+5. **Streamlit dashboard** (`dashboard/app.py`): 5-tab dashboard (Overview, Strategies, Trades, Performance, Intelligence). Reads SQLite journal + JSON state files. Auto-refresh option.
+6. **Config** (`algotrader/core/config.py`): AlertsConfig model with thresholds and webhook URL
+7. **Orchestrator integration**: Post-market attribution, weekly weight learning (Fridays), daily summary alerts, dashboard state writes every 5th cycle
+8. **Scripts**: `check_live.py` (account/positions/orders query), `cleanup.py` (emergency cancel+close with --confirm), `analyze_trades.py` (metrics, by-regime, CSV export)
 
 ## Critical Implementation Rules
 
