@@ -26,6 +26,13 @@ logging:
   file: "data/logs/algotrader.log"
   json_format: true
 
+alerts:
+  enabled: true
+  big_win_threshold: 500.0
+  big_loss_threshold: -300.0
+  webhook_url: ""               # Set for Telegram/Slack/Discord
+  alert_file: "data/logs/alerts.log"
+
 strategy_selector:
   enabled: true
   regime_config: "config/regimes.yaml"

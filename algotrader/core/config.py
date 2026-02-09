@@ -81,6 +81,16 @@ class StrategyConfig(BaseModel):
     params: dict[str, Any] = Field(default_factory=dict)
 
 
+class AlertsConfig(BaseModel):
+    """Config for the alerting system."""
+
+    enabled: bool = True
+    big_win_threshold: float = 500.0
+    big_loss_threshold: float = -300.0
+    webhook_url: str = ""
+    alert_file: str = "data/logs/alerts.log"
+
+
 class StrategySelectorConfig(BaseModel):
     """Config for the Phase 4 strategy selection engine."""
 
@@ -110,6 +120,7 @@ class Settings(BaseModel):
     alpaca: AlpacaConfig = Field(default_factory=AlpacaConfig)
     strategies: dict[str, StrategyConfig] = Field(default_factory=dict)
     strategy_selector: StrategySelectorConfig = Field(default_factory=StrategySelectorConfig)
+    alerts: AlertsConfig = Field(default_factory=AlertsConfig)
 
 
 # ── Loader ───────────────────────────────────────────────────────────────────

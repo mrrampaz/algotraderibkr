@@ -6,9 +6,11 @@ Lifecycle: initialize → warm up strategies → run loop
 
 from __future__ import annotations
 
+import json
 import signal as os_signal
 import time
 from datetime import datetime
+from pathlib import Path
 
 import pytz
 import structlog
@@ -35,6 +37,13 @@ from algotrader.strategy_selector.allocator import CapitalAllocator
 from algotrader.strategy_selector.reviewer import MidDayReviewer
 from algotrader.tracking.journal import TradeJournal
 from algotrader.tracking.portfolio import PortfolioTracker
+from algotrader.tracking.metrics import MetricsCalculator
+from algotrader.tracking.attribution import PerformanceAttribution
+from algotrader.tracking.learner import StrategyWeightLearner
+from algotrader.tracking.alerts import (
+    AlertManager, AlertType, AlertLevel, Alert,
+    LogAlertBackend, FileAlertBackend, WebhookAlertBackend,
+)
 
 logger = structlog.get_logger()
 
@@ -157,6 +166,33 @@ class Orchestrator:
                 self._scorer = None
                 self._allocator = None
                 self._reviewer = None
+
+        # Phase 5: Metrics, Attribution, Learner
+        self._metrics = MetricsCalculator(trade_journal=self._trade_journal)
+        self._attribution = PerformanceAttribution(
+            trade_journal=self._trade_journal,
+            metrics_calculator=self._metrics,
+        )
+        self._learner = StrategyWeightLearner(
+            trade_journal=self._trade_journal,
+            metrics_calculator=self._metrics,
+        )
+
+        # Phase 5: Alerting
+        alert_backends: list = [LogAlertBackend()]
+        if settings.alerts.enabled:
+            alert_backends.append(FileAlertBackend(filepath=settings.alerts.alert_file))
+            if settings.alerts.webhook_url:
+                alert_backends.append(WebhookAlertBackend(settings.alerts.webhook_url))
+        self._alert_manager = AlertManager(
+            event_bus=self._event_bus,
+            backends=alert_backends,
+            big_win_threshold=settings.alerts.big_win_threshold,
+            big_loss_threshold=settings.alerts.big_loss_threshold,
+        )
+
+        # Dashboard state cycle counter
+        self._cycle_count = 0
 
         # Strategies
         self._strategies: dict[str, StrategyBase] = {}
@@ -347,6 +383,14 @@ class Orchestrator:
         # Evict expired cache entries periodically
         self._data_cache.evict_expired()
 
+        # Write dashboard state every 5th cycle
+        self._cycle_count += 1
+        if self._cycle_count % 5 == 0:
+            try:
+                self._write_dashboard_state()
+            except Exception:
+                self._log.debug("dashboard_state_write_failed")
+
     def _run_pre_market_intelligence(self) -> None:
         """Run pre-market intelligence gathering.
 
@@ -388,6 +432,7 @@ class Orchestrator:
             self._log.exception("initial_regime_detection_failed")
 
         # 3. Scan for gaps
+        gaps = []
         try:
             gaps = self._gap_scanner.scan()
             if gaps:
@@ -441,6 +486,13 @@ class Orchestrator:
                 self._log.exception("pre_market_allocation_failed")
                 # Fallback: keep static YAML allocations (already set in initialize())
 
+        # 7. Write intelligence state for dashboard
+        try:
+            upcoming = self._event_calendar.get_upcoming_events(7) if hasattr(self, '_event_calendar') else []
+            self._write_intelligence_state(gaps, [], upcoming)
+        except Exception:
+            self._log.debug("intelligence_state_write_failed")
+
         self._log.info("pre_market_intelligence_complete")
 
     def shutdown(self) -> None:
@@ -486,10 +538,121 @@ class Orchestrator:
         except Exception:
             self._log.exception("strategy_status_log_failed")
 
+        # Post-market analysis: attribution
+        try:
+            attribution = self._attribution.daily_report()
+            self._log.info(
+                "daily_attribution",
+                total_pnl=attribution.total_pnl,
+                by_strategy=attribution.by_strategy,
+                by_session=attribution.by_session,
+                regime_accuracy=attribution.regime_accuracy,
+                return_on_deployed=f"{attribution.return_on_deployed:.2f}%",
+            )
+        except Exception:
+            self._log.exception("attribution_failed")
+
+        # Post-market analysis: weekly weight learning (Fridays)
+        try:
+            et_now = datetime.now(pytz.timezone("America/New_York"))
+            if et_now.weekday() == 4:  # Friday
+                adjustments = self._learner.auto_learn(days=30)
+                if adjustments:
+                    self._log.info(
+                        "weight_adjustments_applied",
+                        count=len(adjustments),
+                        adjustments=[
+                            {"regime": a.regime, "strategy": a.strategy,
+                             "old": a.old_weight, "new": a.new_weight}
+                            for a in adjustments
+                        ],
+                    )
+                    self._alert_manager.send_alert(Alert(
+                        alert_type=AlertType.WEIGHT_ADJUSTMENT,
+                        level=AlertLevel.INFO,
+                        title="Weekly Weight Update",
+                        message=f"{len(adjustments)} regime weights adjusted",
+                        timestamp=datetime.now(pytz.UTC),
+                    ))
+        except Exception:
+            self._log.exception("weight_learning_failed")
+
+        # Post-market analysis: daily summary alert
+        try:
+            summary = self._trade_journal.get_daily_summary()
+            self._alert_manager.send_daily_summary(summary)
+        except Exception:
+            self._log.exception("daily_summary_alert_failed")
+
+        # Write final dashboard state
+        try:
+            self._write_dashboard_state()
+        except Exception:
+            self._log.debug("final_dashboard_state_write_failed")
+
         # Clean up
         self._trade_journal.close()
         self._event_bus.clear()
         self._log.info("shutdown_complete")
+
+    def _write_dashboard_state(self) -> None:
+        """Write state files for the Streamlit dashboard to read."""
+        state_dir = Path("data/state")
+        state_dir.mkdir(parents=True, exist_ok=True)
+
+        # Broker snapshot
+        try:
+            snapshot = self._portfolio_tracker.get_snapshot()
+            with open(state_dir / "broker_snapshot.json", "w") as f:
+                json.dump(snapshot, f, default=str)
+        except Exception:
+            pass
+
+        # Regime
+        if self._current_regime:
+            try:
+                with open(state_dir / "regime.json", "w") as f:
+                    json.dump(self._current_regime.model_dump(), f, default=str)
+            except Exception:
+                pass
+
+    def _write_intelligence_state(self, gaps, volume_results, events) -> None:
+        """Write scanner/intelligence results for dashboard."""
+        state_dir = Path("data/state")
+        state_dir.mkdir(parents=True, exist_ok=True)
+
+        if gaps:
+            try:
+                with open(state_dir / "gaps.json", "w") as f:
+                    json.dump(
+                        [{"symbol": g.symbol, "gap_pct": g.gap_pct,
+                          "direction": g.direction, "volume": g.pre_market_volume}
+                         for g in gaps], f, default=str,
+                    )
+            except Exception:
+                pass
+
+        if volume_results:
+            try:
+                with open(state_dir / "unusual_volume.json", "w") as f:
+                    json.dump(
+                        [{"symbol": v.symbol, "ratio": v.volume_ratio,
+                          "price_change": v.price_change_pct}
+                         for v in volume_results], f, default=str,
+                    )
+            except Exception:
+                pass
+
+        if events:
+            try:
+                with open(state_dir / "upcoming_events.json", "w") as f:
+                    json.dump(
+                        [{"date": str(e.date), "type": e.event_type.value,
+                          "description": e.description, "impact": e.impact}
+                         for e in events], f, default=str,
+                    )
+            except Exception:
+                pass
 
     def _on_kill_switch(self, reason: str = "") -> None:
         """Handle kill switch event."""
