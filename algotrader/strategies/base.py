@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 from datetime import datetime, date
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,22 @@ from algotrader.data.provider import DataProvider
 from algotrader.execution.executor import Executor
 
 logger = structlog.get_logger()
+
+
+@dataclass
+class OpportunityAssessment:
+    """What a strategy sees right now."""
+
+    num_candidates: int = 0
+    avg_risk_reward: float = 0.0
+    confidence: float = 0.0          # 0.0-1.0
+    estimated_daily_trades: int = 0
+    estimated_edge_pct: float = 0.0  # Expected return on deployed capital
+    details: list[dict] = field(default_factory=list)
+
+    @property
+    def has_opportunities(self) -> bool:
+        return self.num_candidates > 0 and self.confidence > 0.0
 
 
 class StrategyBase(ABC):
@@ -153,6 +170,10 @@ class StrategyBase(ABC):
     def on_signal(self, signal: Signal) -> None:
         """Called when a signal is generated. Override for custom handling."""
         pass
+
+    def assess_opportunities(self, regime: MarketRegime | None = None) -> OpportunityAssessment:
+        """Assess tradeable opportunities right now. Override in each strategy."""
+        return OpportunityAssessment()
 
     # ── Status ────────────────────────────────────────────────────────
 

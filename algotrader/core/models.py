@@ -197,7 +197,7 @@ class Signal(BaseModel):
     strategy_name: str
     symbol: str
     direction: SignalDirection
-    conviction: float = 1.0  # 0.5 to 1.5 multiplier
+    conviction: float = 0.5  # 0.0 to 1.0 confidence
     target_price: float | None = None
     stop_price: float | None = None
     reason: str = ""
