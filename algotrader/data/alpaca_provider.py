@@ -9,7 +9,9 @@ import pandas as pd
 import pytz
 import structlog
 from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data import NewsClient as AlpacaNewsClient
 from alpaca.data.requests import (
+    NewsRequest,
     StockBarsRequest,
     StockLatestQuoteRequest,
     StockSnapshotRequest,
@@ -55,6 +57,10 @@ class AlpacaDataProvider:
             api_key=config.api_key,
             secret_key=config.secret_key,
             paper=config.paper,
+        )
+        self._news_client = AlpacaNewsClient(
+            api_key=config.api_key,
+            secret_key=config.secret_key,
         )
 
         self._log.info("alpaca_data_provider_initialized")
@@ -328,33 +334,24 @@ class AlpacaDataProvider:
         symbols: list[str] | None = None,
         limit: int = 50,
     ) -> list[NewsItem]:
-        """Get news from Alpaca news API.
-
-        Tries the StockHistoricalDataClient first; falls back to a
-        dedicated NewsClient if the data client doesn't support news.
-        """
+        """Get news from Alpaca news API via dedicated NewsClient."""
         try:
-            from alpaca.data.requests import NewsRequest
-
             request_params = {"limit": limit}
             if symbols:
                 request_params["symbols"] = symbols
 
             request = NewsRequest(**request_params)
+            result = self._news_client.get_news(request)
 
-            # Try data client first, fall back to dedicated NewsClient
-            try:
-                news = self._data_client.get_news(request)
-            except (AttributeError, TypeError):
-                from alpaca.data.news import NewsClient
-                news_client = NewsClient(
-                    api_key=self._config.api_key,
-                    secret_key=self._config.secret_key,
-                )
-                news = news_client.get_news(request)
+            # alpaca-py 0.43+: NewsSet.data is dict with 'news' key
+            if hasattr(result, "data") and isinstance(result.data, dict):
+                news_list = result.data.get("news", [])
+            elif hasattr(result, "news"):
+                news_list = result.news
+            else:
+                news_list = []
 
             items = []
-            news_list = news.news if hasattr(news, "news") else news
             for article in news_list:
                 items.append(NewsItem(
                     id=str(article.id),
