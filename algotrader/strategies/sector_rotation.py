@@ -132,24 +132,27 @@ class SectorRotationStrategy(StrategyBase):
         self._warmed_up = True
 
     def run_cycle(self, regime: MarketRegime | None = None) -> list[Signal]:
-        """Run one cycle: rebalance if interval elapsed."""
+        """Run one cycle: manage positions, rebalance if interval elapsed."""
         self._check_day_reset()
         self._last_cycle_time = datetime.now(pytz.UTC)
         signals: list[Signal] = []
 
-        # 1. Check regime filter
+        # 1. Calculate RS scores and manage existing positions FIRST (always)
+        if self._trades:
+            self._calculate_all_rs()
+            signals.extend(self._manage_positions())
+
+        # 2. Check regime filter (only gates new entries / rebalance)
         if regime and regime.regime_type.value not in self._allowed_regimes:
             return signals
 
-        # 2. Check if it's time to rebalance
+        # 3. Check if it's time to rebalance
         if not self._should_rebalance():
             return signals
 
-        # 3. Calculate all RS scores
-        self._calculate_all_rs()
-
-        # 4. Manage existing positions
-        signals.extend(self._manage_positions())
+        # 4. Calculate RS scores for rebalance (if not already done above)
+        if not self._trades:
+            self._calculate_all_rs()
 
         # 5. Open new positions
         signals.extend(self._rebalance())
@@ -288,8 +291,8 @@ class SectorRotationStrategy(StrategyBase):
         if current_price is None or current_price <= 0:
             return None
 
-        # Equal-weight sizing across max_positions
-        per_position_capital = self._total_capital * (self.config.capital_allocation_pct / 100) / self.config.max_positions
+        # Equal-weight sizing across max_positions (_total_capital is already allocated)
+        per_position_capital = self._total_capital / self.config.max_positions
         shares = int(per_position_capital / current_price)
 
         if shares <= 0:

@@ -132,15 +132,15 @@ class OptionsPremiumStrategy(StrategyBase):
         if et_now.hour < self._entry_start_hour:
             self._entry_attempted_today = False
 
-        # 1. Check regime filter
+        # 1. Manage existing positions FIRST (always, regardless of regime)
+        signals.extend(self._manage_positions(et_now, regime))
+
+        # 2. Check regime filter (only gates new entries)
         if regime:
             if regime.regime_type.value in self._blocked_regimes:
                 return signals
             if regime.regime_type.value not in self._allowed_regimes:
                 return signals
-
-        # 2. Manage existing positions FIRST
-        signals.extend(self._manage_positions(et_now, regime))
 
         # 3. Check entry window
         if not self._entry_attempted_today and len(self._trades) < self.config.max_positions:

@@ -194,6 +194,11 @@ class Orchestrator:
         # Dashboard state cycle counter
         self._cycle_count = 0
 
+        # Pre-market refresh tracking
+        self._last_premarket_refresh: float = 0.0
+        self._premarket_refresh_interval = 900  # 15 minutes
+        self._volume_refreshed_today = False
+
         # Strategies
         self._strategies: dict[str, StrategyBase] = {}
 
@@ -319,7 +324,7 @@ class Orchestrator:
         """Execute one trading cycle."""
         # Check if market is open
         if not self._data_provider.is_market_open():
-            self._log.debug("market_closed")
+            self._maybe_refresh_premarket()
             return
 
         # Check if killed
@@ -391,6 +396,132 @@ class Orchestrator:
             except Exception:
                 self._log.debug("dashboard_state_write_failed")
 
+    def _maybe_refresh_premarket(self) -> None:
+        """Check if we should refresh pre-market data during the wait loop.
+
+        Only refreshes on trading days between 7:00-9:30 AM ET, throttled
+        to every 15 minutes.
+        """
+        now = time.time()
+
+        # Throttle: skip if refreshed recently
+        if now - self._last_premarket_refresh < self._premarket_refresh_interval:
+            # Periodic heartbeat so logs don't look dead
+            self._cycle_count += 1
+            if self._cycle_count % 12 == 0:  # ~1 hour at 5-min cycles
+                self._log.info("waiting_for_market_open")
+            return
+
+        # Check if it's a trading day in pre-market window
+        try:
+            clock = self._data_provider.get_clock()
+            et_tz = pytz.timezone("America/New_York")
+            now_et = datetime.now(pytz.UTC).astimezone(et_tz)
+
+            # next_open is today = it's a trading day and market hasn't opened yet
+            next_open_et = clock.next_open.astimezone(et_tz)
+            is_trading_day_premarket = (
+                not clock.is_open
+                and next_open_et.date() == now_et.date()
+                and 7 <= now_et.hour < 10  # 7:00 AM - 9:59 AM ET window
+            )
+
+            if not is_trading_day_premarket:
+                self._cycle_count += 1
+                if self._cycle_count % 12 == 0:
+                    self._log.info("market_closed_not_trading_day")
+                return
+        except Exception:
+            self._log.exception("premarket_clock_check_failed")
+            return
+
+        # Do the refresh
+        self._last_premarket_refresh = now
+        self._refresh_premarket_intelligence(now_et)
+
+    def _refresh_premarket_intelligence(self, now_et: datetime) -> None:
+        """Refresh pre-market data: gaps, regime, news, and optionally volume."""
+        self._log.info("premarket_refresh_starting", time_et=now_et.strftime("%H:%M"))
+
+        # 1. Re-scan gaps (idempotent, cheap)
+        gaps = []
+        try:
+            gaps = self._gap_scanner.scan()
+            if gaps:
+                self._log.info(
+                    "premarket_gaps_refreshed",
+                    count=len(gaps),
+                    top_gap=f"{gaps[0].symbol} {gaps[0].gap_pct:+.1f}%",
+                )
+                # Pass gap candidates to gap_reversal strategy
+                self._pass_gap_candidates(gaps)
+        except Exception:
+            self._log.exception("premarket_gap_refresh_failed")
+
+        # 2. Re-detect regime
+        try:
+            self._current_regime = self._regime_detector.detect()
+            self._log.info(
+                "premarket_regime_refreshed",
+                regime=self._current_regime.regime_type.value,
+                confidence=self._current_regime.confidence,
+            )
+        except Exception:
+            self._log.exception("premarket_regime_refresh_failed")
+
+        # 3. Fetch news
+        try:
+            news = self._news_client.fetch_news(limit=30)
+            self._log.info(
+                "premarket_news_refreshed",
+                total=len(news.items),
+                bullish=news.bullish_count,
+                bearish=news.bearish_count,
+            )
+        except Exception:
+            self._log.exception("premarket_news_refresh_failed")
+
+        # 4. Volume scanner warm-up once close to open (after 9:15 AM ET)
+        if now_et.hour == 9 and now_et.minute >= 15 and not self._volume_refreshed_today:
+            try:
+                self._volume_scanner.warm_up()
+                self._volume_refreshed_today = True
+                self._log.info("premarket_volume_refreshed")
+            except Exception:
+                self._log.exception("premarket_volume_refresh_failed")
+
+        # 5. Re-score strategies with fresh data
+        if self._scorer and self._allocator and self._current_regime:
+            try:
+                strategy_names = list(self._strategies.keys())
+                scores = self._scorer.score_strategies(
+                    strategy_names,
+                    self._current_regime,
+                    vix_level=self._current_regime.vix_level,
+                )
+                account = self._executor.get_account()
+                allocations = self._allocator.allocate(scores, current_equity=account.equity)
+                self._allocator.apply_allocations(allocations, self._strategies)
+                self._log.info(
+                    "premarket_allocations_refreshed",
+                    allocations={
+                        a.strategy_name: f"{a.allocation_pct:.1f}%"
+                        for a in allocations if a.is_active
+                    },
+                )
+            except Exception:
+                self._log.exception("premarket_allocation_refresh_failed")
+
+        # 6. Write updated state for dashboard
+        try:
+            upcoming = self._event_calendar.get_upcoming_events(7) if hasattr(self, '_event_calendar') else []
+            self._write_intelligence_state(gaps, [], upcoming)
+            self._write_dashboard_state()
+        except Exception:
+            self._log.debug("premarket_state_write_failed")
+
+        self._log.info("premarket_refresh_complete")
+
     def _run_pre_market_intelligence(self) -> None:
         """Run pre-market intelligence gathering.
 
@@ -441,6 +572,8 @@ class Orchestrator:
                     count=len(gaps),
                     top_gap=f"{gaps[0].symbol} {gaps[0].gap_pct:+.1f}%" if gaps else "",
                 )
+                # Pass gap candidates to gap_reversal strategy
+                self._pass_gap_candidates(gaps)
         except Exception:
             self._log.exception("gap_scan_failed")
 
@@ -653,6 +786,22 @@ class Orchestrator:
                     )
             except Exception:
                 pass
+
+    def _pass_gap_candidates(self, gaps: list) -> None:
+        """Pass gap scanner results to the gap_reversal strategy."""
+        gap_strategy = self._strategies.get("gap_reversal")
+        if gap_strategy and hasattr(gap_strategy, "set_gap_candidates"):
+            candidates = [
+                {
+                    "symbol": g.symbol,
+                    "gap_pct": g.gap_pct,
+                    "prev_close": g.prev_close,
+                    "current_price": g.current_price,
+                    "direction": g.direction,
+                }
+                for g in gaps
+            ]
+            gap_strategy.set_gap_candidates(candidates)
 
     def _on_kill_switch(self, reason: str = "") -> None:
         """Handle kill switch event."""

@@ -115,14 +115,14 @@ class MomentumStrategy(StrategyBase):
         self._last_cycle_time = datetime.now(pytz.UTC)
         signals: list[Signal] = []
 
-        # 1. Check regime filter
-        if regime and regime.regime_type.value not in self._allowed_regimes:
-            return signals
-
         et_now = datetime.now(ET)
 
-        # 2. Manage existing positions FIRST
+        # 1. Manage existing positions FIRST (always, regardless of regime)
         signals.extend(self._manage_positions(et_now))
+
+        # 2. Check regime filter (only gates new entries)
+        if regime and regime.regime_type.value not in self._allowed_regimes:
+            return signals
 
         # 3. Scan for new entries if scan interval elapsed
         if self._should_scan(et_now) and len(self._trades) < self.config.max_positions:
