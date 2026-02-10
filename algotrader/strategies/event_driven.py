@@ -24,7 +24,7 @@ from algotrader.core.models import (
 )
 from algotrader.data.provider import DataProvider
 from algotrader.execution.executor import Executor
-from algotrader.strategies.base import StrategyBase
+from algotrader.strategies.base import OpportunityAssessment, StrategyBase
 from algotrader.strategies.registry import register_strategy
 
 logger = structlog.get_logger()
@@ -442,6 +442,53 @@ class EventDrivenStrategy(StrategyBase):
         except Exception:
             pass
         return None
+
+    def assess_opportunities(self, regime: MarketRegime | None = None) -> OpportunityAssessment:
+        """Assess event-driven opportunities from today's calendar."""
+        try:
+            if not self._events_checked_today:
+                self._check_today_events()
+
+            if not self._today_events:
+                return OpportunityAssessment()
+
+            # Count actionable events (not already traded)
+            actionable = []
+            for event in self._today_events:
+                event_type = event["type"]
+                # Check if any instrument for this event is already traded
+                already_traded = any(
+                    f"{event_type}_{sym}" in self._trades
+                    for sym in self._instruments
+                )
+                if not already_traded:
+                    actionable.append(event)
+
+            if not actionable:
+                return OpportunityAssessment()
+
+            # Higher impact events = higher confidence
+            avg_impact = sum(e.get("impact", 2) for e in actionable) / len(actionable)
+            confidence = min(1.0, len(actionable) * 0.2 + (avg_impact - 1) * 0.15)
+            trades_per_event = len(self._instruments)
+
+            return OpportunityAssessment(
+                num_candidates=len(actionable) * trades_per_event,
+                avg_risk_reward=self._target_rr,
+                confidence=round(max(0.0, confidence), 2),
+                estimated_daily_trades=min(
+                    len(actionable) * trades_per_event,
+                    self.config.max_positions - len(self._trades),
+                ),
+                estimated_edge_pct=round(self._post_event_move_threshold * self._target_rr * 0.4, 2),
+                details=[
+                    {"event": e["type"], "impact": e.get("impact"), "time": e.get("time", "")}
+                    for e in actionable
+                ],
+            )
+        except Exception:
+            self._log.debug("assess_opportunities_failed")
+            return OpportunityAssessment()
 
     def _get_state(self) -> dict[str, Any]:
         """Serialize state for persistence."""

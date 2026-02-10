@@ -27,7 +27,7 @@ from algotrader.core.models import (
 )
 from algotrader.data.provider import DataProvider
 from algotrader.execution.executor import Executor
-from algotrader.strategies.base import StrategyBase
+from algotrader.strategies.base import OpportunityAssessment, StrategyBase
 from algotrader.strategies.registry import register_strategy
 
 logger = structlog.get_logger()
@@ -491,6 +491,62 @@ class OptionsPremiumStrategy(StrategyBase):
         except Exception:
             pass
         return None
+
+    def assess_opportunities(self, regime: MarketRegime | None = None) -> OpportunityAssessment:
+        """Assess options premium selling conditions."""
+        try:
+            # Regime gate
+            if regime:
+                if regime.regime_type.value in self._blocked_regimes:
+                    return OpportunityAssessment()
+                if regime.regime_type.value not in self._allowed_regimes:
+                    return OpportunityAssessment()
+
+            # VIX proxy check
+            vix_level = regime.vix_level if regime and regime.vix_level else None
+            if vix_level is not None and vix_level < self._min_vix_proxy:
+                return OpportunityAssessment(
+                    num_candidates=0,
+                    confidence=0.0,
+                    details=[{"reason": f"VIX {vix_level:.1f} < min {self._min_vix_proxy}"}],
+                )
+
+            # Count available underlyings not already traded
+            available = [u for u in self._underlyings if u not in self._trades]
+            if not available:
+                return OpportunityAssessment()
+
+            # Estimate credit quality from ATR
+            valid = []
+            for underlying in available:
+                try:
+                    atr = self._get_atr(underlying)
+                    if atr and atr > 0:
+                        valid.append({"symbol": underlying, "atr": round(atr, 2)})
+                except Exception:
+                    continue
+
+            if not valid:
+                return OpportunityAssessment()
+
+            # Higher VIX = higher confidence for premium selling
+            vix_boost = min(0.3, (vix_level - self._min_vix_proxy) * 0.02) if vix_level else 0.0
+            confidence = min(1.0, 0.4 + len(valid) * 0.1 + vix_boost)
+
+            # R:R for credit spreads: ~0.33 (25% credit / 75% risk)
+            rr = 0.33
+
+            return OpportunityAssessment(
+                num_candidates=len(valid),
+                avg_risk_reward=rr,
+                confidence=round(max(0.0, confidence), 2),
+                estimated_daily_trades=min(len(valid), self.config.max_positions),
+                estimated_edge_pct=round(rr * 0.5, 2),
+                details=valid,
+            )
+        except Exception:
+            self._log.debug("assess_opportunities_failed")
+            return OpportunityAssessment()
 
     def _get_state(self) -> dict[str, Any]:
         """Serialize state for persistence."""

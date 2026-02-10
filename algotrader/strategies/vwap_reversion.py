@@ -25,7 +25,7 @@ from algotrader.core.models import (
 )
 from algotrader.data.provider import DataProvider
 from algotrader.execution.executor import Executor
-from algotrader.strategies.base import StrategyBase
+from algotrader.strategies.base import OpportunityAssessment, StrategyBase
 from algotrader.strategies.registry import register_strategy
 
 logger = structlog.get_logger()
@@ -355,6 +355,47 @@ class VWAPReversionStrategy(StrategyBase):
         except Exception:
             pass
         return None
+
+    def assess_opportunities(self, regime: MarketRegime | None = None) -> OpportunityAssessment:
+        """Assess VWAP deviation opportunities across universe."""
+        try:
+            # Regime gate — only active in ranging/low_vol
+            if regime and regime.regime_type.value not in self._allowed_regimes:
+                return OpportunityAssessment()
+
+            candidates = []
+            for symbol in self._universe:
+                if symbol in self._trades:
+                    continue
+                try:
+                    bars = self.data_provider.get_bars(
+                        symbol, self._bar_timeframe, self._vwap_lookback_bars,
+                    )
+                    if bars.empty or len(bars) < 10:
+                        continue
+                    _, z_score = calculate_vwap_zscore(bars)
+                    if abs(z_score) >= self._min_z_score:
+                        candidates.append({"symbol": symbol, "z_score": round(z_score, 2)})
+                except Exception:
+                    continue
+
+            if not candidates:
+                return OpportunityAssessment()
+
+            avg_z = sum(abs(c["z_score"]) for c in candidates) / len(candidates)
+            confidence = min(1.0, len(candidates) * 0.12 + (avg_z - self._min_z_score) * 0.15)
+
+            return OpportunityAssessment(
+                num_candidates=len(candidates),
+                avg_risk_reward=self._target_pct / self._stop_pct if self._stop_pct > 0 else 2.0,
+                confidence=round(max(0.0, confidence), 2),
+                estimated_daily_trades=min(len(candidates), self.config.max_positions),
+                estimated_edge_pct=round(0.15 * avg_z, 2),
+                details=candidates[:5],
+            )
+        except Exception:
+            self._log.debug("assess_opportunities_failed")
+            return OpportunityAssessment()
 
     def _get_state(self) -> dict[str, Any]:
         """Serialize state for persistence."""

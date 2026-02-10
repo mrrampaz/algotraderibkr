@@ -27,7 +27,7 @@ from algotrader.core.models import (
 )
 from algotrader.data.provider import DataProvider
 from algotrader.execution.executor import Executor
-from algotrader.strategies.base import StrategyBase
+from algotrader.strategies.base import OpportunityAssessment, StrategyBase
 from algotrader.strategies.registry import register_strategy
 
 logger = structlog.get_logger()
@@ -517,6 +517,56 @@ class PairsTradingStrategy(StrategyBase):
         state.qty_b = 0
         state.bars_in_position = 0
         state.trade_id = ""
+
+    def assess_opportunities(self, regime: MarketRegime | None = None) -> OpportunityAssessment:
+        """Assess pairs with cointegration and z-scores near entry."""
+        try:
+            cointegrated = [
+                s for s in self._pair_states.values()
+                if s.is_cointegrated and not s.is_positioned
+            ]
+
+            if not cointegrated:
+                return OpportunityAssessment()
+
+            # Count pairs near entry threshold
+            near_entry = []
+            for s in cointegrated:
+                if abs(s.z_score) >= self._z_entry * 0.7:
+                    near_entry.append(s)
+
+            if not near_entry:
+                return OpportunityAssessment(
+                    num_candidates=0,
+                    confidence=0.1,
+                    details=[
+                        {"pair": s.config.pair_id, "z": round(s.z_score, 2)}
+                        for s in cointegrated[:5]
+                    ],
+                )
+
+            avg_z = sum(abs(s.z_score) for s in near_entry) / len(near_entry)
+            # Higher z-score = better setup, but cap confidence
+            confidence = min(1.0, len(near_entry) * 0.15 + (avg_z - self._z_entry) * 0.2)
+
+            return OpportunityAssessment(
+                num_candidates=len(near_entry),
+                avg_risk_reward=2.0,
+                confidence=round(max(0.0, confidence), 2),
+                estimated_daily_trades=min(len(near_entry), self._max_pairs),
+                estimated_edge_pct=round(0.2 * avg_z, 2),
+                details=[
+                    {
+                        "pair": s.config.pair_id,
+                        "z_score": round(s.z_score, 2),
+                        "correlation": round(s.correlation, 2),
+                    }
+                    for s in near_entry[:5]
+                ],
+            )
+        except Exception:
+            self._log.debug("assess_opportunities_failed")
+            return OpportunityAssessment()
 
     def on_fill(self, order: Order) -> None:
         """Handle fill events for pairs legs."""

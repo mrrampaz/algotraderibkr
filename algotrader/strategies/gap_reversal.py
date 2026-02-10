@@ -25,7 +25,7 @@ from algotrader.core.models import (
 )
 from algotrader.data.provider import DataProvider
 from algotrader.execution.executor import Executor
-from algotrader.strategies.base import StrategyBase
+from algotrader.strategies.base import OpportunityAssessment, StrategyBase
 from algotrader.strategies.registry import register_strategy
 
 logger = structlog.get_logger()
@@ -514,6 +514,44 @@ class GapReversalStrategy(StrategyBase):
             self._candidates_loaded = True
         except Exception:
             self._log.exception("gap_candidates_load_failed")
+
+    def assess_opportunities(self, regime: MarketRegime | None = None) -> OpportunityAssessment:
+        """Assess gap trading opportunities from scanner candidates."""
+        try:
+            # Regime gate
+            if regime and regime.regime_type.value not in self._allowed_regimes:
+                return OpportunityAssessment()
+
+            if not self._gap_candidates:
+                return OpportunityAssessment()
+
+            qualified = []
+            for c in self._gap_candidates:
+                gap_pct = abs(c.get("gap_pct", 0.0))
+                if self._min_gap_pct <= gap_pct <= self._max_gap_pct:
+                    qualified.append(c)
+
+            if not qualified:
+                return OpportunityAssessment()
+
+            # Confidence: more candidates with larger gaps = higher confidence
+            avg_gap = sum(abs(c.get("gap_pct", 0.0)) for c in qualified) / len(qualified)
+            confidence = min(1.0, len(qualified) * 0.15 + avg_gap * 0.05)
+
+            return OpportunityAssessment(
+                num_candidates=len(qualified),
+                avg_risk_reward=self._go_target_rr,
+                confidence=round(confidence, 2),
+                estimated_daily_trades=min(len(qualified), self.config.max_positions),
+                estimated_edge_pct=round(avg_gap * 0.15, 2),
+                details=[
+                    {"symbol": c["symbol"], "gap_pct": c.get("gap_pct", 0.0)}
+                    for c in qualified[:5]
+                ],
+            )
+        except Exception:
+            self._log.debug("assess_opportunities_failed")
+            return OpportunityAssessment()
 
     def _get_state(self) -> dict[str, Any]:
         """Serialize state for persistence."""

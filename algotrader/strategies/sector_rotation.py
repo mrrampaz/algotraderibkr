@@ -22,7 +22,7 @@ from algotrader.core.models import (
 )
 from algotrader.data.provider import DataProvider
 from algotrader.execution.executor import Executor
-from algotrader.strategies.base import StrategyBase
+from algotrader.strategies.base import OpportunityAssessment, StrategyBase
 from algotrader.strategies.registry import register_strategy
 
 logger = structlog.get_logger()
@@ -390,6 +390,62 @@ class SectorRotationStrategy(StrategyBase):
         except Exception:
             pass
         return None
+
+    def assess_opportunities(self, regime: MarketRegime | None = None) -> OpportunityAssessment:
+        """Assess sector rotation opportunities via relative strength."""
+        try:
+            # Regime gate
+            if regime and regime.regime_type.value not in self._allowed_regimes:
+                return OpportunityAssessment()
+
+            # Calculate RS scores
+            self._calculate_all_rs()
+
+            if not self._rs_scores:
+                return OpportunityAssessment()
+
+            sorted_rs = sorted(self._rs_scores.items(), key=lambda x: x[1], reverse=True)
+
+            # Check divergence threshold
+            if len(sorted_rs) >= 2:
+                divergence = sorted_rs[0][1] - sorted_rs[-1][1]
+                if divergence < self._min_divergence_pct:
+                    return OpportunityAssessment(
+                        num_candidates=0,
+                        confidence=0.0,
+                        details=[{"divergence": round(divergence, 2), "min": self._min_divergence_pct}],
+                    )
+
+            # Count sectors above long / below short thresholds
+            longs = [s for s, rs in sorted_rs if rs >= self._rs_long_threshold and s not in self._trades]
+            shorts = [s for s, rs in sorted_rs if rs <= self._rs_short_threshold and s not in self._trades]
+            candidates = longs + shorts
+
+            if not candidates:
+                return OpportunityAssessment()
+
+            divergence = sorted_rs[0][1] - sorted_rs[-1][1] if len(sorted_rs) >= 2 else 0.0
+            confidence = min(1.0, len(candidates) * 0.12 + divergence * 0.05)
+
+            return OpportunityAssessment(
+                num_candidates=len(candidates),
+                avg_risk_reward=2.0,
+                confidence=round(max(0.0, confidence), 2),
+                estimated_daily_trades=min(len(candidates), self.config.max_positions - len(self._trades)),
+                estimated_edge_pct=round(divergence * 0.1, 2),
+                details=[
+                    {
+                        "symbol": s,
+                        "sector": self._sectors.get(s, ""),
+                        "rs": round(self._rs_scores.get(s, 0.0), 2),
+                        "side": "long" if s in longs else "short",
+                    }
+                    for s in candidates[:5]
+                ],
+            )
+        except Exception:
+            self._log.debug("assess_opportunities_failed")
+            return OpportunityAssessment()
 
     def _get_state(self) -> dict[str, Any]:
         """Serialize state for persistence."""

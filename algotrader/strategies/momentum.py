@@ -23,7 +23,7 @@ from algotrader.core.models import (
 )
 from algotrader.data.provider import DataProvider
 from algotrader.execution.executor import Executor
-from algotrader.strategies.base import StrategyBase
+from algotrader.strategies.base import OpportunityAssessment, StrategyBase
 from algotrader.strategies.registry import register_strategy
 
 logger = structlog.get_logger()
@@ -385,6 +385,53 @@ class MomentumStrategy(StrategyBase):
         except Exception:
             pass
         return None
+
+    def assess_opportunities(self, regime: MarketRegime | None = None) -> OpportunityAssessment:
+        """Assess breakout opportunities via the BreakoutScanner."""
+        try:
+            # Regime gate
+            if regime and regime.regime_type.value not in self._allowed_regimes:
+                return OpportunityAssessment()
+
+            from algotrader.intelligence.scanners.breakout_scanner import BreakoutScanner
+            scanner = BreakoutScanner(
+                data_provider=self.data_provider,
+                min_volume_ratio=self._min_volume_ratio,
+                min_consolidation_days=self._min_consolidation_days,
+            )
+            breakouts = scanner.scan()
+
+            qualified = [
+                bo for bo in breakouts
+                if bo.volume_ratio >= self._min_volume_ratio
+                and bo.consolidation_days >= self._min_consolidation_days
+            ]
+
+            if not qualified:
+                return OpportunityAssessment()
+
+            avg_vol = sum(bo.volume_ratio for bo in qualified) / len(qualified)
+            confidence = min(1.0, len(qualified) * 0.12 + (avg_vol - 1.0) * 0.1)
+
+            return OpportunityAssessment(
+                num_candidates=len(qualified),
+                avg_risk_reward=self._fixed_target_rr,
+                confidence=round(max(0.0, confidence), 2),
+                estimated_daily_trades=min(len(qualified), self.config.max_positions),
+                estimated_edge_pct=round(0.3 * avg_vol, 2),
+                details=[
+                    {
+                        "symbol": bo.symbol,
+                        "type": bo.breakout_type,
+                        "volume_ratio": round(bo.volume_ratio, 1),
+                        "consolidation_days": bo.consolidation_days,
+                    }
+                    for bo in qualified[:5]
+                ],
+            )
+        except Exception:
+            self._log.debug("assess_opportunities_failed")
+            return OpportunityAssessment()
 
     def _get_state(self) -> dict[str, Any]:
         """Serialize state for persistence."""
