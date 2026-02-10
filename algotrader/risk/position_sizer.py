@@ -36,7 +36,7 @@ class PositionSizer:
         self,
         price: float,
         stop_distance: float,
-        conviction: float = 1.0,
+        conviction: float = 0.5,
         reduce_for_drawdown: bool = False,
     ) -> int:
         """Calculate number of shares based on risk.
@@ -44,7 +44,8 @@ class PositionSizer:
         Args:
             price: Entry price per share
             stop_distance: Absolute distance from entry to stop loss
-            conviction: Conviction multiplier (0.5 to 1.5)
+            conviction: Signal conviction (0.0 to 1.0). Mapped to size
+                multiplier via 0.5 + conviction (range 0.5x to 1.5x).
             reduce_for_drawdown: If True, reduce size by 50% (drawdown mode)
 
         Returns:
@@ -53,11 +54,12 @@ class PositionSizer:
         if price <= 0 or stop_distance <= 0:
             return 0
 
-        # Clamp conviction to valid range
-        conviction = max(0.5, min(1.5, conviction))
+        # Map conviction (0.0-1.0) to size multiplier (0.5x-1.5x)
+        conviction = max(0.0, min(1.0, conviction))
+        conviction_mult = 0.5 + conviction
 
         # Dollar risk per trade
-        risk_amount = self._total_capital * self._base_risk_pct * conviction
+        risk_amount = self._total_capital * self._base_risk_pct * conviction_mult
 
         if reduce_for_drawdown:
             risk_amount *= 0.5
@@ -77,6 +79,7 @@ class PositionSizer:
                 price=price,
                 stop_distance=stop_distance,
                 conviction=conviction,
+                conviction_mult=conviction_mult,
             )
             return 0
 
@@ -86,6 +89,7 @@ class PositionSizer:
             price=price,
             stop_distance=stop_distance,
             conviction=conviction,
+            conviction_mult=conviction_mult,
             risk_amount=risk_amount,
             position_value=shares * price,
         )
@@ -96,7 +100,7 @@ class PositionSizer:
         self,
         price: float,
         allocation_pct: float,
-        conviction: float = 1.0,
+        conviction: float = 0.5,
     ) -> int:
         """Calculate shares by percentage of capital allocation.
 
@@ -106,13 +110,15 @@ class PositionSizer:
         Args:
             price: Entry price per share
             allocation_pct: Percentage of capital to allocate (e.g., 2.0 = 2%)
-            conviction: Conviction multiplier (0.5 to 1.5)
+            conviction: Signal conviction (0.0 to 1.0). Mapped to size
+                multiplier via 0.5 + conviction (range 0.5x to 1.5x).
         """
         if price <= 0:
             return 0
 
-        conviction = max(0.5, min(1.5, conviction))
-        target_value = self._total_capital * (allocation_pct / 100) * conviction
+        conviction = max(0.0, min(1.0, conviction))
+        conviction_mult = 0.5 + conviction
+        target_value = self._total_capital * (allocation_pct / 100) * conviction_mult
 
         # Cap at max single position
         max_position_value = self._total_capital * (self._config.max_single_position_pct / 100)

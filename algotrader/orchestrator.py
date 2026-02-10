@@ -497,7 +497,7 @@ class Orchestrator:
         if self._scorer and self._allocator and self._current_regime:
             try:
                 strategy_names = list(self._strategies.keys())
-                assessments = self._gather_assessments(self._current_regime)
+                assessments = self._assess_all_strategies(self._current_regime)
                 scores = self._scorer.score_strategies(
                     strategy_names,
                     self._current_regime,
@@ -604,7 +604,7 @@ class Orchestrator:
         if self._scorer and self._allocator and self._current_regime:
             try:
                 strategy_names = list(self._strategies.keys())
-                assessments = self._gather_assessments(self._current_regime)
+                assessments = self._assess_all_strategies(self._current_regime)
                 scores = self._scorer.score_strategies(
                     strategy_names,
                     self._current_regime,
@@ -794,8 +794,8 @@ class Orchestrator:
             except Exception:
                 pass
 
-    def _gather_assessments(self, regime) -> dict:
-        """Gather opportunity assessments from all strategies."""
+    def _assess_all_strategies(self, regime) -> dict:
+        """Assess opportunities for all strategies, log results, and save to state file."""
         from algotrader.strategies.base import OpportunityAssessment
         assessments: dict[str, OpportunityAssessment] = {}
         for name, strategy in self._strategies.items():
@@ -803,6 +803,41 @@ class Orchestrator:
                 assessments[name] = strategy.assess_opportunities(regime)
             except Exception:
                 self._log.debug("assess_opportunities_failed", strategy=name)
+
+        # Log summary
+        with_opps = {n: a for n, a in assessments.items() if a.has_opportunities}
+        self._log.info(
+            "opportunity_assessments",
+            total=len(assessments),
+            with_opportunities=len(with_opps),
+            details={
+                n: {"candidates": a.num_candidates, "confidence": a.confidence,
+                     "rr": a.avg_risk_reward}
+                for n, a in with_opps.items()
+            },
+        )
+
+        # Save to state file for dashboard
+        try:
+            state_dir = Path("data/state")
+            state_dir.mkdir(parents=True, exist_ok=True)
+            rows = []
+            for name, a in assessments.items():
+                rows.append({
+                    "strategy": name,
+                    "has_opportunities": a.has_opportunities,
+                    "num_candidates": a.num_candidates,
+                    "avg_risk_reward": round(a.avg_risk_reward, 2),
+                    "confidence": round(a.confidence, 2),
+                    "estimated_daily_trades": a.estimated_daily_trades,
+                    "estimated_edge_pct": round(a.estimated_edge_pct, 2),
+                    "details": a.details,
+                })
+            with open(state_dir / "assessments.json", "w") as f:
+                json.dump(rows, f, default=str)
+        except Exception:
+            self._log.debug("assessment_state_write_failed")
+
         return assessments
 
     def _pass_gap_candidates(self, gaps: list) -> None:

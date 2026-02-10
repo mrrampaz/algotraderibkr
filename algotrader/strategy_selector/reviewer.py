@@ -143,9 +143,17 @@ class MidDayReviewer:
 
         actions = []
 
+        # Re-assess opportunities before any review (catches mid-morning setups)
+        assessments = {}
+        for name, strategy in strategies.items():
+            try:
+                assessments[name] = strategy.assess_opportunities(regime)
+            except Exception:
+                pass
+
         if is_regime_change or force:
             # Full re-score and re-allocate on regime change
-            actions = self._full_reallocation(strategies, regime, vix_level)
+            actions = self._full_reallocation(strategies, regime, vix_level, assessments)
         else:
             # Normal scheduled review — adjust based on performance
             actions = self._performance_review(strategies)
@@ -250,17 +258,10 @@ class MidDayReviewer:
         strategies: dict[str, StrategyBase],
         regime: MarketRegime,
         vix_level: float | None,
+        assessments: dict | None = None,
     ) -> list[ReviewAction]:
         """Full re-score and re-allocate (triggered by regime change)."""
         strategy_names = list(strategies.keys())
-
-        # Gather opportunity assessments from all strategies
-        assessments = {}
-        for name, strategy in strategies.items():
-            try:
-                assessments[name] = strategy.assess_opportunities(regime)
-            except Exception:
-                pass
 
         new_scores = self._scorer.score_strategies(
             strategy_names, regime, vix_level, assessments=assessments,
