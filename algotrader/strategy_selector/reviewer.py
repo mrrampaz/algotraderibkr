@@ -253,7 +253,18 @@ class MidDayReviewer:
     ) -> list[ReviewAction]:
         """Full re-score and re-allocate (triggered by regime change)."""
         strategy_names = list(strategies.keys())
-        new_scores = self._scorer.score_strategies(strategy_names, regime, vix_level)
+
+        # Gather opportunity assessments from all strategies
+        assessments = {}
+        for name, strategy in strategies.items():
+            try:
+                assessments[name] = strategy.assess_opportunities(regime)
+            except Exception:
+                pass
+
+        new_scores = self._scorer.score_strategies(
+            strategy_names, regime, vix_level, assessments=assessments,
+        )
         new_allocations = self._allocator.allocate(new_scores)
         self._allocator.apply_allocations(new_allocations, strategies)
 

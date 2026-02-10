@@ -107,6 +107,9 @@ class StrategySelectorConfig(BaseModel):
     scale_up_factor: float = 1.25
     scale_down_factor: float = 0.5
     min_trades_for_review: int = 2
+    cash_threshold: float = 0.25
+    max_single_strategy_pct: float = 70.0
+    concentration_power: float = 2.0
 
 
 class Settings(BaseModel):

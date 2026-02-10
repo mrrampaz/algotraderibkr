@@ -144,6 +144,9 @@ class Orchestrator:
                     risk_config=settings.risk,
                     strategy_configs=settings.strategies,
                     min_allocation_pct=settings.strategy_selector.min_allocation_pct,
+                    cash_threshold=settings.strategy_selector.cash_threshold,
+                    max_single_strategy_pct=settings.strategy_selector.max_single_strategy_pct,
+                    concentration_power=settings.strategy_selector.concentration_power,
                 )
                 self._reviewer = MidDayReviewer(
                     scorer=self._scorer,
@@ -494,10 +497,12 @@ class Orchestrator:
         if self._scorer and self._allocator and self._current_regime:
             try:
                 strategy_names = list(self._strategies.keys())
+                assessments = self._gather_assessments(self._current_regime)
                 scores = self._scorer.score_strategies(
                     strategy_names,
                     self._current_regime,
                     vix_level=self._current_regime.vix_level,
+                    assessments=assessments,
                 )
                 account = self._executor.get_account()
                 allocations = self._allocator.allocate(scores, current_equity=account.equity)
@@ -599,10 +604,12 @@ class Orchestrator:
         if self._scorer and self._allocator and self._current_regime:
             try:
                 strategy_names = list(self._strategies.keys())
+                assessments = self._gather_assessments(self._current_regime)
                 scores = self._scorer.score_strategies(
                     strategy_names,
                     self._current_regime,
                     vix_level=self._current_regime.vix_level,
+                    assessments=assessments,
                 )
                 account = self._executor.get_account()
                 allocations = self._allocator.allocate(scores, current_equity=account.equity)
@@ -786,6 +793,17 @@ class Orchestrator:
                     )
             except Exception:
                 pass
+
+    def _gather_assessments(self, regime) -> dict:
+        """Gather opportunity assessments from all strategies."""
+        from algotrader.strategies.base import OpportunityAssessment
+        assessments: dict[str, OpportunityAssessment] = {}
+        for name, strategy in self._strategies.items():
+            try:
+                assessments[name] = strategy.assess_opportunities(regime)
+            except Exception:
+                self._log.debug("assess_opportunities_failed", strategy=name)
+        return assessments
 
     def _pass_gap_candidates(self, gaps: list) -> None:
         """Pass gap scanner results to the gap_reversal strategy."""

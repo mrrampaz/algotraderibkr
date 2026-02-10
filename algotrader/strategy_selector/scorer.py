@@ -1,7 +1,9 @@
 """Score strategies against current regime and market conditions.
 
-Scoring formula:
-  total_score = clamp(base_weight + vix_mod + perf_mod + time_mod + event_mod, 0.0, 1.0)
+Scoring formula (multiplicative EV):
+  opp_quality = 0.3*(candidates/3) + 0.3*(rr/3) + 0.4*confidence  (0 if no opps)
+  modifiers = vix_mod + perf_mod + time_mod + event_mod
+  total_score = clamp(base_weight * opp_quality * (1 + modifiers), 0.0, 1.0)
   is_active = total_score >= min_activation_score
 """
 
@@ -15,6 +17,7 @@ import structlog
 
 from algotrader.core.models import MarketRegime
 from algotrader.intelligence.calendar.events import EventCalendar
+from algotrader.strategies.base import OpportunityAssessment
 from algotrader.tracking.journal import TradeJournal
 
 logger = structlog.get_logger()
@@ -31,7 +34,9 @@ class StrategyScore:
     performance_modifier: float  # From recent P&L
     time_modifier: float        # From time of day
     event_modifier: float       # From event proximity
+    opportunity_score: float    # From OpportunityAssessment quality
     is_active: bool             # True if score >= min_activation_score
+    assessment: OpportunityAssessment | None = None
 
 
 class StrategyScorer:
@@ -81,10 +86,14 @@ class StrategyScorer:
         strategy_names: list[str],
         regime: MarketRegime,
         vix_level: float | None = None,
+        assessments: dict[str, OpportunityAssessment] | None = None,
     ) -> list[StrategyScore]:
         """Score all strategies. Returns sorted by score (highest first)."""
         scores = [
-            self.score_single(name, regime, vix_level)
+            self.score_single(
+                name, regime, vix_level,
+                assessment=assessments.get(name) if assessments else None,
+            )
             for name in strategy_names
         ]
         scores.sort(key=lambda s: s.total_score, reverse=True)
@@ -106,27 +115,39 @@ class StrategyScorer:
         strategy_name: str,
         regime: MarketRegime,
         vix_level: float | None = None,
+        assessment: OpportunityAssessment | None = None,
     ) -> StrategyScore:
-        """Score a single strategy."""
+        """Score a single strategy using multiplicative EV formula."""
         # 1. Base weight from regime matrix
         regime_key = regime.regime_type.value
         regime_weights = self._regime_weights.get(regime_key, {})
         base_weight = regime_weights.get(strategy_name, 0.0)
 
-        # 2. VIX modifier
+        # 2. Opportunity quality from assessment
+        if assessment and assessment.has_opportunities:
+            opp_quality = (
+                0.3 * min(assessment.num_candidates / 3.0, 1.0)
+                + 0.3 * min(assessment.avg_risk_reward / 3.0, 1.0)
+                + 0.4 * assessment.confidence
+            )
+        else:
+            opp_quality = 0.0  # Zero opportunities = zero score
+
+        # 3. VIX modifier
         vix_mod = self._calc_vix_modifier(strategy_name, vix_level)
 
-        # 3. Performance modifier
+        # 4. Performance modifier
         perf_mod = self._calc_performance_modifier(strategy_name)
 
-        # 4. Time-of-day modifier
+        # 5. Time-of-day modifier
         time_mod = self._calc_time_modifier(strategy_name)
 
-        # 5. Event proximity modifier
+        # 6. Event proximity modifier
         event_mod = self._calc_event_modifier(strategy_name)
 
-        # 6. Total (clamped 0.0-1.0)
-        total = max(0.0, min(1.0, base_weight + vix_mod + perf_mod + time_mod + event_mod))
+        # 7. Multiplicative EV score (clamped 0.0-1.0)
+        modifiers_sum = vix_mod + perf_mod + time_mod + event_mod
+        total = max(0.0, min(1.0, base_weight * opp_quality * (1 + modifiers_sum)))
         is_active = total >= self._min_activation_score
 
         return StrategyScore(
@@ -137,7 +158,9 @@ class StrategyScorer:
             performance_modifier=round(perf_mod, 4),
             time_modifier=round(time_mod, 4),
             event_modifier=round(event_mod, 4),
+            opportunity_score=round(opp_quality, 4),
             is_active=is_active,
+            assessment=assessment,
         )
 
     def _calc_vix_modifier(self, strategy_name: str, vix_level: float | None) -> float:
