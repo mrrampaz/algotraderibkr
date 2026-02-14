@@ -15,10 +15,13 @@ import structlog
 from algotrader.core.config import StrategyConfig
 from algotrader.core.events import EventBus
 from algotrader.core.models import (
-    Order, Signal, StrategyStatus, TradeRecord, MarketRegime,
+    Order, OrderSide, RegimeType, Signal, StrategyStatus, TradeRecord,
+    MarketRegime,
 )
 from algotrader.data.provider import DataProvider
 from algotrader.execution.executor import Executor
+
+from algotrader.tracking.journal import TradeJournal
 
 logger = structlog.get_logger()
 
@@ -76,6 +79,9 @@ class StrategyBase(ABC):
         self._daily_wins: int = 0
         self._daily_losses: int = 0
 
+        # Trade journal (set by orchestrator via set_journal)
+        self._journal: TradeJournal | None = None
+
         # State
         self._enabled: bool = config.enabled
         self._warmed_up: bool = False
@@ -104,6 +110,10 @@ class StrategyBase(ABC):
             return False
         self._capital_reserved += amount
         return True
+
+    def set_journal(self, journal: TradeJournal) -> None:
+        """Inject trade journal for recording completed trades."""
+        self._journal = journal
 
     def release_capital(self, amount: float) -> None:
         """Release reserved capital when a position is closed."""
@@ -136,8 +146,23 @@ class StrategyBase(ABC):
             self._metrics_date = today
             self._log.info("daily_metrics_reset")
 
-    def record_trade(self, pnl: float) -> None:
-        """Record a completed trade's P&L."""
+    def record_trade(
+        self,
+        pnl: float,
+        *,
+        symbol: str = "",
+        side: OrderSide | None = None,
+        qty: float = 0,
+        entry_price: float = 0,
+        exit_price: float = 0,
+        entry_time: datetime | None = None,
+        entry_reason: str = "",
+        exit_reason: str = "",
+        conviction: float = 1.0,
+        regime: RegimeType | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Record a completed trade's P&L and write to journal if available."""
         self._check_day_reset()
         self._daily_pnl += pnl
         self._daily_trades += 1
@@ -145,6 +170,29 @@ class StrategyBase(ABC):
             self._daily_wins += 1
         else:
             self._daily_losses += 1
+
+        # Write to trade journal DB
+        if self._journal and symbol:
+            try:
+                record = TradeRecord(
+                    strategy_name=self.name,
+                    symbol=symbol,
+                    side=side or OrderSide.BUY,
+                    qty=qty,
+                    entry_price=entry_price,
+                    exit_price=exit_price or entry_price,
+                    entry_time=entry_time,
+                    exit_time=datetime.now(pytz.UTC),
+                    realized_pnl=pnl,
+                    conviction=conviction,
+                    regime=regime,
+                    entry_reason=entry_reason,
+                    exit_reason=exit_reason,
+                    metadata=metadata or {},
+                )
+                self._journal.record_trade(record)
+            except Exception:
+                self._log.exception("journal_record_failed", symbol=symbol)
 
     # ── Lifecycle ─────────────────────────────────────────────────────
 

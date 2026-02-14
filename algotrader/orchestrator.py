@@ -244,9 +244,10 @@ class Orchestrator:
             )
 
             if strategy:
-                # Set capital allocation
+                # Set capital allocation and trade journal
                 capital = self._settings.trading.total_capital * (config.capital_allocation_pct / 100)
                 strategy.set_capital(capital)
+                strategy.set_journal(self._trade_journal)
                 self._strategies[name] = strategy
                 self._log.info("strategy_initialized", name=name, capital=capital)
 

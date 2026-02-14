@@ -378,6 +378,7 @@ class MomentumStrategy(StrategyBase):
         """Close a momentum trade with position exit safety."""
         broker_pos = self.executor.get_position(symbol)
         pnl = float(broker_pos.unrealized_pnl) if broker_pos else 0.0
+        exit_price = float(broker_pos.current_price) if broker_pos else trade.entry_price
 
         close_success = self.executor.close_position(symbol)
         if not close_success:
@@ -386,7 +387,21 @@ class MomentumStrategy(StrategyBase):
 
         self._trades.pop(symbol, None)
         self.release_capital(trade.capital_used)
-        self.record_trade(pnl)
+
+        side = OrderSide.BUY if trade.direction == "long" else OrderSide.SELL
+        qty = trade.capital_used / trade.entry_price if trade.entry_price > 0 else 0
+        self.record_trade(
+            pnl,
+            symbol=symbol,
+            side=side,
+            qty=qty,
+            entry_price=trade.entry_price,
+            exit_price=exit_price,
+            entry_time=trade.entry_time,
+            entry_reason=f"breakout: level={trade.breakout_level:.2f} vol={trade.volume_ratio:.1f}x",
+            exit_reason=reason,
+            metadata={"breakout_level": trade.breakout_level, "atr": trade.atr},
+        )
 
         self._log.info(
             "momentum_exit",

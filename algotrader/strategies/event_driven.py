@@ -389,6 +389,7 @@ class EventDrivenStrategy(StrategyBase):
         """Close an event trade with position exit safety."""
         broker_pos = self.executor.get_position(trade.symbol)
         pnl = float(broker_pos.unrealized_pnl) if broker_pos else 0.0
+        exit_price = float(broker_pos.current_price) if broker_pos else trade.entry_price
 
         close_success = self.executor.close_position(trade.symbol)
         if not close_success:
@@ -397,7 +398,26 @@ class EventDrivenStrategy(StrategyBase):
 
         self._trades.pop(trade_key, None)
         self.release_capital(trade.capital_used)
-        self.record_trade(pnl)
+
+        side = OrderSide.BUY if trade.direction == "long" else OrderSide.SELL
+        qty = trade.capital_used / trade.entry_price if trade.entry_price > 0 else 0
+        self.record_trade(
+            pnl,
+            symbol=trade.symbol,
+            side=side,
+            qty=qty,
+            entry_price=trade.entry_price,
+            exit_price=exit_price,
+            entry_time=trade.entry_time,
+            entry_reason=f"post_{trade.event_type}: move={trade.post_event_move_pct:+.2f}%",
+            exit_reason=reason,
+            metadata={
+                "event_type": trade.event_type,
+                "phase": trade.phase,
+                "pre_event_price": trade.pre_event_price,
+                "move_pct": trade.post_event_move_pct,
+            },
+        )
 
         self._log.info(
             "event_exit",

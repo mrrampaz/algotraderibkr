@@ -448,7 +448,23 @@ class OptionsPremiumStrategy(StrategyBase):
             # Estimate P&L for the journal
             current_price = self._get_current_price(trade.underlying) or 0.0
             pnl = self._estimate_simulated_pnl(trade, current_price)
-            self.record_trade(pnl)
+            self.record_trade(
+                pnl,
+                symbol=trade.underlying,
+                side=OrderSide.SELL,
+                qty=trade.contracts,
+                entry_price=trade.credit_received,
+                exit_price=trade.credit_received - pnl if trade.contracts else 0,
+                entry_time=trade.entry_time,
+                entry_reason=f"premium_sell: {trade.structure}",
+                exit_reason=reason,
+                metadata={
+                    "structure": trade.structure,
+                    "short_strike": trade.short_strike,
+                    "long_strike": trade.long_strike,
+                    "simulated": True,
+                },
+            )
             self._log.info(
                 "premium_exit_simulated",
                 underlying=trade.underlying,
@@ -459,6 +475,10 @@ class OptionsPremiumStrategy(StrategyBase):
             return
 
         # For real trades, close via executor
+        broker_pos = self.executor.get_position(trade.underlying)
+        pnl = float(broker_pos.unrealized_pnl) if broker_pos else 0.0
+        exit_price = float(broker_pos.current_price) if broker_pos else 0.0
+
         close_success = self.executor.close_position(trade.underlying)
         if not close_success:
             self._log.error("premium_close_failed", underlying=trade.underlying)
@@ -466,7 +486,23 @@ class OptionsPremiumStrategy(StrategyBase):
 
         self._trades.pop(trade_key, None)
         self.release_capital(trade.capital_used)
-        self.record_trade(0.0)  # Real P&L comes from broker
+        self.record_trade(
+            pnl,
+            symbol=trade.underlying,
+            side=OrderSide.SELL,
+            qty=trade.contracts,
+            entry_price=trade.short_strike,
+            exit_price=exit_price,
+            entry_time=trade.entry_time,
+            entry_reason=f"premium_sell: {trade.structure}",
+            exit_reason=reason,
+            metadata={
+                "structure": trade.structure,
+                "short_strike": trade.short_strike,
+                "long_strike": trade.long_strike,
+                "simulated": False,
+            },
+        )
 
         self._log.info(
             "premium_exit",

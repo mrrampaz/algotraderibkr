@@ -141,6 +141,10 @@ class PairsTradingStrategy(StrategyBase):
         else:
             self._pairs = DEFAULT_PAIRS
 
+        # Cooldown: don't re-enter same pair within N minutes after exit
+        self._cooldown_minutes = params.get("cooldown_minutes", 60)
+        self._last_exit_time: dict[str, datetime] = {}
+
         # Runtime state
         self._pair_states: dict[str, PairState] = {}
         for pair in self._pairs:
@@ -295,7 +299,14 @@ class PairsTradingStrategy(StrategyBase):
         if self.available_capital <= 0:
             return None
 
+        # Cooldown: don't re-enter same pair too soon after exit
         pair = state.config
+        last_exit = self._last_exit_time.get(pair.pair_id)
+        if last_exit is not None:
+            minutes_since_exit = (datetime.now(pytz.UTC) - last_exit).total_seconds() / 60
+            if minutes_since_exit < self._cooldown_minutes:
+                return None
+
         z = state.z_score
 
         if abs(z) < self._z_entry:
@@ -496,8 +507,32 @@ class PairsTradingStrategy(StrategyBase):
         capital_used = state.qty_a * state.entry_price_a + state.qty_b * state.entry_price_b
         self.release_capital(capital_used)
 
-        # Record trade
-        self.record_trade(total_pnl)
+        # Determine exit price from broker positions
+        exit_price_a = float(broker_pos_a.current_price) if broker_pos_a else state.entry_price_a
+        exit_price_b = float(broker_pos_b.current_price) if broker_pos_b else state.entry_price_b
+
+        # Record trade to daily counters + journal
+        side = OrderSide.BUY if state.position_side == "long_spread" else OrderSide.SELL
+        self.record_trade(
+            total_pnl,
+            symbol=f"{pair.symbol_a}/{pair.symbol_b}",
+            side=side,
+            qty=state.qty_a,
+            entry_price=state.entry_price_a,
+            exit_price=exit_price_a,
+            entry_time=state.entry_time,
+            entry_reason=f"pairs z={state.entry_z_score:.2f} {state.position_side}",
+            exit_reason=signal.reason,
+            metadata={
+                "pair_id": pair.pair_id,
+                "qty_b": state.qty_b,
+                "entry_price_b": state.entry_price_b,
+                "exit_price_b": exit_price_b,
+                "bars_held": state.bars_in_position,
+                "z_entry": state.entry_z_score,
+                "z_exit": state.z_score,
+            },
+        )
 
         log.info(
             "pair_exit",
@@ -507,6 +542,9 @@ class PairsTradingStrategy(StrategyBase):
             z_entry=round(state.entry_z_score, 2),
             z_exit=round(state.z_score, 2),
         )
+
+        # Record exit time for cooldown
+        self._last_exit_time[pair.pair_id] = datetime.now(pytz.UTC)
 
         # Reset state
         state.is_positioned = False
