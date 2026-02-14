@@ -109,6 +109,19 @@ class StrategyBase(ABC):
         """Release reserved capital when a position is closed."""
         self._capital_reserved = max(0, self._capital_reserved - amount)
 
+    def get_held_symbols(self) -> list[str]:
+        """Return symbols currently held by this strategy.
+
+        Default: inspects self._trades if it exists.
+        Override in strategies with non-standard tracking (e.g. pairs).
+        """
+        trades = getattr(self, "_trades", {})
+        symbols = []
+        for key, trade in trades.items():
+            sym = getattr(trade, "symbol", key)
+            symbols.append(sym)
+        return symbols
+
     # ── Daily Metrics ─────────────────────────────────────────────────
 
     def _check_day_reset(self) -> None:

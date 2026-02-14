@@ -24,6 +24,8 @@ class Executor(Protocol):
         limit_price: float | None = None,
         stop_price: float | None = None,
         client_order_id: str | None = None,
+        bracket_stop_price: float | None = None,
+        bracket_take_profit_price: float | None = None,
     ) -> Order | None:
         """Submit an order to the broker.
 
@@ -36,9 +38,16 @@ class Executor(Protocol):
             limit_price: Limit price (for limit/stop-limit orders)
             stop_price: Stop price (for stop/stop-limit orders)
             client_order_id: Idempotent order ID to prevent duplicates
+            bracket_stop_price: If set, creates a bracket order with a
+                stop-loss child at this price. The stop remains active at
+                the broker even if the bot disconnects.
+            bracket_take_profit_price: If set (with bracket_stop_price),
+                adds a take-profit child at this limit price.
 
         Returns:
-            Order object if submitted, None if failed
+            Order object if submitted, None if failed.
+            When bracket is used, Order.stop_order_id and Order.tp_order_id
+            contain the child order IDs.
         """
         ...
 
@@ -72,4 +81,16 @@ class Executor(Protocol):
 
     def get_open_orders(self, symbol: str | None = None) -> list[Order]:
         """Get open orders, optionally filtered by symbol."""
+        ...
+
+    def replace_stop_order(
+        self,
+        order_id: str,
+        new_stop_price: float,
+    ) -> Order | None:
+        """Replace a bracket child stop order with a new stop price.
+
+        Used for trailing stop updates. Returns updated Order if
+        successful, None if failed (in-memory stop remains as fallback).
+        """
         ...

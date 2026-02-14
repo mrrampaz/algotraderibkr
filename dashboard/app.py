@@ -131,7 +131,7 @@ def load_regime_state() -> dict | None:
     return None
 
 
-def load_json_state(filename: str) -> list | None:
+def load_json_state(filename: str) -> list | dict | None:
     """Load a JSON state file from data/state/."""
     path = Path(f"data/state/{filename}")
     if path.exists():
@@ -141,6 +141,25 @@ def load_json_state(filename: str) -> list | None:
         except Exception:
             return None
     return None
+
+
+def load_position_stop_info() -> dict[str, dict]:
+    """Build symbol -> {stop, target, is_bracket, strategy} from strategy state files."""
+    info: dict[str, dict] = {}
+    strategy_states = load_strategy_states()
+    for state in strategy_states:
+        name = state.get("name", "")
+        for symbol, trade in state.get("trades", {}).items():
+            info[symbol] = {
+                "strategy": name,
+                "stop": trade.get("stop_price", 0.0),
+                "target": trade.get("target_price", 0.0),
+                "is_bracket": trade.get("is_bracket", False),
+            }
+            # For trailing stops, use trail_stop if active
+            if trade.get("trailing_active") and trade.get("trail_stop"):
+                info[symbol]["stop"] = trade["trail_stop"]
+    return info
 
 
 def get_strategy_names(conn) -> list[str]:
@@ -241,7 +260,170 @@ def render_sidebar() -> tuple[int, bool]:
     return days, auto_refresh
 
 
-# ── Tab 1: Overview ──────────────────────────────────────────────────────────
+# ── Tab 1: Today's Plan ──────────────────────────────────────────────────────
+
+
+def render_todays_plan() -> None:
+    st.header("Today's Plan")
+
+    plan = load_json_state("todays_plan.json")
+    regime = load_regime_state()
+    assessments = load_json_state("assessments.json")
+    broker = load_broker_state()
+    gaps = load_json_state("gaps.json")
+
+    if not regime:
+        st.info("No regime data yet. Start the trading system to populate.")
+        return
+
+    # ── Step 1: Regime Detection ──
+    st.subheader("1. Regime Detection")
+    regime_labels = {
+        "trending_up": "Trending Up", "trending_down": "Trending Down",
+        "ranging": "Range-Bound", "high_vol": "High Volatility",
+        "low_vol": "Low Volatility", "event_day": "Event Day",
+    }
+    regime_type = regime.get("regime_type", "unknown")
+    regime_label = regime_labels.get(regime_type, regime_type)
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Regime", regime_label)
+    col2.metric("VIX Proxy", f"{regime.get('vix_level', 0):.1f}")
+    col3.metric("SPY Trend", f"{regime.get('spy_trend', 0):+.4f}")
+    col4.metric("Vol Percentile", f"{regime.get('volatility_percentile', 0):.0%}")
+
+    regime_descriptions = {
+        "ranging": "Range-bound market favors mean reversion strategies (VWAP, options premium). Momentum and breakout strategies are deprioritized.",
+        "trending_up": "Uptrend favors momentum longs and sector rotation. Mean reversion is deprioritized.",
+        "trending_down": "Downtrend favors momentum shorts and defensive plays. Long-biased strategies are scaled back.",
+        "high_vol": "High volatility favors options premium selling (wider spreads) and tighter risk limits.",
+        "low_vol": "Low volatility favors VWAP reversion and pairs trading. Options premiums are thin.",
+        "event_day": "Event day: reduced position sizing, event-driven strategy prioritized.",
+    }
+    st.caption(regime_descriptions.get(regime_type, ""))
+
+    # ── Step 2: Strategy Scoring ──
+    st.subheader("2. Strategy Scoring")
+    if plan and plan.get("scores"):
+        scores = sorted(plan["scores"], key=lambda s: s["total_score"], reverse=True)
+        rows = []
+        for s in scores:
+            rows.append({
+                "Strategy": s["strategy"],
+                "Score": f"{s['total_score']:.3f}",
+                "Base Weight": f"{s['base_weight']:.3f}",
+                "Opp Quality": f"{s['opportunity_score']:.3f}",
+                "VIX Mod": f"{s['vix_modifier']:+.3f}",
+                "Perf Mod": f"{s['performance_modifier']:+.3f}",
+                "Time Mod": f"{s['time_modifier']:+.3f}",
+                "Event Mod": f"{s['event_modifier']:+.3f}",
+                "Active": "YES" if s["is_active"] else "no",
+            })
+        st.dataframe(pd.DataFrame(rows), hide_index=True)
+    else:
+        st.caption("No scoring data yet. Populated after pre-market intelligence runs.")
+
+    # ── Step 3: Capital Allocation ──
+    st.subheader("3. Capital Allocation")
+    if plan and plan.get("allocations"):
+        allocs = plan["allocations"]
+        active = [a for a in allocs if a["is_active"]]
+        inactive = [a for a in allocs if not a["is_active"]]
+
+        if active:
+            total_deployed = sum(a["allocated_capital"] for a in active)
+            equity = broker.get("equity", 0) if broker else 0
+            cash_pct = ((equity - total_deployed) / equity * 100) if equity else 0
+
+            cols = st.columns(len(active) + 1)
+            for i, a in enumerate(active):
+                cols[i].metric(
+                    a["strategy"],
+                    f"${a['allocated_capital']:,.0f}",
+                    delta=f"{a['allocation_pct']:.1f}%",
+                )
+            cols[-1].metric("Cash Reserve", f"{cash_pct:.0f}%")
+
+        if inactive:
+            st.caption(
+                "Inactive (below threshold): "
+                + ", ".join(a["strategy"] for a in inactive)
+            )
+    else:
+        st.caption("No allocation data yet.")
+
+    # ── Step 4: Planned Trades ──
+    st.subheader("4. Opportunity Targets")
+    if assessments:
+        active_names = set()
+        if plan and plan.get("allocations"):
+            active_names = {a["strategy"] for a in plan["allocations"] if a["is_active"]}
+
+        for a in assessments:
+            name = a.get("strategy", "")
+            is_active = name in active_names
+            details = a.get("details", [])
+            if not details:
+                continue
+
+            status = "ACTIVE" if is_active else "inactive"
+            with st.expander(
+                f"**{name}** [{status}] - {a.get('num_candidates', 0)} candidates, "
+                f"{a.get('confidence', 0):.0%} confidence",
+                expanded=is_active,
+            ):
+                if not is_active:
+                    st.caption("Strategy did not score high enough for capital allocation today.")
+
+                detail_df = pd.DataFrame(details)
+                st.dataframe(detail_df, hide_index=True)
+
+                col1, col2, col3 = st.columns(3)
+                col1.metric("Avg R:R", f"{a.get('avg_risk_reward', 0):.1f}")
+                col2.metric("Est. Edge", f"{a.get('estimated_edge_pct', 0):.2f}%")
+                col3.metric("Est. Trades", a.get("estimated_daily_trades", 0))
+    else:
+        st.caption("No opportunity assessments yet.")
+
+    # ── Step 5: Current Positions ──
+    if broker and broker.get("positions"):
+        st.subheader("5. Current Positions")
+        positions = broker["positions"]
+        stop_info = load_position_stop_info()
+        pos_rows = []
+        for p in positions:
+            sym = p["symbol"]
+            si = stop_info.get(sym, {})
+            strategy = p.get("strategy_name") or si.get("strategy", "")
+            stop = si.get("stop", 0.0)
+            target = si.get("target", 0.0)
+            protected = "Yes" if si.get("is_bracket") else "No"
+            pos_rows.append({
+                "Symbol": sym,
+                "Strategy": strategy,
+                "Side": p["side"],
+                "Qty": p["qty"],
+                "Entry": f"${p['avg_entry_price']:.2f}",
+                "Current": f"${p['current_price']:.2f}",
+                "Stop": f"${stop:.2f}" if stop else "-",
+                "Target": f"${target:.2f}" if target else "-",
+                "Protected": protected,
+                "P&L": f"${p['unrealized_pnl']:+.2f}",
+                "P&L%": f"{p.get('unrealized_pnl_pct', 0):+.2%}",
+            })
+        st.dataframe(pd.DataFrame(pos_rows), hide_index=True)
+
+    # ── Pre-market Gaps ──
+    if gaps:
+        st.subheader("Pre-market Gaps Detected")
+        st.dataframe(pd.DataFrame(gaps), hide_index=True)
+
+    # Timestamp
+    if plan and plan.get("timestamp"):
+        st.caption(f"Plan last updated: {plan['timestamp']}")
+
+
+# ── Tab 2: Overview ──────────────────────────────────────────────────────────
 
 
 def render_overview(conn, days: int) -> None:
@@ -299,11 +481,30 @@ def render_overview(conn, days: int) -> None:
     # Active positions
     if broker and broker.get("positions"):
         st.subheader("Active Positions")
-        pos_df = pd.DataFrame(broker["positions"])
-        display_cols = ["symbol", "qty", "side", "avg_entry_price", "current_price",
-                        "market_value", "unrealized_pnl", "unrealized_pnl_pct"]
-        available = [c for c in display_cols if c in pos_df.columns]
-        st.dataframe(pos_df[available], hide_index=True)
+        stop_info = load_position_stop_info()
+        pos_rows = []
+        for p in broker["positions"]:
+            sym = p["symbol"]
+            si = stop_info.get(sym, {})
+            strategy = p.get("strategy_name") or si.get("strategy", "")
+            stop = si.get("stop", 0.0)
+            target = si.get("target", 0.0)
+            protected = "Yes" if si.get("is_bracket") else "No"
+            pos_rows.append({
+                "Symbol": sym,
+                "Strategy": strategy,
+                "Side": p.get("side", ""),
+                "Qty": p.get("qty", 0),
+                "Entry": p.get("avg_entry_price", 0),
+                "Current": p.get("current_price", 0),
+                "Stop": stop if stop else None,
+                "Target": target if target else None,
+                "Protected": protected,
+                "Mkt Value": p.get("market_value", 0),
+                "P&L": p.get("unrealized_pnl", 0),
+                "P&L%": p.get("unrealized_pnl_pct", 0),
+            })
+        st.dataframe(pd.DataFrame(pos_rows), hide_index=True)
 
 
 # ── Tab 2: Strategies ────────────────────────────────────────────────────────
@@ -552,19 +753,21 @@ def main() -> None:
         st.error("Trade journal database not found. Start the trading system first.")
         return
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(
-        ["Overview", "Strategies", "Trades", "Performance", "Intelligence"]
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+        ["Today's Plan", "Overview", "Strategies", "Trades", "Performance", "Intelligence"]
     )
 
     with tab1:
-        render_overview(conn, days)
+        render_todays_plan()
     with tab2:
-        render_strategies(conn, days)
+        render_overview(conn, days)
     with tab3:
-        render_trades(conn, days)
+        render_strategies(conn, days)
     with tab4:
-        render_performance(conn, days)
+        render_trades(conn, days)
     with tab5:
+        render_performance(conn, days)
+    with tab6:
         render_intelligence()
 
     # Auto-refresh

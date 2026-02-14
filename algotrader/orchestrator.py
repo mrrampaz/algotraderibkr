@@ -514,6 +514,7 @@ class Orchestrator:
                         for a in allocations if a.is_active
                     },
                 )
+                self._write_todays_plan(scores, allocations)
             except Exception:
                 self._log.exception("premarket_allocation_refresh_failed")
 
@@ -622,6 +623,7 @@ class Orchestrator:
                         for a in allocations if a.is_active
                     },
                 )
+                self._write_todays_plan(scores, allocations)
             except Exception:
                 self._log.exception("pre_market_allocation_failed")
                 # Fallback: keep static YAML allocations (already set in initialize())
@@ -735,10 +737,26 @@ class Orchestrator:
         self._event_bus.clear()
         self._log.info("shutdown_complete")
 
+    def _build_strategy_symbol_map(self) -> dict[str, list[str]]:
+        """Build symbol -> [strategy_names] mapping from active strategies."""
+        symbol_map: dict[str, list[str]] = {}
+        for name, strategy in self._strategies.items():
+            try:
+                for symbol in strategy.get_held_symbols():
+                    symbol_map.setdefault(symbol, []).append(name)
+            except Exception:
+                self._log.debug("strategy_symbol_map_failed", strategy=name)
+        return symbol_map
+
     def _write_dashboard_state(self) -> None:
         """Write state files for the Streamlit dashboard to read."""
         state_dir = Path("data/state")
         state_dir.mkdir(parents=True, exist_ok=True)
+
+        # Update strategy attribution before snapshot
+        self._portfolio_tracker.set_strategy_symbol_map(
+            self._build_strategy_symbol_map()
+        )
 
         # Broker snapshot
         try:
@@ -755,6 +773,50 @@ class Orchestrator:
                     json.dump(self._current_regime.model_dump(), f, default=str)
             except Exception:
                 pass
+
+    def _write_todays_plan(self, scores: list, allocations: list) -> None:
+        """Write consolidated today's plan state for the dashboard."""
+        state_dir = Path("data/state")
+        state_dir.mkdir(parents=True, exist_ok=True)
+
+        regime = self._current_regime
+        plan = {
+            "timestamp": datetime.now(pytz.UTC).isoformat(),
+            "regime": regime.model_dump() if regime else None,
+            "scores": [],
+            "allocations": [],
+        }
+
+        # Score breakdown per strategy
+        for s in scores:
+            plan["scores"].append({
+                "strategy": s.strategy_name,
+                "total_score": round(s.total_score, 3),
+                "base_weight": round(s.base_weight, 3),
+                "opportunity_score": round(s.opportunity_score, 3),
+                "vix_modifier": round(s.vix_modifier, 3),
+                "performance_modifier": round(s.performance_modifier, 3),
+                "time_modifier": round(s.time_modifier, 3),
+                "event_modifier": round(s.event_modifier, 3),
+                "is_active": s.is_active,
+            })
+
+        # Allocation breakdown per strategy
+        for a in allocations:
+            plan["allocations"].append({
+                "strategy": a.strategy_name,
+                "score": round(a.score, 3),
+                "allocated_capital": round(a.allocated_capital, 2),
+                "allocation_pct": round(a.allocation_pct, 2),
+                "is_active": a.is_active,
+                "reason": a.reason,
+            })
+
+        try:
+            with open(state_dir / "todays_plan.json", "w") as f:
+                json.dump(plan, f, default=str)
+        except Exception:
+            self._log.debug("todays_plan_write_failed")
 
     def _write_intelligence_state(self, gaps, volume_results, events) -> None:
         """Write scanner/intelligence results for dashboard."""

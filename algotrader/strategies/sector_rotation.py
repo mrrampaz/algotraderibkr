@@ -68,6 +68,8 @@ class SectorTrade:
     capital_used: float = 0.0
     last_rebalance: datetime | None = None
     trade_id: str = ""
+    bracket_stop_order_id: str = ""
+    is_bracket: bool = False
 
 
 @register_strategy("sector_rotation")
@@ -317,6 +319,7 @@ class SectorRotationStrategy(StrategyBase):
             order_type=OrderType.MARKET,
             time_in_force=TimeInForce.DAY,
             client_order_id=client_id,
+            bracket_stop_price=stop_price,
         )
 
         if not order:
@@ -335,6 +338,8 @@ class SectorRotationStrategy(StrategyBase):
             capital_used=capital_needed,
             last_rebalance=datetime.now(pytz.UTC),
             trade_id=str(uuid.uuid4()),
+            bracket_stop_order_id=order.stop_order_id,
+            is_bracket=order.is_bracket,
         )
         self._trades[symbol] = trade
 
@@ -463,6 +468,8 @@ class SectorRotationStrategy(StrategyBase):
                 "capital_used": trade.capital_used,
                 "last_rebalance": trade.last_rebalance.isoformat() if trade.last_rebalance else None,
                 "trade_id": trade.trade_id,
+                "bracket_stop_order_id": trade.bracket_stop_order_id,
+                "is_bracket": trade.is_bracket,
             }
         base["last_rebalance"] = self._last_rebalance.isoformat() if self._last_rebalance else None
         return base
@@ -484,4 +491,6 @@ class SectorRotationStrategy(StrategyBase):
                 capital_used=saved.get("capital_used", 0.0),
                 last_rebalance=datetime.fromisoformat(saved["last_rebalance"]) if saved.get("last_rebalance") else None,
                 trade_id=saved.get("trade_id", ""),
+                bracket_stop_order_id=saved.get("bracket_stop_order_id", ""),
+                is_bracket=saved.get("is_bracket", False),
             )

@@ -32,6 +32,13 @@ class PortfolioTracker:
         self._realized_pnl: float = 0.0
         self._trades_today: int = 0
 
+        # Strategy attribution: symbol -> [strategy_names]
+        self._strategy_symbol_map: dict[str, list[str]] = {}
+
+    def set_strategy_symbol_map(self, mapping: dict[str, list[str]]) -> None:
+        """Update the symbol -> strategy_name mapping for position attribution."""
+        self._strategy_symbol_map = mapping
+
     def reset_day(self, current_equity: float) -> None:
         """Reset daily tracking for a new trading day."""
         today = datetime.now(pytz.UTC).date()
@@ -53,6 +60,11 @@ class PortfolioTracker:
         """Get current portfolio snapshot from broker."""
         account = self._executor.get_account()
         positions = self._executor.get_positions()
+
+        # Enrich positions with strategy attribution
+        for pos in positions:
+            strategies = self._strategy_symbol_map.get(pos.symbol, [])
+            pos.strategy_name = "+".join(strategies) if strategies else "untracked"
 
         # Update peak equity
         if account.equity > self._peak_equity:

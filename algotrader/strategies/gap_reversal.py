@@ -52,6 +52,9 @@ class GapTrade:
     first_candle_low: float | None = None
     waiting_for_entry: bool = True  # True if monitoring but not yet entered
     trade_id: str = ""
+    bracket_stop_order_id: str = ""
+    bracket_tp_order_id: str = ""
+    is_bracket: bool = False
 
 
 @register_strategy("gap_reversal")
@@ -379,6 +382,8 @@ class GapReversalStrategy(StrategyBase):
             order_type=OrderType.MARKET,
             time_in_force=TimeInForce.DAY,
             client_order_id=client_id,
+            bracket_stop_price=stop_price,
+            bracket_take_profit_price=target_price,
         )
 
         if not order:
@@ -401,6 +406,9 @@ class GapReversalStrategy(StrategyBase):
             first_candle_low=first_candle_low,
             waiting_for_entry=False,
             trade_id=str(uuid.uuid4()),
+            bracket_stop_order_id=order.stop_order_id,
+            bracket_tp_order_id=order.tp_order_id,
+            is_bracket=order.is_bracket,
         )
         self._trades[symbol] = trade
 
@@ -459,6 +467,7 @@ class GapReversalStrategy(StrategyBase):
                 new_stop = max(trade.stop_price, trade.entry_price)
                 if new_stop > trade.stop_price:
                     trade.stop_price = new_stop
+                    self._update_bracket_stop(trade, new_stop)
         elif trade.direction == "short":
             distance_to_target = trade.entry_price - trade.target_price
             current_profit = trade.entry_price - current_price
@@ -466,6 +475,16 @@ class GapReversalStrategy(StrategyBase):
                 new_stop = min(trade.stop_price, trade.entry_price)
                 if new_stop < trade.stop_price:
                     trade.stop_price = new_stop
+                    self._update_bracket_stop(trade, new_stop)
+
+    def _update_bracket_stop(self, trade: GapTrade, new_stop: float) -> None:
+        """Update the broker-side bracket stop order."""
+        if trade.is_bracket and trade.bracket_stop_order_id:
+            updated = self.executor.replace_stop_order(
+                trade.bracket_stop_order_id, new_stop,
+            )
+            if updated:
+                trade.bracket_stop_order_id = updated.id
 
     def _check_catalyst(self, symbol: str) -> bool:
         """Check if a symbol has a news catalyst."""
@@ -571,6 +590,9 @@ class GapReversalStrategy(StrategyBase):
                 "entry_time": trade.entry_time.isoformat(),
                 "capital_used": trade.capital_used,
                 "trade_id": trade.trade_id,
+                "bracket_stop_order_id": trade.bracket_stop_order_id,
+                "bracket_tp_order_id": trade.bracket_tp_order_id,
+                "is_bracket": trade.is_bracket,
             }
         return base
 
@@ -592,4 +614,7 @@ class GapReversalStrategy(StrategyBase):
                 capital_used=saved.get("capital_used", 0.0),
                 waiting_for_entry=False,
                 trade_id=saved.get("trade_id", ""),
+                bracket_stop_order_id=saved.get("bracket_stop_order_id", ""),
+                bracket_tp_order_id=saved.get("bracket_tp_order_id", ""),
+                is_bracket=saved.get("is_bracket", False),
             )

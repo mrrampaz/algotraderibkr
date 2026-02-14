@@ -60,6 +60,9 @@ class EventTrade:
     entry_time: datetime | None = None
     capital_used: float = 0.0
     trade_id: str = ""
+    bracket_stop_order_id: str = ""
+    bracket_tp_order_id: str = ""
+    is_bracket: bool = False
 
 
 @register_strategy("event_driven")
@@ -280,6 +283,8 @@ class EventDrivenStrategy(StrategyBase):
             order_type=OrderType.MARKET,
             time_in_force=TimeInForce.DAY,
             client_order_id=client_id,
+            bracket_stop_price=stop_price,
+            bracket_take_profit_price=target_price,
         )
 
         if not order:
@@ -301,6 +306,9 @@ class EventDrivenStrategy(StrategyBase):
             entry_time=datetime.now(pytz.UTC),
             capital_used=capital_needed,
             trade_id=str(uuid.uuid4()),
+            bracket_stop_order_id=order.stop_order_id,
+            bracket_tp_order_id=order.tp_order_id,
+            is_bracket=order.is_bracket,
         )
         self._trades[trade_key] = trade
 
@@ -509,6 +517,9 @@ class EventDrivenStrategy(StrategyBase):
                 "entry_time": trade.entry_time.isoformat() if trade.entry_time else None,
                 "capital_used": trade.capital_used,
                 "trade_id": trade.trade_id,
+                "bracket_stop_order_id": trade.bracket_stop_order_id,
+                "bracket_tp_order_id": trade.bracket_tp_order_id,
+                "is_bracket": trade.is_bracket,
             }
         base["pre_event_prices"] = self._pre_event_prices
         return base
@@ -532,4 +543,7 @@ class EventDrivenStrategy(StrategyBase):
                 entry_time=datetime.fromisoformat(saved["entry_time"]) if saved.get("entry_time") else None,
                 capital_used=saved.get("capital_used", 0.0),
                 trade_id=saved.get("trade_id", ""),
+                bracket_stop_order_id=saved.get("bracket_stop_order_id", ""),
+                bracket_tp_order_id=saved.get("bracket_tp_order_id", ""),
+                is_bracket=saved.get("is_bracket", False),
             )

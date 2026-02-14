@@ -75,6 +75,9 @@ class VWAPTrade:
     entry_time: datetime
     capital_used: float = 0.0
     trade_id: str = ""
+    bracket_stop_order_id: str = ""
+    bracket_tp_order_id: str = ""
+    is_bracket: bool = False
 
 
 @register_strategy("vwap_reversion")
@@ -280,6 +283,8 @@ class VWAPReversionStrategy(StrategyBase):
                 order_type=OrderType.MARKET,
                 time_in_force=TimeInForce.DAY,
                 client_order_id=client_id,
+                bracket_stop_price=stop_price,
+                bracket_take_profit_price=target_price,
             )
 
             if not order:
@@ -297,6 +302,9 @@ class VWAPReversionStrategy(StrategyBase):
                 entry_time=datetime.now(pytz.UTC),
                 capital_used=capital_needed,
                 trade_id=str(uuid.uuid4()),
+                bracket_stop_order_id=order.stop_order_id,
+                bracket_tp_order_id=order.tp_order_id,
+                is_bracket=order.is_bracket,
             )
             self._trades[symbol] = trade
 
@@ -413,6 +421,9 @@ class VWAPReversionStrategy(StrategyBase):
                 "entry_time": trade.entry_time.isoformat(),
                 "capital_used": trade.capital_used,
                 "trade_id": trade.trade_id,
+                "bracket_stop_order_id": trade.bracket_stop_order_id,
+                "bracket_tp_order_id": trade.bracket_tp_order_id,
+                "is_bracket": trade.is_bracket,
             }
         return base
 
@@ -431,4 +442,7 @@ class VWAPReversionStrategy(StrategyBase):
                 entry_time=datetime.fromisoformat(saved["entry_time"]),
                 capital_used=saved.get("capital_used", 0.0),
                 trade_id=saved.get("trade_id", ""),
+                bracket_stop_order_id=saved.get("bracket_stop_order_id", ""),
+                bracket_tp_order_id=saved.get("bracket_tp_order_id", ""),
+                is_bracket=saved.get("is_bracket", False),
             )

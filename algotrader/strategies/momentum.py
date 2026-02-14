@@ -51,6 +51,9 @@ class MomentumTrade:
     highest_price: float = 0.0  # For trailing (longs)
     lowest_price: float = 999999.0  # For trailing (shorts)
     trade_id: str = ""
+    bracket_stop_order_id: str = ""
+    bracket_tp_order_id: str = ""
+    is_bracket: bool = False
 
 
 @register_strategy("momentum")
@@ -203,7 +206,9 @@ class MomentumStrategy(StrategyBase):
             if trade.trailing_active:
                 # Only move trail UP for longs
                 new_trail = trade.highest_price - trade.atr * self._trail_atr_mult
-                trade.trail_stop = max(trade.trail_stop, new_trail)
+                if new_trail > trade.trail_stop:
+                    trade.trail_stop = new_trail
+                    self._update_bracket_stop(trade, new_trail)
                 if current_price <= trade.trail_stop:
                     return f"trail_stop: {current_price:.2f} <= {trade.trail_stop:.2f}"
 
@@ -219,11 +224,22 @@ class MomentumStrategy(StrategyBase):
             if trade.trailing_active:
                 # Only move trail DOWN for shorts
                 new_trail = trade.lowest_price + trade.atr * self._trail_atr_mult
-                trade.trail_stop = min(trade.trail_stop, new_trail)
+                if new_trail < trade.trail_stop:
+                    trade.trail_stop = new_trail
+                    self._update_bracket_stop(trade, new_trail)
                 if current_price >= trade.trail_stop:
                     return f"trail_stop: {current_price:.2f} >= {trade.trail_stop:.2f}"
 
         return ""
+
+    def _update_bracket_stop(self, trade: MomentumTrade, new_stop: float) -> None:
+        """Update the broker-side bracket stop order for trailing."""
+        if trade.is_bracket and trade.bracket_stop_order_id:
+            updated = self.executor.replace_stop_order(
+                trade.bracket_stop_order_id, new_stop,
+            )
+            if updated:
+                trade.bracket_stop_order_id = updated.id
 
     def _scan_entries(self, et_now: datetime) -> list[Signal]:
         """Run breakout scanner and enter on confirmed breaks."""
@@ -302,6 +318,8 @@ class MomentumStrategy(StrategyBase):
                 order_type=OrderType.MARKET,
                 time_in_force=TimeInForce.DAY,
                 client_order_id=client_id,
+                bracket_stop_price=stop_price,
+                bracket_take_profit_price=target_price if not self._use_trailing else None,
             )
 
             if not order:
@@ -323,6 +341,9 @@ class MomentumStrategy(StrategyBase):
                 highest_price=entry_price,
                 lowest_price=entry_price,
                 trade_id=str(uuid.uuid4()),
+                bracket_stop_order_id=order.stop_order_id,
+                bracket_tp_order_id=order.tp_order_id,
+                is_bracket=order.is_bracket,
             )
             self._trades[bo.symbol] = trade
 
@@ -455,6 +476,9 @@ class MomentumStrategy(StrategyBase):
                 "highest_price": trade.highest_price,
                 "lowest_price": trade.lowest_price,
                 "trade_id": trade.trade_id,
+                "bracket_stop_order_id": trade.bracket_stop_order_id,
+                "bracket_tp_order_id": trade.bracket_tp_order_id,
+                "is_bracket": trade.is_bracket,
             }
         return base
 
@@ -479,4 +503,7 @@ class MomentumStrategy(StrategyBase):
                 highest_price=saved.get("highest_price", 0.0),
                 lowest_price=saved.get("lowest_price", 999999.0),
                 trade_id=saved.get("trade_id", ""),
+                bracket_stop_order_id=saved.get("bracket_stop_order_id", ""),
+                bracket_tp_order_id=saved.get("bracket_tp_order_id", ""),
+                is_bracket=saved.get("is_bracket", False),
             )

@@ -1,392 +1,283 @@
-# CLAUDE.md — AlgoTrader Build Guide
+# CLAUDE.md — AlgoTrader Reference
 
 ## What This Project Is
 
-An adaptive, multi-strategy algorithmic trading system for Alpaca Markets API. It autonomously prepares each morning, detects the market regime, selects the highest-probability strategies, trades stocks/ETFs/options long and short, captures intraday opportunities, and learns from every trade.
+An adaptive, multi-strategy algorithmic trading system for Alpaca Markets API. It autonomously detects the market regime, assesses real opportunities across 7 strategies, concentrates capital into the highest-EV setups, and learns from every trade.
 
-**Target**: 0.5–1% daily return on deployed capital through statistically favorable, risk-managed trades.
+**Target**: 0.5-1% daily return on deployed capital through statistically favorable, risk-managed trades.
+
+**Core philosophy**: No trade is better than a bad trade. Sit in cash when nothing meets threshold.
 
 ## Current Status
 
-**Phase 1 — Foundation**: COMPLETE. Core abstractions, data layer, execution layer, orchestrator, pairs trading strategy.
-**Phase 2 — Intelligence Layer**: COMPLETE. Regime detector, gap/volume/breakout scanners, news client, event calendar.
-**Phase 3 — Strategy Arsenal**: COMPLETE. 6 strategies (gap reversal, momentum, VWAP reversion, options premium, sector rotation, event-driven), 3 bug fixes (VIX proxy, executor protocol, news API).
-**Phase 4 — Strategy Selection**: COMPLETE. Regime-strategy scorer, score-weighted capital allocator, mid-day reviewer with regime-change reallocation.
-**Phase 5 — Learning & Dashboard**: COMPLETE. Performance metrics, attribution, strategy weight learner, alerting system, Streamlit dashboard, utility scripts.
+All 5 build phases complete. System is live on paper trading.
 
-## Tech Stack
+- **Phase 1 — Foundation**: Core abstractions, data/execution layers, orchestrator, pairs trading
+- **Phase 2 — Intelligence**: Regime detector, gap/volume/breakout scanners, news, event calendar
+- **Phase 3 — Strategies**: 7 strategies with `@register_strategy` auto-registration
+- **Phase 4 — Selection**: EV-based multiplicative scorer, concentration allocator, mid-day reviewer
+- **Phase 5 — Learning**: Metrics, attribution, weight learner, alerts, Streamlit dashboard
 
-- **Python 3.11+** with **uv** for package management
-- **alpaca-py** for broker API
-- **pandas, numpy, scipy** for quantitative analysis
-- **httpx + beautifulsoup4** for async web scraping
-- **pydantic** for config and data models
-- **APScheduler** for lifecycle scheduling
-- **structlog** for structured JSON logging
-- **SQLite** for trade journal persistence
-- **Streamlit** for dashboard
-- **pytest** for testing
-- **YAML** for all configuration
+**Recent redesign**: Replaced additive scoring with multiplicative EV scoring. Strategies now `assess_opportunities()` before allocation. Zero opportunities = zero capital. Concentration allocator uses power-law weighting (up to 70% to single strategy).
 
 ## Architecture Overview
 
 ```
-Orchestrator (lifecycle: pre-market → open → intraday → close → post-market)
+Orchestrator (pre-market → open → intraday → close → post-market)
     │
     ├── Intelligence Engine
-    │   ├── Regime Detector (VIX, trend, volatility classification)
-    │   ├── Scanners (gaps, volume, breakouts, options flow)
-    │   ├── News (Alpaca API + web scraping)
-    │   └── Event Calendar (FOMC, CPI, earnings)
+    │   ├── Regime Detector (SPY realized vol as VIX proxy, trend, ATR)
+    │   ├── Scanners (gaps, volume, breakouts)
+    │   ├── News (Alpaca NewsClient + web scraping)
+    │   └── Event Calendar (FOMC, CPI, earnings with impact scores)
     │
-    ├── Strategy Selector (scores strategies vs regime, allocates capital)
+    ├── Strategy Arsenal (7 strategies, each implements assess_opportunities + run_cycle)
+    │   ├── Pairs Trading — statistical arbitrage via cointegration/z-score
+    │   ├── Gap Reversal — gap-and-go (catalyst) + gap fade, time-limited to 11 AM ET
+    │   ├── Momentum — consolidation breakouts with ATR trailing stops
+    │   ├── VWAP Reversion — mean reversion off VWAP z-score, ranging regimes
+    │   ├── Options Premium — credit spreads with SMA5 contrarian filter
+    │   ├── Event-Driven — post-FOMC/CPI directional trades, 2:1 R/R
+    │   └── Sector Rotation — RS-based long/short sector ETFs, 4-hour rebalance
     │
-    ├── Strategy Arsenal (pluggable strategies, all implement StrategyBase)
-    │   ├── Gap & Reversal
-    │   ├── Momentum / Breakout
-    │   ├── Pairs Trading (migrated from existing bot)
-    │   ├── VWAP Mean Reversion
-    │   ├── Options Premium Selling
-    │   ├── Event-Driven
-    │   ├── Sector Rotation
-    │   └── Overnight / Swing
+    ├── Strategy Selector
+    │   ├── Scorer — multiplicative EV: base_weight * opp_quality * (1 + modifiers)
+    │   ├── Allocator — power-law concentration, cash threshold, max 70% single strategy
+    │   └── Reviewer — mid-day re-assessment, regime-change reallocation
     │
-    ├── Risk Manager (portfolio-level controls, position sizing, correlation, kill switch)
+    ├── Risk Manager
+    │   ├── Portfolio Risk — 2% max daily loss, 8% drawdown, 80% exposure, kill switch
+    │   └── Position Sizer — risk-based sizing, conviction multiplier (0.5x-1.5x)
     │
-    └── Tracking (portfolio P&L, trade journal, performance attribution, strategy weight learner)
+    └── Tracking
+        ├── Portfolio — live P&L, positions, daily metrics
+        ├── Trade Journal — SQLite-backed, full context per trade
+        ├── Metrics — Sharpe, profit factor, expectancy, drawdown
+        ├── Attribution — P&L by strategy/regime/session
+        ├── Learner — conservative regime weight adjustment from history
+        └── Alerts — log/file/webhook backends, EventBus auto-subscribe
 
 Abstraction Layers:
     ├── DataProvider protocol (Alpaca IEX now, IBKR later)
     └── Executor protocol (Alpaca now, IBKR later)
 ```
 
+## Opportunity Assessment → EV Scoring → Concentration Allocation
+
+The core decision loop each cycle:
+
+1. **Intelligence gathers data**: Regime detection, scanner results, news, calendar events
+2. **Strategies assess opportunities**: Each strategy's `assess_opportunities()` returns an `OpportunityAssessment` with candidate count, avg risk/reward, confidence, estimated edge
+3. **Scorer computes EV**: `score = clamp(base_weight * opp_quality * (1 + modifiers), 0, 1)` where `opp_quality = 0.3*(candidates/3) + 0.3*(rr/3) + 0.4*confidence`. No opportunities = score 0.
+4. **Allocator concentrates capital**: Power-law weighting (`score ** 2.0`), cash threshold 0.25, max 70% single strategy, 80% max deployment, 3% floor if active
+5. **Strategies execute**: Only strategies with allocated capital run their `run_cycle()`
+6. **Position management runs always**: Existing positions managed regardless of allocation
+
+## Risk Framework
+
+| Parameter | Value |
+|-----------|-------|
+| Max daily loss | 2% of equity |
+| Max drawdown | 8% |
+| Max gross exposure | 80% |
+| Max single position | 5% of capital |
+| Per-strategy daily loss limit | 1% |
+| Risk per trade | 0.25-0.5% |
+| Conviction multiplier range | 0.5x-1.5x |
+| Kill switch | Auto-triggers on max daily loss or max drawdown |
+
+## Daily Lifecycle
+
+1. **Pre-market (7-9:30 AM ET)**: Refresh gaps, regime, news every 15 min. Volume scan at 9:15 AM.
+2. **Market open**: Assess opportunities across all strategies. EV score and concentrate allocation.
+3. **Intraday (5-min cycles)**: Run allocated strategies, manage all positions, risk checks.
+4. **Mid-day (noon ET)**: Re-assess opportunities. Scale down losers, disable severe losers, boost winners. Regime change triggers full reallocation.
+5. **Market close**: Close day-only positions.
+6. **Post-market**: Attribution analysis. Daily summary alert. Friday: weight learning cycle.
+
+## Tech Stack
+
+- **Python 3.11+** with **uv** for package management
+- **alpaca-py** for broker API (paper trading)
+- **pandas, numpy, scipy** for quantitative analysis
+- **httpx + beautifulsoup4** for web scraping
+- **pydantic** for config and data validation
+- **APScheduler** for lifecycle scheduling
+- **structlog** for structured JSON logging
+- **SQLite** for trade journal
+- **Streamlit** for dashboard (5 tabs: Overview, Strategies, Trades, Performance, Intelligence)
+- **YAML** for all configuration
+
 ## Repo Structure
 
 ```
 algotrader/
-├── CLAUDE.md                         # This file
-├── README.md
-├── pyproject.toml                    # uv/pip dependencies
+├── CLAUDE.md
+├── pyproject.toml
 ├── .env.example
 │
 ├── config/
-│   ├── settings.yaml                 # Global settings (capital, risk, data feed)
-│   ├── strategies/                   # Per-strategy YAML configs
-│   │   ├── pairs_trading.yaml
-│   │   ├── gap_reversal.yaml
-│   │   ├── momentum.yaml
-│   │   ├── vwap_reversion.yaml
-│   │   ├── options_premium.yaml
-│   │   ├── event_driven.yaml
-│   │   └── sector_rotation.yaml
-│   └── regimes.yaml                  # Regime definitions and strategy weights
+│   ├── settings.yaml                 # Global: capital, risk, data feed, execution
+│   ├── regimes.yaml                  # Regime-strategy weight matrix + modifiers
+│   └── strategies/                   # Per-strategy YAML configs
+│       ├── pairs_trading.yaml
+│       ├── gap_reversal.yaml
+│       ├── momentum.yaml
+│       ├── vwap_reversion.yaml
+│       ├── options_premium.yaml
+│       ├── event_driven.yaml
+│       └── sector_rotation.yaml
 │
-├── algotrader/                       # Main package
-│   ├── __init__.py
+├── algotrader/
 │   ├── orchestrator.py               # Main lifecycle controller
-│   │
-│   ├── core/                         # Core abstractions
-│   │   ├── __init__.py
-│   │   ├── models.py                 # Pydantic models: Bar, Quote, Order, Position, Signal, etc.
-│   │   ├── events.py                 # Event bus (pub/sub for components)
-│   │   ├── config.py                 # YAML config loader with pydantic validation
+│   ├── core/
+│   │   ├── models.py                 # Bar, Quote, Order, Signal, OpportunityAssessment, etc.
+│   │   ├── events.py                 # EventBus pub/sub
+│   │   ├── config.py                 # YAML loader + pydantic validation
 │   │   └── logging.py               # structlog setup
-│   │
-│   ├── data/                         # Data provider layer
-│   │   ├── __init__.py
+│   ├── data/
 │   │   ├── provider.py               # DataProvider Protocol
 │   │   ├── alpaca_provider.py        # Alpaca IEX/SIP implementation
-│   │   └── cache.py                  # In-memory quote/bar cache with TTL
-│   │
-│   ├── execution/                    # Order execution layer
-│   │   ├── __init__.py
+│   │   └── cache.py                  # TTL-based quote/bar cache
+│   ├── execution/
 │   │   ├── executor.py               # Executor Protocol
 │   │   ├── alpaca_executor.py        # Alpaca order execution
-│   │   └── order_manager.py          # Order tracking, fill callbacks, retry logic
-│   │
-│   ├── intelligence/                 # Market intelligence engine
-│   │   ├── __init__.py
+│   │   └── order_manager.py          # Order tracking, fills, retries
+│   ├── intelligence/
 │   │   ├── regime.py                 # Market regime classifier
 │   │   ├── scanners/
-│   │   │   ├── __init__.py
 │   │   │   ├── gap_scanner.py        # Pre-market gap detection
 │   │   │   ├── volume_scanner.py     # Unusual volume detection
-│   │   │   └── breakout_scanner.py   # Technical breakout scanner
+│   │   │   └── breakout_scanner.py   # Consolidation breakout scanner
 │   │   ├── news/
-│   │   │   ├── __init__.py
-│   │   │   ├── alpaca_news.py        # Alpaca news API client
-│   │   │   └── scraper.py            # Finviz/Yahoo web scraper
+│   │   │   ├── alpaca_news.py        # Alpaca NewsClient
+│   │   │   └── scraper.py            # Finviz/Yahoo scraper
 │   │   └── calendar/
-│   │       ├── __init__.py
-│   │       └── events.py             # Economic + earnings calendar
-│   │
-│   ├── strategies/                   # Strategy plugins
-│   │   ├── __init__.py
-│   │   ├── base.py                   # StrategyBase ABC
-│   │   ├── registry.py               # Strategy discovery & registration
-│   │   ├── pairs_trading.py          # Statistical pairs trading
-│   │   ├── gap_reversal.py           # Gap fade / gap-and-go
-│   │   ├── momentum.py              # Breakout / momentum
-│   │   ├── vwap_reversion.py         # VWAP mean reversion
-│   │   ├── options_premium.py        # Credit spreads / iron condors
-│   │   ├── event_driven.py           # FOMC/CPI/earnings plays
-│   │   └── sector_rotation.py        # Sector relative strength
-│   │
-│   ├── risk/                         # Risk management
-│   │   ├── __init__.py
-│   │   ├── portfolio_risk.py         # Portfolio-level: drawdown, exposure, kill switch
-│   │   └── position_sizer.py         # Risk-based position sizing with conviction
-│   │
-│   ├── strategy_selector/            # Strategy selection engine
-│   │   ├── __init__.py
-│   │   ├── scorer.py                 # Score strategies vs regime/conditions
-│   │   ├── allocator.py              # Capital allocation across strategies
-│   │   └── reviewer.py               # Mid-day performance review
-│   │
-│   └── tracking/                     # Performance tracking & learning
-│       ├── __init__.py
+│   │       └── events.py             # FOMC, CPI, earnings calendar
+│   ├── strategies/
+│   │   ├── base.py                   # StrategyBase ABC + OpportunityAssessment
+│   │   ├── registry.py               # @register_strategy decorator + registry
+│   │   ├── pairs_trading.py
+│   │   ├── gap_reversal.py
+│   │   ├── momentum.py
+│   │   ├── vwap_reversion.py
+│   │   ├── options_premium.py
+│   │   ├── event_driven.py
+│   │   └── sector_rotation.py
+│   ├── strategy_selector/
+│   │   ├── scorer.py                 # Multiplicative EV scoring
+│   │   ├── allocator.py              # Power-law concentration allocation
+│   │   └── reviewer.py               # Mid-day review + regime-change reallocation
+│   ├── risk/
+│   │   ├── portfolio_risk.py         # Portfolio-level controls + kill switch
+│   │   └── position_sizer.py         # Risk-based sizing with conviction
+│   └── tracking/
 │       ├── portfolio.py              # Live portfolio state
-│       ├── journal.py                # Trade journal (SQLite-backed)
-│       ├── metrics.py                # Performance metrics calculation
+│       ├── journal.py                # Trade journal (SQLite)
+│       ├── metrics.py                # Sharpe, PF, expectancy, drawdown
 │       ├── attribution.py            # P&L attribution by strategy/regime/session
-│       ├── learner.py                # Strategy weight adjustment from history
-│       └── alerts.py                 # Alert manager with log/file/webhook backends
+│       ├── learner.py                # Strategy weight learning from history
+│       └── alerts.py                 # Log/file/webhook alert backends
 │
 ├── dashboard/
-│   └── app.py                        # Streamlit dashboard
+│   └── app.py                        # Streamlit dashboard (5 tabs)
 │
 ├── scripts/
-│   ├── check_live.py                 # Query live positions/orders/account
-│   ├── cleanup.py                    # Cancel all orders, close all positions
-│   ├── analyze_trades.py             # Historical trade analysis + CSV export
-│   └── run.py                        # Main entry point
+│   ├── run.py                        # Main entry point
+│   ├── check_live.py                 # Query live account/positions/orders
+│   ├── cleanup.py                    # Emergency cancel+close (--confirm)
+│   └── analyze_trades.py             # Trade analysis + CSV export
 │
 ├── tests/
-│   ├── __init__.py
 │   ├── unit/
 │   └── integration/
 │
 └── data/                             # Runtime data (gitignored)
-    ├── state/
-    ├── logs/
-    ├── journal/
-    └── cache/
+    ├── state/                        # JSON state files for dashboard
+    ├── logs/                         # structlog JSON + alerts
+    ├── journal/                      # trades.db (SQLite)
+    └── cache/                        # Quote/bar cache
 ```
 
-## Build Phases
+## Key Config Files
 
-### Phase 1 — Foundation (COMPLETE)
+| File | Controls |
+|------|----------|
+| `config/settings.yaml` | Capital, risk limits, data feed, execution, logging |
+| `config/regimes.yaml` | Regime-strategy weight matrix, score modifiers (VIX, time, events, performance) |
+| `config/strategies/*.yaml` | Per-strategy: enabled, allocation cap, entry/exit params, symbols |
 
-Built in this exact order:
+## Alpaca Quirks
 
-1. **Project setup**: pyproject.toml with all dependencies, .env.example, directory structure, __init__.py files
-2. **Core models** (`algotrader/core/models.py`): Pydantic models for Bar, Quote, Snapshot, Order, OrderSide, OrderStatus, Position, Signal, TradeRecord, MarketRegime, RegimeType
-3. **Config loader** (`algotrader/core/config.py`): Load YAML configs with pydantic validation. Global settings + per-strategy configs.
-4. **Logging** (`algotrader/core/logging.py`): structlog with JSON output to file + human-readable to console
-5. **Event bus** (`algotrader/core/events.py`): Simple pub/sub for order fills, regime changes, risk alerts
-6. **DataProvider protocol** (`algotrader/data/provider.py`): Abstract interface with get_bars, get_quote, get_snapshot, get_snapshots, get_option_chain, get_news, is_market_open, get_clock
-7. **Alpaca data provider** (`algotrader/data/alpaca_provider.py`): Implement DataProvider for Alpaca IEX. Include retry/backoff logic. Handle bar limit quirk (returns first N, use .tail).
-8. **Data cache** (`algotrader/data/cache.py`): TTL-based cache for quotes and bars to reduce API calls
-9. **Executor protocol** (`algotrader/execution/executor.py`): Abstract interface with submit_order, cancel_order, close_position, get_positions, get_account, get_open_orders
-10. **Alpaca executor** (`algotrader/execution/alpaca_executor.py`): Implement Executor for Alpaca. Include: idempotent orders (client_order_id), wash trade prevention (cancel conflicting orders), marketable limit orders, ghost position handling.
-11. **Order manager** (`algotrader/execution/order_manager.py`): Track pending/filled/cancelled orders, fill callbacks, retry failed orders
-12. **StrategyBase** (`algotrader/strategies/base.py`): ABC with run_cycle, warm_up, on_signal, on_fill, get_status. Capital tracking (reserve/release). Daily metrics with auto-reset. State save/restore.
-13. **Strategy registry** (`algotrader/strategies/registry.py`): Register strategies by name, discover from config
-14. **Portfolio risk manager** (`algotrader/risk/portfolio_risk.py`): Max daily loss (2%), max drawdown (8%), max gross exposure (80%), per-strategy loss limit (-1%), kill switch
-15. **Position sizer** (`algotrader/risk/position_sizer.py`): Risk-based sizing (risk 0.25-0.5% per trade), max single position (5% capital), conviction multiplier (0.5x-1.5x)
-16. **Portfolio tracker** (`algotrader/tracking/portfolio.py`): Live P&L, positions, daily metrics
-17. **Trade journal** (`algotrader/tracking/journal.py`): SQLite-backed, records every trade with full context
-18. **Pairs trading strategy** (`algotrader/strategies/pairs_trading.py`): Migrate from existing bot. Rewrite to use new DataProvider and Executor interfaces. Keep the proven logic: cointegration tests, z-score signals, hedge ratio calculation, entry/exit rules.
-19. **Orchestrator** (`algotrader/orchestrator.py`): Basic lifecycle: initialize → warm up strategies → run loop (check market open → run active strategies → manage risk) → shutdown. 5-minute cycle for IEX data.
-20. **Config files**: settings.yaml (global), pairs_trading.yaml (strategy config), .env.example
-21. **Entry point** (`scripts/run.py`): Load config, init components, start orchestrator
-
-### Phase 2 — Intelligence Layer (COMPLETE)
-
-1. **Regime detector** (`algotrader/intelligence/regime.py`): Classify using SPY realized vol (VIX proxy), SPY trend (SMA20 slope), intraday range vs ATR. Output: RegimeType (trending_up, trending_down, ranging, high_vol, low_vol, event_day)
-2. **Gap scanner** (`algotrader/intelligence/scanners/gap_scanner.py`): Pre-market scan for stocks gapping >2% with volume >500K. Use Alpaca snapshots API.
-3. **Volume scanner** (`algotrader/intelligence/scanners/volume_scanner.py`): Detect unusual volume (>2x 20-day average) during market hours
-4. **Breakout scanner** (`algotrader/intelligence/scanners/breakout_scanner.py`): Detect consolidation range breakouts with volume confirmation
-5. **Alpaca news client** (`algotrader/intelligence/news/alpaca_news.py`): Pull news feed, categorize by symbol and sector
-6. **Web scraper** (`algotrader/intelligence/news/scraper.py`): Scrape Finviz screener (gaps, unusual volume), Yahoo Finance earnings calendar
-7. **Event calendar** (`algotrader/intelligence/calendar/events.py`): Track FOMC, CPI, PPI, earnings dates with impact scores
-
-### Phase 3 — Strategy Arsenal (COMPLETE)
-
-All strategies implement StrategyBase with @register_strategy decorator:
-1. **Gap & Reversal** (`algotrader/strategies/gap_reversal.py`): Gap-and-go (catalyst) + gap fade (no catalyst), time-limited to 11 AM ET
-2. **Momentum / Breakout** (`algotrader/strategies/momentum.py`): Consolidation breakouts with ATR trailing stops
-3. **VWAP Mean Reversion** (`algotrader/strategies/vwap_reversion.py`): Z-score deviation trades, ranging/low-vol regimes only
-4. **Options Premium Selling** (`algotrader/strategies/options_premium.py`): Credit spreads with SMA5 contrarian filter (simulated until IBKR)
-5. **Sector Rotation** (`algotrader/strategies/sector_rotation.py`): RS-based long/short sector ETFs, 4-hour rebalance
-6. **Event-Driven** (`algotrader/strategies/event_driven.py`): Post-FOMC/CPI directional trades with 2:1 R/R
-
-### Phase 4 — Strategy Selection (COMPLETE)
-
-1. **Regime config** (`config/regimes.yaml`): Regime-to-strategy weight matrix (0.0-1.0) + score modifiers for VIX, performance, time-of-day, event proximity
-2. **Strategy scorer** (`algotrader/strategy_selector/scorer.py`): Score = clamp(base_weight + vix_mod + perf_mod + time_mod + event_mod, 0, 1). Strategies below 0.35 get zero allocation.
-3. **Capital allocator** (`algotrader/strategy_selector/allocator.py`): Score-weighted capital distribution with 3% floor, per-strategy ceiling, excess redistribution
-4. **Mid-day reviewer** (`algotrader/strategy_selector/reviewer.py`): Noon ET review: scale down losers (>-0.5%), disable severe losers (>-0.8%), scale up winners (>+0.3% with 50%+ WR). Regime change triggers full reallocation via event bus.
-5. **Config** (`algotrader/core/config.py`): `StrategySelectorConfig` pydantic model with all thresholds configurable
-6. **Orchestrator integration**: Pre-market scoring/allocation, per-cycle mid-day review, shutdown status logging, fallback to static YAML when disabled
-
-### Phase 5 — Learning & Dashboard (COMPLETE)
-
-1. **Performance metrics** (`algotrader/tracking/metrics.py`): MetricsCalculator — Sharpe ratio, profit factor, expectancy, max drawdown, win streaks, avg hold time. Supports filtering by strategy, date range, and regime.
-2. **Performance attribution** (`algotrader/tracking/attribution.py`): Daily/weekly P&L attribution by strategy, regime, and session (morning/midday/afternoon). Regime accuracy scoring.
-3. **Strategy weight learner** (`algotrader/tracking/learner.py`): Conservative regime-strategy weight adjustment from trade history. Min 20 trades per combo, max ±0.10 per cycle, confidence gating, YAML backup before writes.
-4. **Alerting system** (`algotrader/tracking/alerts.py`): AlertManager with log/file/webhook backends. Auto-subscribes to EventBus (kill switch, regime change, strategy disabled). Big win/loss detection, daily summary alerts.
-5. **Streamlit dashboard** (`dashboard/app.py`): 5-tab dashboard (Overview, Strategies, Trades, Performance, Intelligence). Reads SQLite journal + JSON state files. Auto-refresh option.
-6. **Config** (`algotrader/core/config.py`): AlertsConfig model with thresholds and webhook URL
-7. **Orchestrator integration**: Post-market attribution, weekly weight learning (Fridays), daily summary alerts, dashboard state writes every 5th cycle
-8. **Scripts**: `check_live.py` (account/positions/orders query), `cleanup.py` (emergency cancel+close with --confirm), `analyze_trades.py` (metrics, by-regime, CSV export)
-
-## Critical Implementation Rules
-
-### Safety
-- **ALWAYS** verify `ALPACA_PAPER_TRADE=True` in .env before any testing
-- **NEVER** commit API keys or .env files
-- **ALWAYS** check live broker state (not just local state) when reporting positions
-- **ALWAYS** use paper trading until explicitly told to switch to live
-
-### Timezone
-Always use UTC conversion:
-```python
-from datetime import datetime
-import pytz
-
-now_utc = datetime.now(pytz.UTC)
-now_et = now_utc.astimezone(pytz.timezone('America/New_York'))
-```
-Store all timestamps in UTC. Display in ET.
-
-### Alpaca Quirks
 1. **Bar limit**: Returns FIRST N bars, not last. Always use `.tail(limit)` or pass `start` datetime.
 2. **Wash trades**: Alpaca rejects orders when opposite-side order exists. Cancel conflicting orders first.
 3. **Ghost positions**: `close_position()` should return success when broker says "position not found".
 4. **Quote validation**: Always check bid/ask > 0 before placing limit orders.
-5. **IEX delays**: Options quotes are 15-min delayed. Plan for this in options strategies.
-6. **alpaca-py 0.43+ BarSet**: `symbol in result` is broken on `BarSet` objects; use `symbol in result.data`. Also `result[symbol]` returns `list[Bar]` (no `.df` attribute) — convert manually to DataFrame.
-7. **alpaca-py 0.43+ News**: `StockHistoricalDataClient.get_news()` and `alpaca.data.news.NewsClient` no longer exist. News fetch gracefully fails and returns empty list (non-critical).
+5. **IEX delays**: Options quotes are 15-min delayed.
+6. **alpaca-py 0.43+ BarSet**: `symbol in result` broken; use `symbol in result.data`. `result[symbol]` returns `list[Bar]` not `.df` — convert manually.
+7. **alpaca-py 0.43+ News**: Use `from alpaca.data import NewsClient` (not `alpaca.data.news`). Dedicated `_news_client` in `AlpacaDataProvider.__init__`.
 
-### Code Patterns
+## Critical Code Patterns
 
-**Position exit safety** — always verify close before removing from tracking:
+**Position exit safety** — only remove from tracking after confirmed close:
 ```python
 close_success = executor.close_position(symbol)
 if not close_success:
     return  # Keep in tracking, retry next cycle
-positions.pop(symbol)  # Only after confirmed close
+positions.pop(symbol)
 ```
 
 **Pairs entry rollback** — if one leg fails, close the filled leg:
 ```python
 order_a, order_b = place_pair_orders(...)
 if order_a and not order_b:
-    executor.close_position(symbol_a)  # Rollback
+    executor.close_position(symbol_a)
 ```
 
-**P&L tracking** — get unrealized P&L from broker before closing:
+**P&L tracking** — get unrealized P&L from broker BEFORE closing:
 ```python
 broker_pos = executor.get_position(symbol)
 realized_pnl = float(broker_pos.unrealized_pl) if broker_pos else 0.0
 executor.close_position(symbol)
 ```
 
-### Config Pattern
-All config in YAML. Load once at startup, validate with pydantic:
-```python
-class StrategyConfig(BaseModel):
-    enabled: bool = True
-    capital_allocation_pct: float  # % of total capital
-    # ... strategy-specific params
-```
+## Safety Rules
 
-### Logging Pattern
-Use structlog everywhere. Bind context:
-```python
-import structlog
-logger = structlog.get_logger()
+- **ALWAYS** verify `ALPACA_PAPER_TRADE=True` in .env
+- **NEVER** commit API keys or .env files
+- **ALWAYS** check live broker state (not just local state) when reporting positions
+- Store timestamps in UTC. Display in ET.
+- VPS is in Europe; always think in ET for market hours.
 
-log = logger.bind(strategy="pairs_trading", pair_id="XOM_CVX")
-log.info("entry_signal", z_score=2.3, signal="LONG_SPREAD")
-```
-
-### Testing Pattern
-Every strategy must have unit tests for signal generation (using mock data, not live API).
-
-## Existing Code Reference
-
-The old AlpacaTradingBot repo contains proven logic to migrate:
-
-- **Pairs trading**: Cointegration tests (Engle-Granger), z-score calculation, hedge ratio via OLS regression, entry/exit logic. File: `strategies/pairs_trading.py`
-- **Risk management concepts**: Capital reservation/release, daily metric tracking, position sizing. File: `strategies/base.py`
-- **Order execution patterns**: Marketable limits, wash trade cancellation, ghost position handling. File: `trading_system/order_execution.py`
-- **Options trading**: Multi-leg order submission, Iron Condor structure. File: `strategies/iron_condor.py`
-- **Market data**: Bar fetching, snapshot caching, quote validation. File: `trading_system/market_data.py`
-
-Do NOT copy code verbatim. Rewrite for the new architecture using the DataProvider and Executor abstractions.
-
-## Environment Setup
+## Setup & Run
 
 ```bash
-# Clone repo
-git clone https://github.com/USERNAME/algotrader.git
-cd algotrader
-
-# Install uv if not present
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Create venv and install deps
+# Install
 uv sync
-
-# Copy env file and add keys
 cp .env.example .env
-# Edit .env with ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_PAPER_TRADE=True
+# Edit .env: ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_PAPER_TRADE=True
 
-# Run trading loop
+# Run trading
 .venv/Scripts/python.exe scripts/run.py      # Windows
-# .venv/bin/python scripts/run.py             # Linux/macOS
+# .venv/bin/python scripts/run.py            # Linux/macOS
 
 # Run dashboard
 .venv/Scripts/python.exe -m streamlit run dashboard/app.py
+
+# Utilities
+.venv/Scripts/python.exe scripts/check_live.py          # Account status
+.venv/Scripts/python.exe scripts/cleanup.py --confirm    # Emergency close all
+.venv/Scripts/python.exe scripts/analyze_trades.py       # Trade analysis
 ```
 
 ### VS Code Setup
-A `.vscode/launch.json` is provided with two debug configurations:
-- **Run AlgoTrader** — launches `scripts/run.py` with correct cwd and .env
-- **Run Dashboard** — launches Streamlit dashboard
+A `.vscode/launch.json` provides debug configurations for both the trading loop and dashboard. Select the `.venv` interpreter in the status bar.
 
-Select the `.venv` Python interpreter in the VS Code status bar (bottom right) before running.
+## Key Design Decisions
 
-## Global Settings (config/settings.yaml)
-
-```yaml
-trading:
-  paper_mode: true
-  total_capital: 60000
-  timezone: "America/New_York"
-
-data:
-  provider: "alpaca"
-  feed: "iex"  # or "sip"
-  cycle_interval_seconds: 300  # 5 min for IEX
-
-risk:
-  max_daily_loss_pct: 2.0
-  max_drawdown_pct: 8.0
-  max_gross_exposure_pct: 80.0
-  max_single_position_pct: 5.0
-  max_correlated_positions: 3
-  strategy_daily_loss_limit_pct: 1.0
-
-execution:
-  broker: "alpaca"
-  max_spread_pct: 0.3
-  use_marketable_limits: true
-
-logging:
-  level: "INFO"
-  file: "data/logs/algotrader.log"
-  json_format: true
-```
+1. **No trade > bad trade**: Cash threshold (0.25) means system sits out when no strategy finds opportunities above threshold
+2. **Concentration > diversification**: Power-law allocation concentrates into best setups rather than spreading thin
+3. **Opportunities are assessed, not assumed**: Every strategy must prove it sees real candidates via `assess_opportunities()` before receiving capital
+4. **Position management always runs**: Existing positions get managed regardless of current regime or allocation
+5. **Multiplicative scoring**: A strategy's regime weight is multiplied by opportunity quality — zero opportunities always produces zero score
+6. **Conservative learning**: Weight adjustments require 20+ trades, max +/-0.10 per cycle, confidence >= 0.6, YAML backup before writes

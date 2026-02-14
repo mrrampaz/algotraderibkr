@@ -574,6 +574,15 @@ class PairsTradingStrategy(StrategyBase):
         # Fills are handled in _execute_entry/_execute_exit directly
         # since we need to track both legs together
 
+    def get_held_symbols(self) -> list[str]:
+        """Return symbols from active pair positions (both legs)."""
+        symbols = []
+        for state in self._pair_states.values():
+            if state.is_positioned:
+                symbols.append(state.config.symbol_a)
+                symbols.append(state.config.symbol_b)
+        return symbols
+
     def _get_state(self) -> dict[str, Any]:
         """Serialize strategy state for persistence."""
         base = super()._get_state()

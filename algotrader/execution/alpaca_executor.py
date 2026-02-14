@@ -13,12 +13,16 @@ from alpaca.trading.requests import (
     StopLimitOrderRequest,
     TrailingStopOrderRequest,
     GetOrdersRequest,
+    ReplaceOrderRequest,
+    TakeProfitRequest,
+    StopLossRequest,
 )
 from alpaca.trading.enums import (
     OrderSide as AlpacaOrderSide,
     OrderType as AlpacaOrderType,
     TimeInForce as AlpacaTimeInForce,
     QueryOrderStatus,
+    OrderClass,
 )
 from alpaca.common.exceptions import APIError
 
@@ -70,6 +74,7 @@ class AlpacaExecutor:
     - Wash trade prevention (cancel conflicting orders before entry)
     - Marketable limit orders
     - Ghost position handling (close returns True if position not found)
+    - Bracket orders with broker-side stop loss protection
     """
 
     def __init__(self, config: AlpacaConfig) -> None:
@@ -116,6 +121,43 @@ class AlpacaExecutor:
                 )
                 self.cancel_order(order.id)
 
+    def _build_bracket_kwargs(
+        self,
+        bracket_stop_price: float | None,
+        bracket_take_profit_price: float | None,
+    ) -> dict:
+        """Build bracket order kwargs if stop/target prices are provided."""
+        if bracket_stop_price is None:
+            return {}
+
+        kwargs: dict = {
+            "order_class": OrderClass.BRACKET,
+            "stop_loss": StopLossRequest(stop_price=bracket_stop_price),
+        }
+        if bracket_take_profit_price is not None:
+            kwargs["take_profit"] = TakeProfitRequest(
+                limit_price=bracket_take_profit_price,
+            )
+        return kwargs
+
+    def _extract_bracket_legs(self, alpaca_order, order: Order) -> None:
+        """Extract child order IDs from bracket order legs."""
+        legs = getattr(alpaca_order, "legs", None)
+        if not legs:
+            return
+
+        order.is_bracket = True
+        for leg in legs:
+            leg_type = str(getattr(leg, "order_type", "")).lower()
+            if hasattr(leg_type, "value"):
+                leg_type = leg_type.value.lower()
+            leg_id = str(leg.id)
+
+            if "stop" in leg_type:
+                order.stop_order_id = leg_id
+            elif "limit" in leg_type:
+                order.tp_order_id = leg_id
+
     def submit_order(
         self,
         symbol: str,
@@ -126,8 +168,14 @@ class AlpacaExecutor:
         limit_price: float | None = None,
         stop_price: float | None = None,
         client_order_id: str | None = None,
+        bracket_stop_price: float | None = None,
+        bracket_take_profit_price: float | None = None,
     ) -> Order | None:
-        """Submit an order to Alpaca."""
+        """Submit an order to Alpaca.
+
+        When bracket_stop_price is provided for MARKET or LIMIT orders,
+        a bracket order is created with broker-side stop loss protection.
+        """
         # Generate idempotent client_order_id if not provided
         if client_order_id is None:
             client_order_id = str(uuid.uuid4())
@@ -135,14 +183,19 @@ class AlpacaExecutor:
         # Cancel conflicting orders to prevent wash trade rejections
         self._cancel_conflicting_orders(symbol, side)
 
+        use_bracket = bracket_stop_price is not None
         log = self._log.bind(
             symbol=symbol, qty=qty, side=side.value,
             order_type=order_type.value, client_order_id=client_order_id,
+            bracket=use_bracket,
         )
 
         try:
             alpaca_side = _SIDE_MAP[side]
             alpaca_tif = _TIF_MAP[time_in_force]
+            bracket_kwargs = self._build_bracket_kwargs(
+                bracket_stop_price, bracket_take_profit_price,
+            )
 
             if order_type == OrderType.MARKET:
                 request = MarketOrderRequest(
@@ -151,6 +204,7 @@ class AlpacaExecutor:
                     side=alpaca_side,
                     time_in_force=alpaca_tif,
                     client_order_id=client_order_id,
+                    **bracket_kwargs,
                 )
             elif order_type == OrderType.LIMIT:
                 if limit_price is None:
@@ -163,6 +217,7 @@ class AlpacaExecutor:
                     time_in_force=alpaca_tif,
                     limit_price=limit_price,
                     client_order_id=client_order_id,
+                    **bracket_kwargs,
                 )
             elif order_type == OrderType.STOP:
                 if stop_price is None:
@@ -204,15 +259,69 @@ class AlpacaExecutor:
 
             result = self._client.submit_order(request)
             order = self._convert_order(result)
-            order.strategy_name = ""  # Caller sets this
-            log.info("order_submitted", order_id=order.id, status=order.status.value)
+
+            # Extract bracket child order IDs
+            if use_bracket:
+                self._extract_bracket_legs(result, order)
+
+            log.info(
+                "order_submitted",
+                order_id=order.id,
+                status=order.status.value,
+                is_bracket=order.is_bracket,
+                stop_order_id=order.stop_order_id or None,
+                tp_order_id=order.tp_order_id or None,
+            )
             return order
 
         except APIError as e:
+            # If bracket order fails, fall back to simple order
+            if use_bracket:
+                log.warning(
+                    "bracket_order_failed_falling_back",
+                    error=str(e),
+                    bracket_stop=bracket_stop_price,
+                )
+                return self.submit_order(
+                    symbol=symbol, qty=qty, side=side,
+                    order_type=order_type, time_in_force=time_in_force,
+                    limit_price=limit_price, stop_price=stop_price,
+                    client_order_id=f"{client_order_id}_fb" if client_order_id else None,
+                )
             log.error("order_submit_failed", error=str(e))
             return None
         except Exception:
             log.exception("order_submit_error")
+            return None
+
+    def replace_stop_order(
+        self,
+        order_id: str,
+        new_stop_price: float,
+    ) -> Order | None:
+        """Replace a bracket child stop order with a new stop price.
+
+        Used for trailing stop updates. Returns updated Order with
+        the new order ID, or None if the replace failed.
+        """
+        log = self._log.bind(order_id=order_id, new_stop_price=new_stop_price)
+        try:
+            result = self._client.replace_order_by_id(
+                order_id=order_id,
+                order_data=ReplaceOrderRequest(stop_price=new_stop_price),
+            )
+            order = self._convert_order(result)
+            log.info("stop_order_replaced", new_order_id=order.id)
+            return order
+        except APIError as e:
+            error_msg = str(e).lower()
+            if "not found" in error_msg:
+                log.info("stop_order_already_triggered")
+            else:
+                log.error("stop_replace_failed", error=str(e))
+            return None
+        except Exception:
+            log.exception("stop_replace_error")
             return None
 
     def cancel_order(self, order_id: str) -> bool:

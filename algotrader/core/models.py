@@ -162,6 +162,11 @@ class Order(BaseModel):
     strategy_name: str = ""
     metadata: dict[str, Any] = Field(default_factory=dict)
 
+    # Bracket order tracking
+    stop_order_id: str = ""
+    tp_order_id: str = ""
+    is_bracket: bool = False
+
 
 class Position(BaseModel):
     """A held position."""
