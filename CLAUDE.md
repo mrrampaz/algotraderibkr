@@ -18,7 +18,10 @@ All 5 build phases complete. System is live on paper trading.
 - **Phase 4 — Selection**: EV-based multiplicative scorer, concentration allocator, mid-day reviewer
 - **Phase 5 — Learning**: Metrics, attribution, weight learner, alerts, Streamlit dashboard
 
-**Recent redesign**: Replaced additive scoring with multiplicative EV scoring. Strategies now `assess_opportunities()` before allocation. Zero opportunities = zero capital. Concentration allocator uses power-law weighting (up to 70% to single strategy).
+**Post-launch fixes applied**:
+- Gap reversal: 11 AM ET entry cutoff guard, cross-strategy symbol conflict prevention (broker is authoritative), bracket stop/target price rounding in gap-go path
+- AlpacaExecutor: Decimal-based `_round_price()` to prevent sub-penny bracket rejections (IEEE 754 float issue)
+- Options premium: real Alpaca Level 3 MLEG execution (was always simulated); fallback to simulated if executor doesn't support it
 
 ## Architecture Overview
 
@@ -32,30 +35,30 @@ Orchestrator (pre-market → open → intraday → close → post-market)
     │   └── Event Calendar (FOMC, CPI, earnings with impact scores)
     │
     ├── Strategy Arsenal (7 strategies, each implements assess_opportunities + run_cycle)
-    │   ├── Pairs Trading — statistical arbitrage via cointegration/z-score
-    │   ├── Gap Reversal — gap-and-go (catalyst) + gap fade, time-limited to 11 AM ET
-    │   ├── Momentum — consolidation breakouts with ATR trailing stops
-    │   ├── VWAP Reversion — mean reversion off VWAP z-score, ranging regimes
-    │   ├── Options Premium — credit spreads with SMA5 contrarian filter
-    │   ├── Event-Driven — post-FOMC/CPI directional trades, 2:1 R/R
-    │   └── Sector Rotation — RS-based long/short sector ETFs, 4-hour rebalance
+    │   ├── Pairs Trading       — statistical arbitrage via cointegration/z-score
+    │   ├── Gap Reversal        — gap-and-go (catalyst) + gap fade, time-limited to 11 AM ET
+    │   ├── Momentum            — consolidation breakouts with ATR trailing stops
+    │   ├── VWAP Reversion      — mean reversion off VWAP z-score, ranging regimes
+    │   ├── Options Premium     — credit spreads / iron condors, real MLEG execution (Level 3)
+    │   ├── Event-Driven        — post-FOMC/CPI directional trades, 2:1 R/R
+    │   └── Sector Rotation     — RS-based long/short sector ETFs, 4-hour rebalance
     │
     ├── Strategy Selector
-    │   ├── Scorer — multiplicative EV: base_weight * opp_quality * (1 + modifiers)
+    │   ├── Scorer    — multiplicative EV: base_weight × opp_quality × (1 + modifiers)
     │   ├── Allocator — power-law concentration, cash threshold, max 70% single strategy
-    │   └── Reviewer — mid-day re-assessment, regime-change reallocation
+    │   └── Reviewer  — mid-day re-assessment, regime-change reallocation
     │
     ├── Risk Manager
     │   ├── Portfolio Risk — 2% max daily loss, 8% drawdown, 80% exposure, kill switch
-    │   └── Position Sizer — risk-based sizing, conviction multiplier (0.5x-1.5x)
+    │   └── Position Sizer — risk-based sizing, conviction multiplier (0.5x–1.5x)
     │
     └── Tracking
-        ├── Portfolio — live P&L, positions, daily metrics
-        ├── Trade Journal — SQLite-backed, full context per trade
-        ├── Metrics — Sharpe, profit factor, expectancy, drawdown
-        ├── Attribution — P&L by strategy/regime/session
-        ├── Learner — conservative regime weight adjustment from history
-        └── Alerts — log/file/webhook backends, EventBus auto-subscribe
+        ├── Portfolio  — live P&L, positions, daily metrics
+        ├── Journal    — SQLite-backed, full context per trade
+        ├── Metrics    — Sharpe, profit factor, expectancy, drawdown
+        ├── Attribution— P&L by strategy/regime/session
+        ├── Learner    — conservative regime weight adjustment from history
+        └── Alerts     — log/file/webhook backends, EventBus auto-subscribe
 
 Abstraction Layers:
     ├── DataProvider protocol (Alpaca IEX now, IBKR later)
@@ -68,7 +71,7 @@ The core decision loop each cycle:
 
 1. **Intelligence gathers data**: Regime detection, scanner results, news, calendar events
 2. **Strategies assess opportunities**: Each strategy's `assess_opportunities()` returns an `OpportunityAssessment` with candidate count, avg risk/reward, confidence, estimated edge
-3. **Scorer computes EV**: `score = clamp(base_weight * opp_quality * (1 + modifiers), 0, 1)` where `opp_quality = 0.3*(candidates/3) + 0.3*(rr/3) + 0.4*confidence`. No opportunities = score 0.
+3. **Scorer computes EV**: `score = clamp(base_weight × opp_quality × (1 + modifiers), 0, 1)` where `opp_quality = 0.3×(candidates/3) + 0.3×(rr/3) + 0.4×confidence`. No opportunities = score 0.
 4. **Allocator concentrates capital**: Power-law weighting (`score ** 2.0`), cash threshold 0.25, max 70% single strategy, 80% max deployment, 3% floor if active
 5. **Strategies execute**: Only strategies with allocated capital run their `run_cycle()`
 6. **Position management runs always**: Existing positions managed regardless of allocation
@@ -82,13 +85,13 @@ The core decision loop each cycle:
 | Max gross exposure | 80% |
 | Max single position | 5% of capital |
 | Per-strategy daily loss limit | 1% |
-| Risk per trade | 0.25-0.5% |
-| Conviction multiplier range | 0.5x-1.5x |
+| Risk per trade | 0.25–0.5% |
+| Conviction multiplier range | 0.5x–1.5x |
 | Kill switch | Auto-triggers on max daily loss or max drawdown |
 
 ## Daily Lifecycle
 
-1. **Pre-market (7-9:30 AM ET)**: Refresh gaps, regime, news every 15 min. Volume scan at 9:15 AM.
+1. **Pre-market (7–9:30 AM ET)**: Refresh gaps, regime, news every 15 min. Volume scan at 9:15 AM.
 2. **Market open**: Assess opportunities across all strategies. EV score and concentrate allocation.
 3. **Intraday (5-min cycles)**: Run allocated strategies, manage all positions, risk checks.
 4. **Mid-day (noon ET)**: Re-assess opportunities. Scale down losers, disable severe losers, boost winners. Regime change triggers full reallocation.
@@ -98,7 +101,7 @@ The core decision loop each cycle:
 ## Tech Stack
 
 - **Python 3.11+** with **uv** for package management
-- **alpaca-py** for broker API (paper trading)
+- **alpaca-py 0.43+** for broker API (paper trading, Level 3 options MLEG)
 - **pandas, numpy, scipy** for quantitative analysis
 - **httpx + beautifulsoup4** for web scraping
 - **pydantic** for config and data validation
@@ -137,18 +140,18 @@ algotrader/
 │   │   └── logging.py               # structlog setup
 │   ├── data/
 │   │   ├── provider.py               # DataProvider Protocol
-│   │   ├── alpaca_provider.py        # Alpaca IEX/SIP implementation
+│   │   ├── alpaca_provider.py        # Alpaca IEX/SIP + NewsClient implementation
 │   │   └── cache.py                  # TTL-based quote/bar cache
 │   ├── execution/
 │   │   ├── executor.py               # Executor Protocol
-│   │   ├── alpaca_executor.py        # Alpaca order execution
+│   │   ├── alpaca_executor.py        # Alpaca order execution + MLEG options support
 │   │   └── order_manager.py          # Order tracking, fills, retries
 │   ├── intelligence/
 │   │   ├── regime.py                 # Market regime classifier
 │   │   ├── scanners/
-│   │   │   ├── gap_scanner.py        # Pre-market gap detection
-│   │   │   ├── volume_scanner.py     # Unusual volume detection
-│   │   │   └── breakout_scanner.py   # Consolidation breakout scanner
+│   │   │   ├── gap_scanner.py
+│   │   │   ├── volume_scanner.py
+│   │   │   └── breakout_scanner.py
 │   │   ├── news/
 │   │   │   ├── alpaca_news.py        # Alpaca NewsClient
 │   │   │   └── scraper.py            # Finviz/Yahoo scraper
@@ -161,7 +164,7 @@ algotrader/
 │   │   ├── gap_reversal.py
 │   │   ├── momentum.py
 │   │   ├── vwap_reversion.py
-│   │   ├── options_premium.py
+│   │   ├── options_premium.py        # Real MLEG execution (Level 3), simulated fallback
 │   │   ├── event_driven.py
 │   │   └── sector_rotation.py
 │   ├── strategy_selector/
@@ -172,7 +175,7 @@ algotrader/
 │   │   ├── portfolio_risk.py         # Portfolio-level controls + kill switch
 │   │   └── position_sizer.py         # Risk-based sizing with conviction
 │   └── tracking/
-│       ├── portfolio.py              # Live portfolio state
+│       ├── portfolio.py
 │       ├── journal.py                # Trade journal (SQLite)
 │       ├── metrics.py                # Sharpe, PF, expectancy, drawdown
 │       ├── attribution.py            # P&L attribution by strategy/regime/session
@@ -188,34 +191,30 @@ algotrader/
 │   ├── cleanup.py                    # Emergency cancel+close (--confirm)
 │   └── analyze_trades.py             # Trade analysis + CSV export
 │
-├── tests/
-│   ├── unit/
-│   └── integration/
-│
-└── data/                             # Runtime data (gitignored)
-    ├── state/                        # JSON state files for dashboard
-    ├── logs/                         # structlog JSON + alerts
-    ├── journal/                      # trades.db (SQLite)
-    └── cache/                        # Quote/bar cache
+└── tests/
+    ├── unit/
+    └── integration/
 ```
 
 ## Key Config Files
 
 | File | Controls |
-|------|----------|
-| `config/settings.yaml` | Capital, risk limits, data feed, execution, logging |
+|------|---------|
+| `config/settings.yaml` | Capital, risk limits, data feed, execution, strategy allocations |
 | `config/regimes.yaml` | Regime-strategy weight matrix, score modifiers (VIX, time, events, performance) |
 | `config/strategies/*.yaml` | Per-strategy: enabled, allocation cap, entry/exit params, symbols |
 
 ## Alpaca Quirks
 
-1. **Bar limit**: Returns FIRST N bars, not last. Always use `.tail(limit)` or pass `start` datetime.
+1. **Bar limit**: `get_bars()` returns FIRST N bars, not last. Always use `.tail(limit)` or pass `start` datetime.
 2. **Wash trades**: Alpaca rejects orders when opposite-side order exists. Cancel conflicting orders first.
-3. **Ghost positions**: `close_position()` should return success when broker says "position not found".
+3. **Ghost positions**: `close_position()` returns True if "position not found" — don't treat as failure.
 4. **Quote validation**: Always check bid/ask > 0 before placing limit orders.
 5. **IEX delays**: Options quotes are 15-min delayed.
 6. **alpaca-py 0.43+ BarSet**: `symbol in result` broken; use `symbol in result.data`. `result[symbol]` returns `list[Bar]` not `.df` — convert manually.
 7. **alpaca-py 0.43+ News**: Use `from alpaca.data import NewsClient` (not `alpaca.data.news`). Dedicated `_news_client` in `AlpacaDataProvider.__init__`.
+8. **Bracket price precision**: `round(price, 2)` on floats can produce sub-penny values due to IEEE 754. `AlpacaExecutor._round_price()` uses `Decimal(str(price)).quantize(Decimal("0.01"))` — never revert to plain `round()`.
+9. **MLEG options**: `AlpacaExecutor` exposes `lookup_option_contract()` and `submit_mleg_order()` outside the `Executor` Protocol (Alpaca-specific). Strategies check `hasattr(executor, "submit_mleg_order")` before calling and fall back to simulated if absent. Requires Level 3 approval (self-serve in paper accounts: Trading → Options).
 
 ## Critical Code Patterns
 
@@ -234,16 +233,43 @@ if order_a and not order_b:
     executor.close_position(symbol_a)
 ```
 
-**P&L tracking** — get unrealized P&L from broker BEFORE closing:
+**P&L tracking** — get unrealized P&L from broker BEFORE closing equity positions:
 ```python
 broker_pos = executor.get_position(symbol)
 realized_pnl = float(broker_pos.unrealized_pl) if broker_pos else 0.0
 executor.close_position(symbol)
 ```
 
+**Options MLEG close** — reverse all opening legs:
+```python
+# Opening: SELL_TO_OPEN short + BUY_TO_OPEN long
+# Closing:  BUY_TO_CLOSE short + SELL_TO_CLOSE long
+legs = [
+    {"symbol": short_occ, "side": OrderSide.BUY,  "position_intent": "buy_to_close"},
+    {"symbol": long_occ,  "side": OrderSide.SELL, "position_intent": "sell_to_close"},
+]
+executor.submit_mleg_order(legs, qty=contracts)
+```
+
+**Cross-strategy conflict prevention** — broker is authoritative:
+```python
+# In _scan_entries() before entering any new position:
+if executor.get_position(symbol) is not None:
+    continue  # Another strategy already holds this symbol
+```
+
+**Gap reversal entry cutoff** — never open new positions after 11 AM ET:
+```python
+def _past_entry_cutoff(self, et_now) -> bool:
+    return (et_now.hour > self._close_by_hour or
+            (et_now.hour == self._close_by_hour and
+             et_now.minute >= self._close_by_minute))
+# In run_cycle(): guard _scan_entries with this check
+```
+
 ## Safety Rules
 
-- **ALWAYS** verify `ALPACA_PAPER_TRADE=True` in .env
+- **ALWAYS** verify `ALPACA_PAPER_TRADE=True` in .env before running
 - **NEVER** commit API keys or .env files
 - **ALWAYS** check live broker state (not just local state) when reporting positions
 - Store timestamps in UTC. Display in ET.
@@ -261,7 +287,7 @@ cp .env.example .env
 .venv/Scripts/python.exe scripts/run.py      # Windows
 # .venv/bin/python scripts/run.py            # Linux/macOS
 
-# Run dashboard
+# Run dashboard (separate terminal)
 .venv/Scripts/python.exe -m streamlit run dashboard/app.py
 
 # Utilities
@@ -280,4 +306,6 @@ A `.vscode/launch.json` provides debug configurations for both the trading loop 
 3. **Opportunities are assessed, not assumed**: Every strategy must prove it sees real candidates via `assess_opportunities()` before receiving capital
 4. **Position management always runs**: Existing positions get managed regardless of current regime or allocation
 5. **Multiplicative scoring**: A strategy's regime weight is multiplied by opportunity quality — zero opportunities always produces zero score
-6. **Conservative learning**: Weight adjustments require 20+ trades, max +/-0.10 per cycle, confidence >= 0.6, YAML backup before writes
+6. **Conservative learning**: Weight adjustments require 20+ trades, max ±0.10 per cycle, confidence ≥ 0.6, YAML backup before writes
+7. **Broker is authoritative**: For cross-strategy conflicts, always query the live broker position — never rely solely on local state
+8. **Graceful fallback**: If MLEG options execution fails (Level 3 not approved, API error), options strategy reverts to simulated tracking automatically

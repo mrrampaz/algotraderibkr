@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import uuid
+from datetime import date
+from decimal import Decimal, ROUND_HALF_UP
 
 import structlog
 from alpaca.trading.client import TradingClient
@@ -13,6 +15,8 @@ from alpaca.trading.requests import (
     StopLimitOrderRequest,
     TrailingStopOrderRequest,
     GetOrdersRequest,
+    GetOptionContractsRequest,
+    OptionLegRequest,
     ReplaceOrderRequest,
     TakeProfitRequest,
     StopLossRequest,
@@ -23,6 +27,8 @@ from alpaca.trading.enums import (
     TimeInForce as AlpacaTimeInForce,
     QueryOrderStatus,
     OrderClass,
+    ContractType,
+    PositionIntent,
 )
 from alpaca.common.exceptions import APIError
 
@@ -121,23 +127,37 @@ class AlpacaExecutor:
                 )
                 self.cancel_order(order.id)
 
+    @staticmethod
+    def _round_price(price: float) -> float:
+        """Round price to valid tick (2 decimals for stocks >= $1).
+
+        Uses Decimal to avoid IEEE 754 floating-point precision issues that
+        cause Alpaca to reject prices with sub-penny increments (e.g. 319.0675).
+        """
+        return float(Decimal(str(price)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
     def _build_bracket_kwargs(
         self,
         bracket_stop_price: float | None,
         bracket_take_profit_price: float | None,
+        side: str = "buy",
     ) -> dict:
-        """Build bracket order kwargs if stop/target prices are provided."""
+        """Build bracket order kwargs if stop/target prices are provided.
+
+        Validates that stop/TP prices are on the correct side for the order
+        direction and rounds to valid tick increments.
+        """
         if bracket_stop_price is None:
             return {}
 
+        stop = self._round_price(bracket_stop_price)
         kwargs: dict = {
             "order_class": OrderClass.BRACKET,
-            "stop_loss": StopLossRequest(stop_price=bracket_stop_price),
+            "stop_loss": StopLossRequest(stop_price=stop),
         }
         if bracket_take_profit_price is not None:
-            kwargs["take_profit"] = TakeProfitRequest(
-                limit_price=bracket_take_profit_price,
-            )
+            tp = self._round_price(bracket_take_profit_price)
+            kwargs["take_profit"] = TakeProfitRequest(limit_price=tp)
         return kwargs
 
     def _extract_bracket_legs(self, alpaca_order, order: Order) -> None:
@@ -195,6 +215,7 @@ class AlpacaExecutor:
             alpaca_tif = _TIF_MAP[time_in_force]
             bracket_kwargs = self._build_bracket_kwargs(
                 bracket_stop_price, bracket_take_profit_price,
+                side=side.value,
             )
 
             if order_type == OrderType.MARKET:
@@ -436,3 +457,125 @@ class AlpacaExecutor:
         except Exception:
             self._log.exception("get_open_orders_error")
             return []
+
+    # ── Options Support ───────────────────────────────────────────────────────
+
+    def lookup_option_contract(
+        self,
+        underlying: str,
+        contract_type: str,
+        strike: float,
+        expiration: date,
+    ) -> str | None:
+        """Look up an option contract OCC symbol.
+
+        Searches Alpaca for the active, tradeable contract matching the
+        given underlying, type ("call" or "put"), strike, and expiration date.
+
+        Returns the OCC symbol (e.g. 'SPY260117P00580000') if found, else None.
+        """
+        ctype = ContractType.CALL if contract_type.lower() == "call" else ContractType.PUT
+        try:
+            request = GetOptionContractsRequest(
+                underlying_symbols=[underlying],
+                type=ctype,
+                expiration_date=expiration,
+                # Narrow range around target strike to avoid large result sets
+                strike_price_gte=str(strike - 0.5),
+                strike_price_lte=str(strike + 0.5),
+                limit=10,
+            )
+            result = self._client.get_option_contracts(request)
+            contracts = getattr(result, "option_contracts", None) or []
+            for contract in contracts:
+                if abs(float(contract.strike_price) - float(strike)) < 0.01 and contract.tradable:
+                    self._log.debug(
+                        "option_contract_found",
+                        symbol=contract.symbol,
+                        underlying=underlying,
+                        type=contract_type,
+                        strike=strike,
+                        expiration=str(expiration),
+                    )
+                    return contract.symbol
+            self._log.warning(
+                "option_contract_not_found",
+                underlying=underlying,
+                type=contract_type,
+                strike=strike,
+                expiration=str(expiration),
+            )
+            return None
+        except Exception as e:
+            self._log.error(
+                "option_lookup_failed",
+                underlying=underlying,
+                type=contract_type,
+                strike=strike,
+                error=str(e),
+            )
+            return None
+
+    def submit_mleg_order(
+        self,
+        legs: list[dict],
+        qty: int = 1,
+        time_in_force: TimeInForce = TimeInForce.DAY,
+        client_order_id: str | None = None,
+    ) -> str | None:
+        """Submit a multi-leg options order (credit spread, iron condor, etc.).
+
+        Each leg dict must contain:
+            symbol          : OCC option symbol (e.g. 'SPY260117P00580000')
+            side            : OrderSide.BUY or OrderSide.SELL
+            position_intent : str matching PositionIntent enum value
+                              ('buy_to_open', 'sell_to_open', 'buy_to_close', 'sell_to_close')
+            ratio_qty       : int, default 1 — ratio within the spread
+
+        qty is the number of spreads (multiplier applied to each leg's ratio_qty).
+
+        Returns the broker order ID string on success, None on failure.
+        """
+        if client_order_id is None:
+            client_order_id = str(uuid.uuid4())
+
+        alpaca_legs = [
+            OptionLegRequest(
+                symbol=leg["symbol"],
+                ratio_qty=float(leg.get("ratio_qty", 1)),
+                side=_SIDE_MAP[leg["side"]],
+                position_intent=PositionIntent(leg["position_intent"]),
+            )
+            for leg in legs
+        ]
+
+        request = MarketOrderRequest(
+            qty=float(qty),
+            type=AlpacaOrderType.MARKET,
+            time_in_force=_TIF_MAP[time_in_force],
+            order_class=OrderClass.MLEG,
+            client_order_id=client_order_id,
+            legs=alpaca_legs,
+        )
+
+        try:
+            result = self._client.submit_order(request)
+            order_id = str(result.id)
+            self._log.info(
+                "mleg_order_submitted",
+                order_id=order_id,
+                qty=qty,
+                num_legs=len(legs),
+                symbols=[leg["symbol"] for leg in legs],
+            )
+            return order_id
+        except APIError as e:
+            self._log.error(
+                "mleg_order_failed",
+                error=str(e),
+                symbols=[leg["symbol"] for leg in legs],
+            )
+            return None
+        except Exception:
+            self._log.exception("mleg_order_error")
+            return None

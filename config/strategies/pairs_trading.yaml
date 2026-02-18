@@ -6,7 +6,7 @@ params:
   lookback_bars: 252
 
   # Z-score thresholds
-  z_entry_threshold: 1.2     # Enter when |z| > this
+  z_entry_threshold: 2.0     # Enter when |z| > this
   z_exit_threshold: 0.2      # Exit when |z| < this (profit target)
   z_stop_threshold: 2.8      # Exit when |z| > this (stop loss)
 

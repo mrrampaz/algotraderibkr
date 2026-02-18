@@ -52,9 +52,15 @@ class PremiumTrade:
     max_loss: float = 0.0
     entry_time: datetime | None = None
     expiration: date | None = None
-    simulated: bool = False  # True if couldn't submit real order
+    simulated: bool = True   # False only when a real MLEG order was placed
     capital_used: float = 0.0
     trade_id: str = ""
+    # Real execution fields (empty when simulated=True)
+    open_order_id: str = ""       # Broker order ID for the opening MLEG order
+    short_occ_symbol: str = ""    # OCC symbol for the short leg (put or call)
+    long_occ_symbol: str = ""     # OCC symbol for the long (protective) leg
+    call_short_occ_symbol: str = ""  # Iron condor call-side short OCC symbol
+    call_long_occ_symbol: str = ""   # Iron condor call-side long OCC symbol
 
 
 @register_strategy("options_premium")
@@ -274,10 +280,12 @@ class OptionsPremiumStrategy(StrategyBase):
             if not self.reserve_capital(capital_needed):
                 continue
 
-            # Attempt to submit the trade
-            submitted = self._submit_credit_spread(
+            # Attempt to submit the trade as a real MLEG order
+            order_result = self._submit_credit_spread(
                 underlying, short_strike, long_strike,
                 structure, contracts, et_now.date(),
+                call_short_strike=call_short,
+                call_long_strike=call_long,
             )
 
             trade = PremiumTrade(
@@ -293,9 +301,14 @@ class OptionsPremiumStrategy(StrategyBase):
                 max_loss=total_risk,
                 entry_time=datetime.now(pytz.UTC),
                 expiration=et_now.date() + timedelta(days=self._target_dte),
-                simulated=not submitted,
+                simulated=order_result is None,
                 capital_used=capital_needed,
                 trade_id=str(uuid.uuid4()),
+                open_order_id=order_result["order_id"] if order_result else "",
+                short_occ_symbol=order_result["short_occ"] if order_result else "",
+                long_occ_symbol=order_result["long_occ"] if order_result else "",
+                call_short_occ_symbol=order_result.get("call_short_occ", "") if order_result else "",
+                call_long_occ_symbol=order_result.get("call_long_occ", "") if order_result else "",
             )
             self._trades[underlying] = trade
 
@@ -418,26 +431,146 @@ class OptionsPremiumStrategy(StrategyBase):
         return 0.0
 
     def _submit_credit_spread(
-        self, underlying: str, short_strike: float, long_strike: float,
-        structure: str, contracts: int, expiration: date,
-    ) -> bool:
-        """Submit a credit spread order. Returns False if not supported."""
-        try:
-            # Alpaca may not support multi-leg options orders via alpaca-py
-            # Log the intended trade and flag as simulated
+        self,
+        underlying: str,
+        short_strike: float,
+        long_strike: float,
+        structure: str,
+        contracts: int,
+        expiration: date,
+        call_short_strike: float | None = None,
+        call_long_strike: float | None = None,
+    ) -> dict | None:
+        """Submit a credit spread or iron condor via Alpaca MLEG order.
+
+        Looks up the OCC contract symbols for each leg, then submits a single
+        multi-leg market order (order_class="mleg"). Requires Level 3 options
+        approval on the Alpaca account (self-serve toggle in paper accounts).
+
+        Returns a dict with order details if a real order was placed:
+            {"order_id": str, "short_occ": str, "long_occ": str,
+             "call_short_occ": str, "call_long_occ": str}
+        Returns None to indicate simulated tracking should be used instead,
+        either because the executor doesn't support MLEG or the lookup failed.
+        """
+        if not hasattr(self.executor, "submit_mleg_order"):
+            # Executor (e.g. IBKR stub) doesn't implement MLEG yet — simulate
+            self._log.info("options_executor_no_mleg", underlying=underlying)
+            return None
+
+        # Resolve option type for each spread direction
+        if structure == "put_spread" or structure == "iron_condor":
+            put_or_call = "put"
+        else:  # call_spread
+            put_or_call = "call"
+
+        # Look up OCC symbols for the primary (put or call) spread legs
+        short_occ = self.executor.lookup_option_contract(
+            underlying, put_or_call, short_strike, expiration,
+        )
+        long_occ = self.executor.lookup_option_contract(
+            underlying, put_or_call, long_strike, expiration,
+        )
+
+        if not short_occ or not long_occ:
             self._log.warning(
-                "options_order_simulated",
+                "options_leg_lookup_failed",
                 underlying=underlying,
                 structure=structure,
                 short_strike=short_strike,
                 long_strike=long_strike,
-                contracts=contracts,
-                note="Options orders require IBKR integration for live execution",
+                expiration=str(expiration),
+            )
+            return None
+
+        # Build the leg list: short = sell-to-open, long (hedge) = buy-to-open
+        legs: list[dict] = [
+            {"symbol": short_occ, "ratio_qty": 1, "side": OrderSide.SELL, "position_intent": "sell_to_open"},
+            {"symbol": long_occ,  "ratio_qty": 1, "side": OrderSide.BUY,  "position_intent": "buy_to_open"},
+        ]
+
+        # Iron condor: add the call-side spread as two additional legs
+        call_short_occ = ""
+        call_long_occ = ""
+        if structure == "iron_condor" and call_short_strike and call_long_strike:
+            call_short_occ = self.executor.lookup_option_contract(
+                underlying, "call", call_short_strike, expiration,
+            ) or ""
+            call_long_occ = self.executor.lookup_option_contract(
+                underlying, "call", call_long_strike, expiration,
+            ) or ""
+            if call_short_occ and call_long_occ:
+                legs.extend([
+                    {"symbol": call_short_occ, "ratio_qty": 1, "side": OrderSide.SELL, "position_intent": "sell_to_open"},
+                    {"symbol": call_long_occ,  "ratio_qty": 1, "side": OrderSide.BUY,  "position_intent": "buy_to_open"},
+                ])
+            else:
+                # Can't complete iron condor — fall back to the put spread only
+                self._log.warning(
+                    "iron_condor_call_lookup_failed",
+                    underlying=underlying,
+                    call_short_strike=call_short_strike,
+                    call_long_strike=call_long_strike,
+                )
+
+        order_id = self.executor.submit_mleg_order(legs, qty=contracts)
+        if order_id is None:
+            return None
+
+        self._log.info(
+            "options_mleg_submitted",
+            underlying=underlying,
+            structure=structure,
+            contracts=contracts,
+            order_id=order_id,
+            legs=[leg["symbol"] for leg in legs],
+        )
+        return {
+            "order_id": order_id,
+            "short_occ": short_occ,
+            "long_occ": long_occ,
+            "call_short_occ": call_short_occ,
+            "call_long_occ": call_long_occ,
+        }
+
+    def _close_real_spread(self, trade: PremiumTrade) -> bool:
+        """Submit a closing MLEG order to buy back an open credit spread.
+
+        Reverses each opening leg:
+          sell-to-open short → buy-to-close
+          buy-to-open long   → sell-to-close
+
+        Returns True if the closing order was submitted, False otherwise.
+        """
+        if not hasattr(self.executor, "submit_mleg_order"):
+            return False
+        if not trade.short_occ_symbol or not trade.long_occ_symbol:
+            self._log.error(
+                "close_spread_missing_occ_symbols",
+                underlying=trade.underlying,
             )
             return False
-        except Exception as e:
-            self._log.warning("options_order_failed", error=str(e))
-            return False
+
+        legs: list[dict] = [
+            {"symbol": trade.short_occ_symbol, "ratio_qty": 1, "side": OrderSide.BUY,  "position_intent": "buy_to_close"},
+            {"symbol": trade.long_occ_symbol,  "ratio_qty": 1, "side": OrderSide.SELL, "position_intent": "sell_to_close"},
+        ]
+        # Iron condor: also close the call side
+        if trade.call_short_occ_symbol and trade.call_long_occ_symbol:
+            legs.extend([
+                {"symbol": trade.call_short_occ_symbol, "ratio_qty": 1, "side": OrderSide.BUY,  "position_intent": "buy_to_close"},
+                {"symbol": trade.call_long_occ_symbol,  "ratio_qty": 1, "side": OrderSide.SELL, "position_intent": "sell_to_close"},
+            ])
+
+        order_id = self.executor.submit_mleg_order(legs, qty=trade.contracts)
+        if order_id:
+            self._log.info(
+                "options_close_mleg_submitted",
+                underlying=trade.underlying,
+                structure=trade.structure,
+                order_id=order_id,
+            )
+        return order_id is not None
 
     def _close_trade(self, trade_key: str, trade: PremiumTrade, reason: str) -> None:
         """Close a premium trade."""
@@ -474,12 +607,12 @@ class OptionsPremiumStrategy(StrategyBase):
             )
             return
 
-        # For real trades, close via executor
-        broker_pos = self.executor.get_position(trade.underlying)
-        pnl = float(broker_pos.unrealized_pnl) if broker_pos else 0.0
-        exit_price = float(broker_pos.current_price) if broker_pos else 0.0
+        # For real trades, close by reversing the MLEG legs
+        # P&L is estimated from underlying price (options legs aren't equity positions)
+        current_price = self._get_current_price(trade.underlying) or 0.0
+        pnl = self._estimate_simulated_pnl(trade, current_price)
 
-        close_success = self.executor.close_position(trade.underlying)
+        close_success = self._close_real_spread(trade)
         if not close_success:
             self._log.error("premium_close_failed", underlying=trade.underlying)
             return
@@ -492,7 +625,7 @@ class OptionsPremiumStrategy(StrategyBase):
             side=OrderSide.SELL,
             qty=trade.contracts,
             entry_price=trade.short_strike,
-            exit_price=exit_price,
+            exit_price=current_price,
             entry_time=trade.entry_time,
             entry_reason=f"premium_sell: {trade.structure}",
             exit_reason=reason,
@@ -500,6 +633,8 @@ class OptionsPremiumStrategy(StrategyBase):
                 "structure": trade.structure,
                 "short_strike": trade.short_strike,
                 "long_strike": trade.long_strike,
+                "short_occ": trade.short_occ_symbol,
+                "long_occ": trade.long_occ_symbol,
                 "simulated": False,
             },
         )
@@ -509,6 +644,7 @@ class OptionsPremiumStrategy(StrategyBase):
             underlying=trade.underlying,
             structure=trade.structure,
             reason=reason,
+            est_pnl=round(pnl, 2),
         )
 
     def _estimate_simulated_pnl(self, trade: PremiumTrade, current_price: float) -> float:
@@ -605,6 +741,11 @@ class OptionsPremiumStrategy(StrategyBase):
                 "simulated": trade.simulated,
                 "capital_used": trade.capital_used,
                 "trade_id": trade.trade_id,
+                "open_order_id": trade.open_order_id,
+                "short_occ_symbol": trade.short_occ_symbol,
+                "long_occ_symbol": trade.long_occ_symbol,
+                "call_short_occ_symbol": trade.call_short_occ_symbol,
+                "call_long_occ_symbol": trade.call_long_occ_symbol,
             }
         return base
 
@@ -628,4 +769,9 @@ class OptionsPremiumStrategy(StrategyBase):
                 simulated=saved.get("simulated", True),
                 capital_used=saved.get("capital_used", 0.0),
                 trade_id=saved.get("trade_id", ""),
+                open_order_id=saved.get("open_order_id", ""),
+                short_occ_symbol=saved.get("short_occ_symbol", ""),
+                long_occ_symbol=saved.get("long_occ_symbol", ""),
+                call_short_occ_symbol=saved.get("call_short_occ_symbol", ""),
+                call_long_occ_symbol=saved.get("call_long_occ_symbol", ""),
             )

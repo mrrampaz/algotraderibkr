@@ -121,6 +121,12 @@ class GapReversalStrategy(StrategyBase):
         self._candidates_loaded = True
         self._log.info("gap_candidates_set", count=len(candidates))
 
+    def _past_entry_cutoff(self, et_now: datetime) -> bool:
+        """Return True if it's past the 11 AM ET cutoff for new entries."""
+        return (et_now.hour > self._close_by_hour or
+                (et_now.hour == self._close_by_hour and
+                 et_now.minute >= self._close_by_minute))
+
     def run_cycle(self, regime: MarketRegime | None = None) -> list[Signal]:
         """Run one cycle: manage positions, scan for new gap entries."""
         self._check_day_reset()
@@ -136,8 +142,8 @@ class GapReversalStrategy(StrategyBase):
         if regime and regime.regime_type.value not in self._allowed_regimes:
             return signals
 
-        # 3. Scan for new entries (if under max_positions)
-        if len(self._trades) < self.config.max_positions:
+        # 3. Scan for new entries (if under max_positions and within entry window)
+        if len(self._trades) < self.config.max_positions and not self._past_entry_cutoff(et_now):
             signals.extend(self._scan_entries(et_now))
 
         return signals
@@ -206,6 +212,9 @@ class GapReversalStrategy(StrategyBase):
                 continue
             if len(self._trades) >= self.config.max_positions:
                 break
+            # Skip symbols already held by another strategy (broker is authoritative)
+            if self.executor.get_position(symbol) is not None:
+                continue
 
             gap_pct = candidate.get("gap_pct", 0.0)
             prev_close = candidate.get("prev_close", 0.0)
@@ -266,6 +275,10 @@ class GapReversalStrategy(StrategyBase):
         else:
             return None
 
+        # Round prices to valid tick (avoid sub-penny bracket rejections)
+        stop_price = round(stop_price, 2)
+        target_price = round(target_price, 2)
+
         return self._execute_entry(
             symbol=symbol,
             trade_type="gap_go",
@@ -317,6 +330,9 @@ class GapReversalStrategy(StrategyBase):
             entry_price = current_price
             stop_price = gap_open * (1 + self._fade_stop_pct / 100)
             target_price = fill_target
+            # Stop must be above entry for a short
+            if stop_price <= entry_price:
+                return None
         else:
             # Gap DOWN fade: long
             direction = "long"
@@ -324,6 +340,13 @@ class GapReversalStrategy(StrategyBase):
             entry_price = current_price
             stop_price = gap_open * (1 - self._fade_stop_pct / 100)
             target_price = fill_target
+            # Stop must be below entry for a long
+            if stop_price >= entry_price:
+                return None
+
+        # Round prices to valid tick (avoid sub-penny rejections)
+        stop_price = round(stop_price, 2)
+        target_price = round(target_price, 2)
 
         return self._execute_entry(
             symbol=symbol,

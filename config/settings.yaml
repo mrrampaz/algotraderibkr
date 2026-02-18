@@ -71,7 +71,7 @@ strategies:
     max_positions: 5
     params:
       lookback_bars: 252
-      z_entry_threshold: 1.2
+      z_entry_threshold: 2.0
       z_exit_threshold: 0.2
       z_stop_threshold: 2.8
       max_bars_in_position: 80

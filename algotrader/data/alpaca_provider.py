@@ -338,7 +338,8 @@ class AlpacaDataProvider:
         try:
             request_params = {"limit": limit}
             if symbols:
-                request_params["symbols"] = symbols
+                # alpaca-py 0.43+: NewsRequest.symbols expects comma-separated string
+                request_params["symbols"] = ",".join(symbols) if isinstance(symbols, list) else symbols
 
             request = NewsRequest(**request_params)
             result = self._news_client.get_news(request)
