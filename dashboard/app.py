@@ -16,6 +16,13 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
+# Resolve paths from repository root regardless of current working directory.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DATA_DIR = REPO_ROOT / "data"
+STATE_DIR = DATA_DIR / "state"
+JOURNAL_DB_PATH = DATA_DIR / "journal" / "trades.db"
+ALERT_LOG_PATH = DATA_DIR / "logs" / "alerts.log"
+
 # Page config
 st.set_page_config(
     page_title="AlgoTrader Dashboard",
@@ -31,10 +38,9 @@ st.set_page_config(
 @st.cache_resource
 def get_db_connection():
     """Connect to trade journal SQLite database."""
-    db_path = "data/journal/trades.db"
-    if not Path(db_path).exists():
+    if not JOURNAL_DB_PATH.exists():
         return None
-    return sqlite3.connect(db_path, check_same_thread=False)
+    return sqlite3.connect(JOURNAL_DB_PATH, check_same_thread=False)
 
 
 def load_trades(conn, days=30, strategy=None) -> pd.DataFrame:
@@ -97,7 +103,7 @@ def load_strategy_summary(conn, days=30) -> pd.DataFrame:
 
 def load_broker_state() -> dict | None:
     """Try to load live broker state from a shared state file."""
-    state_path = Path("data/state/broker_snapshot.json")
+    state_path = STATE_DIR / "broker_snapshot.json"
     if state_path.exists():
         try:
             with open(state_path) as f:
@@ -109,11 +115,10 @@ def load_broker_state() -> dict | None:
 
 def load_recent_alerts(n=20) -> list[str]:
     """Load recent alerts from alert log."""
-    alert_path = Path("data/logs/alerts.log")
-    if not alert_path.exists():
+    if not ALERT_LOG_PATH.exists():
         return []
     try:
-        lines = alert_path.read_text().strip().split("\n")
+        lines = ALERT_LOG_PATH.read_text().strip().split("\n")
         return lines[-n:]
     except Exception:
         return []
@@ -121,7 +126,7 @@ def load_recent_alerts(n=20) -> list[str]:
 
 def load_regime_state() -> dict | None:
     """Load current regime from state file."""
-    path = Path("data/state/regime.json")
+    path = STATE_DIR / "regime.json"
     if path.exists():
         try:
             with open(path) as f:
@@ -133,7 +138,7 @@ def load_regime_state() -> dict | None:
 
 def load_json_state(filename: str) -> list | dict | None:
     """Load a JSON state file from data/state/."""
-    path = Path(f"data/state/{filename}")
+    path = STATE_DIR / filename
     if path.exists():
         try:
             with open(path) as f:
@@ -173,7 +178,7 @@ def get_strategy_names(conn) -> list[str]:
 
 def load_strategy_states() -> list[dict]:
     """Load live strategy state from JSON files in data/state/."""
-    state_dir = Path("data/state")
+    state_dir = STATE_DIR
     states = []
     strategy_names = [
         "pairs_trading", "gap_reversal", "momentum", "vwap_reversion",

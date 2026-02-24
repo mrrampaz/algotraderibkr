@@ -1,8 +1,12 @@
 {
-    "python.defaultInterpreterPath": "c:\\algotrader\\.venv\\Scripts\\python.exe",
+    "python.defaultInterpreterPath": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
     "python.terminal.activateEnvironment": true,
+    "python.terminal.activateEnvInCurrentTerminal": true,
     "python.terminal.executeInFileDir": false,
     "python.envFile": "${workspaceFolder}/.env",
-    "python-envs.pythonProjects": [],
-    "python-envs.defaultEnvManager": "ms-python.python:system"
+    "python-envs.defaultEnvManager": "ms-python.python:system",
+    "code-runner.runInTerminal": true,
+    "code-runner.executorMap": {
+        "python": "\"${workspaceFolder}\\\\.venv\\\\Scripts\\\\python.exe\" -u"
+    }
 }

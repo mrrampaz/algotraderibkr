@@ -8,6 +8,18 @@ data:
   feed: "iex"  # or "sip"
   cycle_interval_seconds: 300  # 5 min for IEX
 
+broker:
+  provider: "ibkr"            # "alpaca" or "ibkr"
+  ibkr:
+    host: "127.0.0.1"           # TWS/Gateway host
+    port: 7497                   # 7497=TWS paper, 7496=TWS live, 4002=Gateway paper, 4001=Gateway live
+    client_id: 1                 # Use unique IDs for multiple bots
+    timeout: 30                  # Connection timeout seconds
+    readonly: false              # True = data-only mode (no orders)
+    account: ""                  # Empty = default account
+    max_reconnect_attempts: 5
+    reconnect_delay_seconds: 10
+
 risk:
   max_daily_loss_pct: 2.0
   max_drawdown_pct: 8.0

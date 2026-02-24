@@ -61,6 +61,7 @@ class Orchestrator:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._running = False
+        self._shutdown_requested = False
         self._log = logger.bind(component="orchestrator")
 
         # Set up logging
@@ -73,15 +74,34 @@ class Orchestrator:
         # Core components
         self._event_bus = EventBus()
         self._data_cache = DataCache()
+        self._ibkr_conn = None
 
-        # Data provider
-        self._data_provider = AlpacaDataProvider(
-            config=settings.alpaca,
-            feed=settings.data.feed,
-        )
+        broker_provider = settings.broker.provider.lower()
+        if broker_provider == "ibkr":
+            from algotrader.data.ibkr_provider import IBKRDataProvider
+            from algotrader.execution.ibkr_connection import IBKRConnection
+            from algotrader.execution.ibkr_executor import IBKRExecutor
 
-        # Executor
-        self._executor = AlpacaExecutor(config=settings.alpaca)
+            self._ibkr_conn = IBKRConnection.get_instance(
+                config=settings.broker.ibkr,
+                event_bus=self._event_bus,
+            )
+            if not self._ibkr_conn.connect():
+                raise RuntimeError("Failed to connect to IBKR TWS/Gateway")
+
+            self._data_provider = IBKRDataProvider(connection=self._ibkr_conn)
+            self._executor = IBKRExecutor(connection=self._ibkr_conn)
+            self._log.info("broker_initialized", provider="ibkr")
+        else:
+            # Data provider
+            self._data_provider = AlpacaDataProvider(
+                config=settings.alpaca,
+                feed=settings.data.feed,
+            )
+
+            # Executor
+            self._executor = AlpacaExecutor(config=settings.alpaca)
+            self._log.info("broker_initialized", provider="alpaca")
 
         # Order manager
         self._order_manager = OrderManager(
@@ -215,8 +235,20 @@ class Orchestrator:
 
     def _signal_handler(self, signum, frame):
         """Handle OS signals for graceful shutdown."""
+        if self._shutdown_requested:
+            self._log.info("shutdown_signal_received_again", signal=signum)
+            return
+
         self._log.info("shutdown_signal_received", signal=signum)
+        self._shutdown_requested = True
         self._running = False
+
+        # Interrupt active IB requests so warm-up/startup can unwind quickly.
+        if self._ibkr_conn is not None:
+            try:
+                self._ibkr_conn.disconnect()
+            except Exception:
+                self._log.exception("ibkr_disconnect_on_signal_failed")
 
     def initialize(self) -> None:
         """Initialize strategies from config and registry."""
@@ -227,6 +259,10 @@ class Orchestrator:
 
         # Create strategies from config
         for name in registry.names:
+            if self._shutdown_requested:
+                self._log.info("initialize_aborted_shutdown_requested")
+                break
+
             config = self._settings.strategies.get(name)
             if config is None:
                 config = load_strategy_config(name)
@@ -275,6 +311,10 @@ class Orchestrator:
         self._log.info("warming_up_strategies")
 
         for name, strategy in self._strategies.items():
+            if self._shutdown_requested:
+                self._log.info("warm_up_aborted_shutdown_requested")
+                break
+
             try:
                 # Try to restore saved state first
                 if strategy.restore_state():
@@ -289,10 +329,20 @@ class Orchestrator:
     def run(self) -> None:
         """Main run loop. Blocks until shutdown."""
         self.initialize()
+        if self._shutdown_requested:
+            self.shutdown()
+            return
+
         self.warm_up()
+        if self._shutdown_requested:
+            self.shutdown()
+            return
 
         # Pre-market intelligence
         self._run_pre_market_intelligence()
+        if self._shutdown_requested:
+            self.shutdown()
+            return
 
         self._running = True
         cycle_interval = self._settings.data.cycle_interval_seconds
@@ -302,8 +352,12 @@ class Orchestrator:
         account = self._executor.get_account()
         self._portfolio_tracker.reset_day(account.equity)
         self._risk_manager.reset_day(account.equity)
+        try:
+            self._write_dashboard_state()
+        except Exception:
+            self._log.debug("initial_dashboard_state_write_failed")
 
-        while self._running:
+        while self._running and not self._shutdown_requested:
             cycle_start = time.time()
 
             try:
@@ -326,8 +380,15 @@ class Orchestrator:
 
     def _run_cycle(self) -> None:
         """Execute one trading cycle."""
+        if self._shutdown_requested:
+            return
+
         # Check if market is open
         if not self._data_provider.is_market_open():
+            try:
+                self._write_dashboard_state()
+            except Exception:
+                self._log.debug("dashboard_state_write_failed")
             self._maybe_refresh_premarket()
             return
 
@@ -445,6 +506,9 @@ class Orchestrator:
 
     def _refresh_premarket_intelligence(self, now_et: datetime) -> None:
         """Refresh pre-market data: gaps, regime, news, and optionally volume."""
+        if self._shutdown_requested:
+            return
+
         self._log.info("premarket_refresh_starting", time_et=now_et.strftime("%H:%M"))
 
         # 1. Re-scan gaps (idempotent, cheap)
@@ -535,6 +599,9 @@ class Orchestrator:
         Detects regime, scans for gaps, checks event calendar, fetches news.
         Called once before the trading loop starts.
         """
+        if self._shutdown_requested:
+            return
+
         self._log.info("pre_market_intelligence_starting")
 
         # 1. Check event calendar
@@ -640,6 +707,12 @@ class Orchestrator:
 
     def shutdown(self) -> None:
         """Graceful shutdown: save state, log summary."""
+        if getattr(self, "_shutdown_completed", False):
+            return
+        self._shutdown_completed = True
+        self._running = False
+        self._shutdown_requested = True
+
         self._log.info("shutting_down")
 
         # Save strategy states
@@ -734,6 +807,12 @@ class Orchestrator:
             self._log.debug("final_dashboard_state_write_failed")
 
         # Clean up
+        if self._ibkr_conn is not None:
+            try:
+                self._ibkr_conn.disconnect()
+            except Exception:
+                self._log.exception("ibkr_disconnect_failed")
+
         self._trade_journal.close()
         self._event_bus.clear()
         self._log.info("shutdown_complete")

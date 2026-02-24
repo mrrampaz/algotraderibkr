@@ -72,6 +72,22 @@ class AlpacaConfig(BaseModel):
         )
 
 
+class IBKRConfig(BaseModel):
+    host: str = "127.0.0.1"
+    port: int = 7497
+    client_id: int = 1
+    timeout: int = 30
+    readonly: bool = False
+    account: str = ""
+    max_reconnect_attempts: int = 5
+    reconnect_delay_seconds: int = 10
+
+
+class BrokerConfig(BaseModel):
+    provider: str = "alpaca"  # "alpaca" or "ibkr"
+    ibkr: IBKRConfig = Field(default_factory=IBKRConfig)
+
+
 class StrategyConfig(BaseModel):
     """Base config for any strategy. Strategies extend this with their own fields."""
 
@@ -121,6 +137,7 @@ class Settings(BaseModel):
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     alpaca: AlpacaConfig = Field(default_factory=AlpacaConfig)
+    broker: BrokerConfig = Field(default_factory=BrokerConfig)
     strategies: dict[str, StrategyConfig] = Field(default_factory=dict)
     strategy_selector: StrategySelectorConfig = Field(default_factory=StrategySelectorConfig)
     alerts: AlertsConfig = Field(default_factory=AlertsConfig)
