@@ -558,6 +558,18 @@ class PairsTradingStrategy(StrategyBase):
 
     def assess_opportunities(self, regime: MarketRegime | None = None) -> OpportunityAssessment:
         """Assess pairs with cointegration and z-scores near entry."""
+        self._log.info("assess_start", strategy=self.name)
+        raw_scanned = len(self._pair_states)
+
+        def _complete(assessment: OpportunityAssessment) -> OpportunityAssessment:
+            self._log.info(
+                "assess_complete",
+                strategy=self.name,
+                num_candidates=len(assessment.candidates),
+                num_raw_scanned=raw_scanned,
+            )
+            return assessment
+
         try:
             from algotrader.strategy_selector.candidate import CandidateType, TradeCandidate
 
@@ -567,7 +579,7 @@ class PairsTradingStrategy(StrategyBase):
             ]
 
             if not cointegrated:
-                return OpportunityAssessment()
+                return _complete(OpportunityAssessment())
 
             # Count pairs near entry threshold
             near_entry = []
@@ -576,7 +588,7 @@ class PairsTradingStrategy(StrategyBase):
                     near_entry.append(s)
 
             if not near_entry:
-                return OpportunityAssessment(
+                return _complete(OpportunityAssessment(
                     num_candidates=0,
                     confidence=0.1,
                     details=[
@@ -584,7 +596,7 @@ class PairsTradingStrategy(StrategyBase):
                         for s in cointegrated[:5]
                     ],
                     candidates=[],
-                )
+                ))
 
             details: list[dict] = []
             trade_candidates: list[TradeCandidate] = []
@@ -701,7 +713,7 @@ class PairsTradingStrategy(StrategyBase):
                 )
 
             if not trade_candidates:
-                return OpportunityAssessment(
+                return _complete(OpportunityAssessment(
                     num_candidates=0,
                     avg_risk_reward=0.0,
                     confidence=0.0,
@@ -714,7 +726,7 @@ class PairsTradingStrategy(StrategyBase):
                         }
                     ],
                     candidates=[],
-                )
+                ))
 
             trade_candidates.sort(key=lambda c: c.expected_value, reverse=True)
             top_candidates = trade_candidates[:3]
@@ -722,7 +734,7 @@ class PairsTradingStrategy(StrategyBase):
             avg_conf = sum(c.confidence for c in trade_candidates) / len(trade_candidates)
             avg_edge = sum(c.edge_estimate_pct for c in trade_candidates) / len(trade_candidates)
 
-            return OpportunityAssessment(
+            return _complete(OpportunityAssessment(
                 num_candidates=len(trade_candidates),
                 avg_risk_reward=round(max(0.0, avg_rr), 2),
                 confidence=round(max(0.0, min(1.0, avg_conf)), 2),
@@ -730,10 +742,10 @@ class PairsTradingStrategy(StrategyBase):
                 estimated_edge_pct=round(max(0.0, avg_edge), 2),
                 details=details[:5],
                 candidates=top_candidates,
-            )
-        except Exception:
-            self._log.debug("assess_opportunities_failed")
-            return OpportunityAssessment()
+            ))
+        except Exception as exc:
+            self._log.error("assess_failed", strategy=self.name, error=str(exc), exc_info=True)
+            return _complete(OpportunityAssessment())
 
     def on_fill(self, order: Order) -> None:
         """Handle fill events for pairs legs."""

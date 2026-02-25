@@ -10,7 +10,7 @@ Output: RegimeType (trending_up, trending_down, ranging, high_vol, low_vol, even
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
@@ -20,6 +20,7 @@ import structlog
 from algotrader.core.events import EventBus, REGIME_CHANGED
 from algotrader.core.models import MarketRegime, RegimeType
 from algotrader.data.provider import DataProvider
+from algotrader.intelligence.calendar.events import EventCalendar
 
 logger = structlog.get_logger()
 
@@ -37,6 +38,12 @@ TREND_DOWN_THRESHOLD = -0.05   # < -5% = downtrend
 ATR_EXPANSION_RATIO = 1.5      # Today's range > 1.5x ATR = expanding vol
 ATR_CONTRACTION_RATIO = 0.5    # Today's range < 0.5x ATR = contracting vol
 
+# VIX data quality safeguards
+VIX_SANITY_MIN = 10.0
+VIX_SANITY_MAX = 80.0
+VIX_STALE_MINUTES = 30
+VIX_STALE_EPSILON = 1e-4
+
 
 class RegimeDetector:
     """Classify the current market regime.
@@ -51,16 +58,21 @@ class RegimeDetector:
         data_provider: DataProvider,
         event_bus: EventBus,
         spy_symbol: str = "SPY",
-        vix_symbol: str = "VIXY",  # VIX ETF proxy for IEX data
+        vix_symbol: str = "VIX",  # live VIX index when supported by provider
+        event_calendar: EventCalendar | None = None,
     ) -> None:
         self._data = data_provider
         self._event_bus = event_bus
         self._spy_symbol = spy_symbol
         self._vix_symbol = vix_symbol
+        self._event_calendar = event_calendar or EventCalendar()
         self._log = logger.bind(component="regime_detector")
 
         self._current_regime: MarketRegime | None = None
         self._event_days: set[str] = set()  # Dates marked as event days (YYYY-MM-DD)
+        self._last_vix_level: float | None = None
+        self._last_vix_fetch_at: datetime | None = None
+        self._last_vix_change_at: datetime | None = None
 
     @property
     def current_regime(self) -> MarketRegime | None:
@@ -76,22 +88,26 @@ class RegimeDetector:
         Called pre-market and periodically during the day.
         """
         now = datetime.now(pytz.UTC)
-        today_str = now.astimezone(pytz.timezone("America/New_York")).strftime("%Y-%m-%d")
-
-        # Check if today is a pre-marked event day
-        if today_str in self._event_days:
-            regime = MarketRegime(
-                regime_type=RegimeType.EVENT_DAY,
-                confidence=1.0,
-                timestamp=now,
-            )
-            self._update_regime(regime)
-            return regime
+        today_et = now.astimezone(pytz.timezone("America/New_York")).date()
+        today_str = today_et.strftime("%Y-%m-%d")
 
         # Gather data
         vix_level = self._get_vix_level()
         spy_trend = self._get_spy_trend()
         atr_ratio = self._get_atr_ratio()
+
+        is_event_day = today_str in self._event_days or self._event_calendar.is_event_day(today_et)
+        if is_event_day:
+            regime = MarketRegime(
+                regime_type=RegimeType.EVENT_DAY,
+                vix_level=vix_level,
+                spy_trend=spy_trend,
+                volatility_percentile=atr_ratio,
+                confidence=self._calculate_confidence(vix_level, spy_trend, atr_ratio, RegimeType.EVENT_DAY),
+                timestamp=now,
+            )
+            self._update_regime(regime)
+            return regime
 
         # Classify
         regime_type = self._classify(vix_level, spy_trend, atr_ratio)
@@ -171,25 +187,73 @@ class RegimeDetector:
         if regime_type == RegimeType.LOW_VOL and vix_level is not None:
             scores.append(min(1.0, (VIX_LOW - vix_level) / 5.0 + 0.5))
 
+        if regime_type == RegimeType.EVENT_DAY:
+            scores.append(0.9)
+            if vix_level is not None and vix_level >= VIX_NORMAL_HIGH:
+                scores.append(1.0)
+
         return round(np.mean(scores) if scores else 0.5, 2)
 
     def _get_vix_level(self) -> float | None:
-        """Estimate VIX-equivalent level from SPY realized volatility.
+        """Fetch VIX from live data source with staleness and sanity checks."""
+        now = datetime.now(pytz.UTC)
 
-        Calculate 20-day annualized realized vol of SPY and map to
-        approximate VIX-equivalent levels (realized vol typically runs
-        ~70-80% of implied vol / VIX).
-        """
+        # Primary path: IBKR index quote via optional provider method.
+        provider_get_index = getattr(self._data, "get_index_price", None)
+        if callable(provider_get_index):
+            try:
+                vix_live = provider_get_index("VIX", exchange="CBOE", wait_seconds=2.0)
+                if vix_live is not None:
+                    if self._is_vix_stale(vix_live, now):
+                        self._log.warning(
+                            "vix_quote_stale",
+                            vix=round(vix_live, 4),
+                            stale_minutes=self._stale_vix_minutes(now),
+                            last_change_at=(
+                                self._last_vix_change_at.isoformat()
+                                if self._last_vix_change_at else None
+                            ),
+                        )
+                        # Re-fetch once with a longer wait before accepting stale print.
+                        refreshed = provider_get_index("VIX", exchange="CBOE", wait_seconds=3.5)
+                        if refreshed is not None:
+                            vix_live = refreshed
+
+                    self._validate_vix(vix_live)
+                    self._record_vix(vix_live, now)
+                    self._log.debug("vix_live_quote", source="ibkr_index", vix=round(vix_live, 4))
+                    return vix_live
+            except Exception:
+                self._log.exception("vix_live_fetch_failed")
+
+        # Fallback path: provider snapshot for configured proxy symbol.
+        try:
+            snap = self._data.get_snapshot(self._vix_symbol)
+            if snap and snap.latest_trade_price and snap.latest_trade_price > 0:
+                proxy_vix = float(snap.latest_trade_price)
+                self._validate_vix(proxy_vix)
+                self._record_vix(proxy_vix, now)
+                self._log.warning(
+                    "vix_proxy_used",
+                    symbol=self._vix_symbol,
+                    vix=round(proxy_vix, 4),
+                )
+                return proxy_vix
+        except Exception:
+            self._log.exception("vix_proxy_snapshot_failed")
+
+        # Last-resort fallback: realized-vol estimate from SPY.
         try:
             bars = self._data.get_bars(self._spy_symbol, "1Day", 25)
             if bars.empty or len(bars) < 10:
                 return None
             returns = bars["close"].pct_change().dropna()
-            realized_vol = float(returns.std() * np.sqrt(252) * 100)  # annualized %
-            # Map realized vol to VIX-equivalent
+            realized_vol = float(returns.std() * np.sqrt(252) * 100)
             vix_estimate = realized_vol / 0.75
+            self._validate_vix(vix_estimate)
+            self._record_vix(vix_estimate, now)
             self._log.debug(
-                "vix_proxy_estimated",
+                "vix_proxy_estimated_from_spy",
                 realized_vol=round(realized_vol, 2),
                 vix_estimate=round(vix_estimate, 2),
             )
@@ -197,6 +261,33 @@ class RegimeDetector:
         except Exception:
             self._log.exception("vix_proxy_failed")
         return None
+
+    def _record_vix(self, vix_level: float, now: datetime) -> None:
+        if self._last_vix_level is None or abs(vix_level - self._last_vix_level) > VIX_STALE_EPSILON:
+            self._last_vix_change_at = now
+        self._last_vix_level = vix_level
+        self._last_vix_fetch_at = now
+
+    def _is_vix_stale(self, vix_level: float, now: datetime) -> bool:
+        if self._last_vix_level is None or self._last_vix_change_at is None:
+            return False
+        unchanged = abs(vix_level - self._last_vix_level) <= VIX_STALE_EPSILON
+        if not unchanged:
+            return False
+        return (now - self._last_vix_change_at) >= timedelta(minutes=VIX_STALE_MINUTES)
+
+    def _stale_vix_minutes(self, now: datetime) -> float:
+        if self._last_vix_change_at is None:
+            return 0.0
+        return round((now - self._last_vix_change_at).total_seconds() / 60.0, 1)
+
+    def _validate_vix(self, vix_level: float) -> None:
+        if vix_level < VIX_SANITY_MIN or vix_level > VIX_SANITY_MAX:
+            self._log.warning(
+                "vix_sanity_warning",
+                vix=round(vix_level, 4),
+                expected_range=f"{VIX_SANITY_MIN}-{VIX_SANITY_MAX}",
+            )
 
     def _get_spy_trend(self) -> float | None:
         """Calculate SPY SMA20 slope as annualized rate of change.

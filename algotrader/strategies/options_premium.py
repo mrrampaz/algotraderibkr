@@ -101,6 +101,10 @@ class OptionsPremiumStrategy(StrategyBase):
         # Filters
         self._min_vix_proxy = params.get("min_vix_proxy", 15.0)
         self._use_sma5_filter = params.get("use_sma5_filter", True)
+        self._credit_estimate_pct = params.get("credit_estimate_pct", 0.30)
+        self._win_rate_credit_spread = params.get("win_rate_credit_spread", 0.70)
+        self._win_rate_iron_condor = params.get("win_rate_iron_condor", 0.72)
+        self._event_day_confidence_penalty = params.get("event_day_confidence_penalty", 0.25)
 
         # Exit
         self._profit_target_pct = params.get("profit_target_pct", 50.0)
@@ -255,8 +259,8 @@ class OptionsPremiumStrategy(StrategyBase):
 
             # Calculate contracts and risk
             spread_width = self._wing_width * 100  # Per contract in dollars
-            estimated_credit = spread_width * 0.25  # ~25% of width as premium
-            max_loss_per_contract = spread_width - estimated_credit
+            estimated_credit = spread_width * self._credit_estimate_pct
+            max_loss_per_contract = max(1.0, spread_width - estimated_credit)
             contracts = min(
                 self._max_contracts,
                 int(self._max_risk_per_trade / max_loss_per_contract) if max_loss_per_contract > 0 else 1,
@@ -664,8 +668,27 @@ class OptionsPremiumStrategy(StrategyBase):
             pass
         return None
 
+    def _structure_win_rate(self, structure: str) -> float:
+        if structure == "iron_condor":
+            return float(self._win_rate_iron_condor)
+        return float(self._win_rate_credit_spread)
+
+    def _adjusted_rr(self, win_rate: float, credit: float, max_loss: float) -> float:
+        if max_loss <= 0 or credit <= 0:
+            return 0.0
+        loss_rate = max(1e-6, 1.0 - win_rate)
+        return (win_rate * credit) / (loss_rate * max_loss)
+
+    def _edge_pct(self, win_rate: float, credit: float, max_loss: float) -> float:
+        if max_loss <= 0:
+            return 0.0
+        expected_pnl = win_rate * credit - (1.0 - win_rate) * max_loss
+        return (expected_pnl / max_loss) * 100.0
+
     def assess_opportunities(self, regime: MarketRegime | None = None) -> OpportunityAssessment:
         """Assess options premium selling conditions."""
+        self._log.info("assess_start", strategy=self.name)
+        raw_scanned = 0
         try:
             from algotrader.intelligence.calendar.events import EventCalendar
             from algotrader.strategy_selector.candidate import CandidateType, TradeCandidate
@@ -673,8 +696,20 @@ class OptionsPremiumStrategy(StrategyBase):
             # Regime gate
             if regime:
                 if regime.regime_type.value in self._blocked_regimes:
+                    self._log.info(
+                        "assess_complete",
+                        strategy=self.name,
+                        num_candidates=0,
+                        num_raw_scanned=raw_scanned,
+                    )
                     return OpportunityAssessment()
                 if regime.regime_type.value not in self._allowed_regimes:
+                    self._log.info(
+                        "assess_complete",
+                        strategy=self.name,
+                        num_candidates=0,
+                        num_raw_scanned=raw_scanned,
+                    )
                     return OpportunityAssessment()
 
             et_now = datetime.now(ET)
@@ -685,6 +720,12 @@ class OptionsPremiumStrategy(StrategyBase):
                 microsecond=0,
             )
             if et_now > window_end:
+                self._log.info(
+                    "assess_complete",
+                    strategy=self.name,
+                    num_candidates=0,
+                    num_raw_scanned=raw_scanned,
+                )
                 return OpportunityAssessment(
                     num_candidates=0,
                     confidence=0.0,
@@ -696,6 +737,12 @@ class OptionsPremiumStrategy(StrategyBase):
             # VIX proxy check
             vix_level = regime.vix_level if regime and regime.vix_level else None
             if vix_level is not None and vix_level < self._min_vix_proxy:
+                self._log.info(
+                    "assess_complete",
+                    strategy=self.name,
+                    num_candidates=0,
+                    num_raw_scanned=raw_scanned,
+                )
                 return OpportunityAssessment(
                     num_candidates=0,
                     confidence=0.0,
@@ -705,10 +752,18 @@ class OptionsPremiumStrategy(StrategyBase):
 
             # Count available underlyings not already traded
             available = [u for u in self._underlyings if u not in self._trades]
+            raw_scanned = len(available)
             if not available:
+                self._log.info(
+                    "assess_complete",
+                    strategy=self.name,
+                    num_candidates=0,
+                    num_raw_scanned=raw_scanned,
+                )
                 return OpportunityAssessment()
 
             event_calendar = EventCalendar()
+            is_event_day = event_calendar.is_event_day()
             details: list[dict] = []
             candidate_rows: list[TradeCandidate] = []
 
@@ -750,7 +805,7 @@ class OptionsPremiumStrategy(StrategyBase):
                         candidate_type = CandidateType.IRON_CONDOR
 
                     spread_width = max(1.0, self._wing_width * 100.0)
-                    credit_single = spread_width * 0.25
+                    credit_single = spread_width * self._credit_estimate_pct
                     if structure == "iron_condor":
                         credit_per_contract = credit_single * 2.0
                         max_loss_per_contract = spread_width
@@ -802,14 +857,24 @@ class OptionsPremiumStrategy(StrategyBase):
                         else:
                             regime_fit = 0.4
 
-                    if not event_calendar.has_earnings(underlying):
+                    if is_event_day:
+                        confidence -= self._event_day_confidence_penalty
+                    elif not event_calendar.has_earnings(underlying):
                         confidence += 0.10
 
                     confidence = min(1.0, max(0.0, confidence))
 
-                    win_rate = 0.70 if structure == "iron_condor" else 0.62
-                    expected_pnl = win_rate * total_credit - (1.0 - win_rate) * total_max_loss
-                    edge_pct = max(0.0, (expected_pnl / total_max_loss * 100.0) if total_max_loss > 0 else 0.0)
+                    win_rate = self._structure_win_rate(structure)
+                    edge_pct = self._edge_pct(
+                        win_rate=win_rate,
+                        credit=total_credit,
+                        max_loss=total_max_loss,
+                    )
+                    adjusted_rr = self._adjusted_rr(
+                        win_rate=win_rate,
+                        credit=total_credit,
+                        max_loss=total_max_loss,
+                    )
 
                     candidate_rows.append(TradeCandidate(
                         strategy_name=self.name,
@@ -821,7 +886,7 @@ class OptionsPremiumStrategy(StrategyBase):
                         target_price=round(current_price, 2),
                         risk_dollars=round(total_max_loss, 2),
                         suggested_qty=contracts,
-                        risk_reward_ratio=round(rr_ratio, 2),
+                        risk_reward_ratio=round(adjusted_rr, 2),
                         confidence=round(confidence, 2),
                         edge_estimate_pct=round(edge_pct, 2),
                         regime_fit=round(regime_fit, 2),
@@ -839,6 +904,10 @@ class OptionsPremiumStrategy(StrategyBase):
                             "atr": round(atr, 2),
                             "call_short_strike": call_short,
                             "call_long_strike": call_long,
+                            "win_rate": round(win_rate, 4),
+                            "raw_rr": round(rr_ratio, 4),
+                            "adjusted_rr": round(adjusted_rr, 4),
+                            "event_day": is_event_day,
                         },
                     ))
                     details.append({
@@ -849,11 +918,25 @@ class OptionsPremiumStrategy(StrategyBase):
                         "contracts": contracts,
                         "credit": round(total_credit, 2),
                         "max_loss": round(total_max_loss, 2),
+                        "edge_pct": round(edge_pct, 2),
+                        "adjusted_rr": round(adjusted_rr, 2),
                     })
-                except Exception:
+                except Exception as exc:
+                    self._log.debug(
+                        "assess_candidate_build_failed",
+                        strategy=self.name,
+                        symbol=underlying,
+                        error=str(exc),
+                    )
                     continue
 
             if not candidate_rows:
+                self._log.info(
+                    "assess_complete",
+                    strategy=self.name,
+                    num_candidates=0,
+                    num_raw_scanned=raw_scanned,
+                )
                 return OpportunityAssessment()
 
             candidate_rows.sort(key=lambda c: c.expected_value, reverse=True)
@@ -862,17 +945,23 @@ class OptionsPremiumStrategy(StrategyBase):
             avg_conf = sum(c.confidence for c in candidate_rows) / len(candidate_rows)
             avg_edge = sum(c.edge_estimate_pct for c in candidate_rows) / len(candidate_rows)
 
+            self._log.info(
+                "assess_complete",
+                strategy=self.name,
+                num_candidates=len(candidate_rows),
+                num_raw_scanned=raw_scanned,
+            )
             return OpportunityAssessment(
                 num_candidates=len(candidate_rows),
-                avg_risk_reward=round(max(0.0, avg_rr), 2),
+                avg_risk_reward=round(avg_rr, 2),
                 confidence=round(max(0.0, min(1.0, avg_conf)), 2),
                 estimated_daily_trades=min(len(candidate_rows), self.config.max_positions),
-                estimated_edge_pct=round(max(0.0, avg_edge), 2),
+                estimated_edge_pct=round(avg_edge, 2),
                 details=details[:5],
                 candidates=top_candidates,
             )
-        except Exception:
-            self._log.debug("assess_opportunities_failed")
+        except Exception as exc:
+            self._log.error("assess_failed", strategy=self.name, error=str(exc), exc_info=True)
             return OpportunityAssessment()
 
     def _get_state(self) -> dict[str, Any]:

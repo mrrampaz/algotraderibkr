@@ -9,7 +9,7 @@ from datetime import date, datetime, timedelta
 import pandas as pd
 import pytz
 import structlog
-from ib_async import Option, Stock
+from ib_async import Index, Option, Stock
 
 from algotrader.core.models import Bar, MarketClock, NewsItem, Quote, Snapshot
 from algotrader.execution.ibkr_connection import IBKRConnection
@@ -51,6 +51,7 @@ class IBKRDataProvider:
     def __init__(self, connection: IBKRConnection) -> None:
         self._connection = connection
         self._stock_contract_cache: dict[str, object] = {}
+        self._index_contract_cache: dict[str, object] = {}
         self._log = logger.bind(component="ibkr_data")
         self._log.info("ibkr_data_provider_initialized")
 
@@ -176,6 +177,87 @@ class IBKRDataProvider:
 
         self._stock_contract_cache[symbol] = contract
         return contract
+
+    def _qualify_index_contract(self, symbol: str, exchange: str = "CBOE"):
+        symbol = symbol.upper()
+        exchange = exchange.upper()
+        cache_key = f"{symbol}:{exchange}"
+
+        cached = self._index_contract_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        def _qualify(ib):
+            contract = Index(symbol, exchange)
+            qualified = ib.qualifyContracts(contract)
+            return qualified[0] if qualified else None
+
+        contract = self._connection.execute(_qualify)
+        if contract is None:
+            self._log.warning(
+                "ibkr_index_contract_qualification_failed",
+                symbol=symbol,
+                exchange=exchange,
+            )
+            return None
+
+        self._index_contract_cache[cache_key] = contract
+        return contract
+
+    def get_index_price(
+        self,
+        symbol: str,
+        exchange: str = "CBOE",
+        wait_seconds: float = 2.0,
+    ) -> float | None:
+        """Fetch a live index quote (e.g., VIX on CBOE)."""
+        contract = self._qualify_index_contract(symbol=symbol, exchange=exchange)
+        if contract is None:
+            return None
+
+        try:
+            def _fetch(ib):
+                ticker = ib.reqMktData(
+                    contract=contract,
+                    genericTickList="",
+                    snapshot=False,
+                    regulatorySnapshot=False,
+                )
+
+                deadline = time.time() + max(0.5, wait_seconds)
+                best_price: float | None = None
+                while time.time() < deadline:
+                    ib.sleep(0.2)
+                    market_price = self._safe_optional_float(ticker.marketPrice())
+                    last_price = self._safe_optional_float(getattr(ticker, "last", None))
+                    close_price = self._safe_optional_float(getattr(ticker, "close", None))
+
+                    for value in (market_price, last_price, close_price):
+                        if value is not None and value > 0:
+                            best_price = value
+                            break
+                    if best_price is not None:
+                        break
+
+                try:
+                    ib.cancelMktData(contract)
+                except Exception:
+                    self._log.debug(
+                        "ibkr_cancel_index_mkt_data_failed",
+                        symbol=symbol.upper(),
+                        exchange=exchange.upper(),
+                    )
+
+                return best_price
+
+            return self._connection.execute(_fetch)
+        except Exception:
+            self._log.exception(
+                "ibkr_get_index_price_failed",
+                symbol=symbol.upper(),
+                exchange=exchange.upper(),
+            )
+            return None
 
     def _build_quote_from_ticker(self, symbol: str, ticker, now_utc: datetime) -> Quote | None:
         bid = self._safe_float(getattr(ticker, "bid", None))

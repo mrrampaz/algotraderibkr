@@ -381,21 +381,33 @@ class VWAPReversionStrategy(StrategyBase):
 
     def assess_opportunities(self, regime: MarketRegime | None = None) -> OpportunityAssessment:
         """Assess VWAP deviation opportunities across universe."""
+        self._log.info("assess_start", strategy=self.name)
+        raw_scanned = len(self._universe)
+
+        def _complete(assessment: OpportunityAssessment) -> OpportunityAssessment:
+            self._log.info(
+                "assess_complete",
+                strategy=self.name,
+                num_candidates=len(assessment.candidates),
+                num_raw_scanned=raw_scanned,
+            )
+            return assessment
+
         try:
             from algotrader.strategy_selector.candidate import CandidateType, TradeCandidate
 
             # Regime gate - only active in ranging/low_vol
             if regime and regime.regime_type.value not in self._allowed_regimes:
-                return OpportunityAssessment()
+                return _complete(OpportunityAssessment())
 
             et_now = datetime.now(ET)
             if et_now.hour >= 15:
-                return OpportunityAssessment(
+                return _complete(OpportunityAssessment(
                     num_candidates=0,
                     confidence=0.0,
                     details=[{"reason": "entry_window_closed_after_1500"}],
                     candidates=[],
-                )
+                ))
 
             candidates: list[dict] = []
             trade_candidates: list[TradeCandidate] = []
@@ -512,7 +524,7 @@ class VWAPReversionStrategy(StrategyBase):
                     continue
 
             if not trade_candidates:
-                return OpportunityAssessment()
+                return _complete(OpportunityAssessment())
 
             trade_candidates.sort(key=lambda c: c.expected_value, reverse=True)
             top_candidates = trade_candidates[:3]
@@ -520,7 +532,7 @@ class VWAPReversionStrategy(StrategyBase):
             avg_conf = sum(c.confidence for c in trade_candidates) / len(trade_candidates)
             avg_edge = sum(c.edge_estimate_pct for c in trade_candidates) / len(trade_candidates)
 
-            return OpportunityAssessment(
+            return _complete(OpportunityAssessment(
                 num_candidates=len(trade_candidates),
                 avg_risk_reward=round(max(0.0, avg_rr), 2),
                 confidence=round(max(0.0, min(1.0, avg_conf)), 2),
@@ -528,10 +540,10 @@ class VWAPReversionStrategy(StrategyBase):
                 estimated_edge_pct=round(max(0.0, avg_edge), 2),
                 details=candidates[:5],
                 candidates=top_candidates,
-            )
-        except Exception:
-            self._log.debug("assess_opportunities_failed")
-            return OpportunityAssessment()
+            ))
+        except Exception as exc:
+            self._log.error("assess_failed", strategy=self.name, error=str(exc), exc_info=True)
+            return _complete(OpportunityAssessment())
 
     def _get_state(self) -> dict[str, Any]:
         """Serialize state for persistence."""

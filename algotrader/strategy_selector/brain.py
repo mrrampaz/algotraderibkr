@@ -426,7 +426,8 @@ class DailyBrain:
     ) -> str | None:
         if candidate.confidence < min_confidence:
             return "low_confidence"
-        if candidate.risk_reward_ratio < self._min_risk_reward:
+        effective_rr = self._effective_rr(candidate)
+        if effective_rr < self._required_rr(candidate):
             return "poor_rr"
         if candidate.edge_estimate_pct < self._min_edge_pct:
             return "insufficient_edge"
@@ -451,15 +452,21 @@ class DailyBrain:
             candidate.strategy_name,
             regime,
         )
+        effective_rr = self._effective_rr(candidate)
+        rr_divisor = 2.0 if candidate.is_options else 4.0
+        rr_component = min(effective_rr / rr_divisor, 1.0) * 0.25
         base_score = (
             effective_confidence * 0.35
-            + min(candidate.risk_reward_ratio / 4.0, 1.0) * 0.25
+            + rr_component
             + min(candidate.edge_estimate_pct / 2.0, 1.0) * 0.25
             + candidate.regime_fit * 0.15
         )
 
         if candidate.regime_fit < 0.35:
             base_score *= self._regime_mismatch_penalty
+
+        if regime.regime_type == RegimeType.EVENT_DAY and candidate.strategy_name == "options_premium":
+            base_score *= 0.7
 
         corr = self._compute_correlation(candidate, current_positions)
         if corr > 0:
@@ -479,6 +486,33 @@ class DailyBrain:
             base_score *= dd_penalty
 
         return round(max(0.0, min(1.0, base_score)), 4)
+
+    def _required_rr(self, candidate: TradeCandidate) -> float:
+        if candidate.is_options:
+            return max(0.5, self._min_risk_reward * 0.35)
+        return self._min_risk_reward
+
+    def _effective_rr(self, candidate: TradeCandidate) -> float:
+        rr = max(0.0, candidate.risk_reward_ratio)
+        if not candidate.is_options:
+            return rr
+
+        max_loss = candidate.max_loss
+        credit = candidate.credit_received
+        if max_loss <= 0 or credit <= 0:
+            return rr
+
+        raw_win_rate = candidate.metadata.get("win_rate") if candidate.metadata else None
+        if isinstance(raw_win_rate, (int, float)):
+            win_rate = float(raw_win_rate)
+        else:
+            # Fallback to confidence if strategy doesn't pass explicit win rate.
+            win_rate = min(0.9, max(0.5, candidate.confidence))
+
+        win_rate = min(0.99, max(0.01, win_rate))
+        loss_rate = max(1e-6, 1.0 - win_rate)
+        adjusted_rr = (win_rate * credit) / (loss_rate * max_loss)
+        return max(0.0, adjusted_rr)
 
     def _allocation_for_candidate(self, candidate: TradeCandidate) -> tuple[float, int, float]:
         max_trade_capital = self._total_capital * (self._max_capital_per_trade_pct / 100.0)

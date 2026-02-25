@@ -413,18 +413,30 @@ class SectorRotationStrategy(StrategyBase):
 
     def assess_opportunities(self, regime: MarketRegime | None = None) -> OpportunityAssessment:
         """Assess sector rotation opportunities via relative strength."""
+        self._log.info("assess_start", strategy=self.name)
+        raw_scanned = len(self._sectors)
+
+        def _complete(assessment: OpportunityAssessment) -> OpportunityAssessment:
+            self._log.info(
+                "assess_complete",
+                strategy=self.name,
+                num_candidates=len(assessment.candidates),
+                num_raw_scanned=raw_scanned,
+            )
+            return assessment
+
         try:
             from algotrader.strategy_selector.candidate import CandidateType, TradeCandidate
 
             # Regime gate
             if regime and regime.regime_type.value not in self._allowed_regimes:
-                return OpportunityAssessment()
+                return _complete(OpportunityAssessment())
 
             # Calculate RS scores
             self._calculate_all_rs()
 
             if not self._rs_scores:
-                return OpportunityAssessment()
+                return _complete(OpportunityAssessment())
 
             sorted_rs = sorted(self._rs_scores.items(), key=lambda x: x[1], reverse=True)
 
@@ -432,11 +444,11 @@ class SectorRotationStrategy(StrategyBase):
             if len(sorted_rs) >= 2:
                 divergence = sorted_rs[0][1] - sorted_rs[-1][1]
                 if divergence < self._min_divergence_pct:
-                    return OpportunityAssessment(
+                    return _complete(OpportunityAssessment(
                         num_candidates=0,
                         confidence=0.0,
                         details=[{"divergence": round(divergence, 2), "min": self._min_divergence_pct}],
-                    )
+                    ))
 
             # Count sectors above long / below short thresholds
             longs = [s for s, rs in sorted_rs if rs >= self._rs_long_threshold and s not in self._trades]
@@ -444,16 +456,16 @@ class SectorRotationStrategy(StrategyBase):
             candidates = longs + shorts
 
             if not candidates:
-                return OpportunityAssessment()
+                return _complete(OpportunityAssessment())
 
             divergence = sorted_rs[0][1] - sorted_rs[-1][1] if len(sorted_rs) >= 2 else 0.0
             if not longs or not shorts:
-                return OpportunityAssessment(
+                return _complete(OpportunityAssessment(
                     num_candidates=0,
                     confidence=0.0,
                     details=[{"reason": "need_both_long_and_short_legs", "divergence": round(divergence, 2)}],
                     candidates=[],
-                )
+                ))
 
             long_symbol = longs[0]
             short_symbol = shorts[0]
@@ -463,7 +475,7 @@ class SectorRotationStrategy(StrategyBase):
             short_price = self._get_current_price(short_symbol)
 
             if not long_price or long_price <= 0:
-                return OpportunityAssessment()
+                return _complete(OpportunityAssessment())
 
             stop_price = long_price * (1 - self._stop_pct / 100)
             target_price = long_price + (long_price * self._stop_pct / 100 * 1.5)
@@ -541,7 +553,7 @@ class SectorRotationStrategy(StrategyBase):
                 },
             )
 
-            return OpportunityAssessment(
+            return _complete(OpportunityAssessment(
                 num_candidates=1,
                 avg_risk_reward=round(max(0.0, rr_ratio), 2),
                 confidence=round(max(0.0, confidence), 2),
@@ -562,10 +574,10 @@ class SectorRotationStrategy(StrategyBase):
                     }
                 ],
                 candidates=[trade_candidate],
-            )
-        except Exception:
-            self._log.debug("assess_opportunities_failed")
-            return OpportunityAssessment()
+            ))
+        except Exception as exc:
+            self._log.error("assess_failed", strategy=self.name, error=str(exc), exc_info=True)
+            return _complete(OpportunityAssessment())
 
     def _get_state(self) -> dict[str, Any]:
         """Serialize state for persistence."""

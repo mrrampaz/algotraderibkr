@@ -140,14 +140,15 @@ class Orchestrator:
         self._trade_journal = TradeJournal()
 
         # Intelligence layer
+        self._event_calendar = EventCalendar()
         self._regime_detector = RegimeDetector(
             data_provider=self._data_provider,
             event_bus=self._event_bus,
+            event_calendar=self._event_calendar,
         )
         self._gap_scanner = GapScanner(data_provider=self._data_provider)
         self._volume_scanner = VolumeScanner(data_provider=self._data_provider)
         self._news_client = AlpacaNewsClient(data_provider=self._data_provider)
-        self._event_calendar = EventCalendar()
         self._current_regime: MarketRegime | None = None
 
         # Strategy selector: Daily Brain (new) or classic scorer/allocator path.
@@ -1133,7 +1134,16 @@ class Orchestrator:
             try:
                 assessments[name] = strategy.assess_opportunities(regime)
             except Exception:
-                self._log.debug("assess_opportunities_failed", strategy=name)
+                self._log.error("assess_opportunities_failed", strategy=name, exc_info=True)
+                assessments[name] = OpportunityAssessment()
+
+        for name, assessment in assessments.items():
+            self._log.info(
+                "strategy_assessment",
+                strategy=name,
+                num_candidates=len(assessment.candidates),
+                has_opportunities=assessment.has_opportunities,
+            )
 
         # Log summary
         with_opps = {n: a for n, a in assessments.items() if a.has_opportunities}

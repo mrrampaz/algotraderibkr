@@ -46,6 +46,19 @@ EVENT_IMPACT: dict[EventType, int] = {
     EventType.QUAD_WITCHING: 3,
 }
 
+# Minimal high-impact seed list until a dynamic earnings feed is wired in.
+KNOWN_EVENTS: tuple[dict, ...] = (
+    {
+        "event_type": EventType.EARNINGS,
+        "date": date(2026, 2, 25),
+        "time": "16:05",
+        "description": "NVDA earnings (after close)",
+        "impact": 3,
+        "symbol": "NVDA",
+        "metadata": {"timing": "after_close", "scope": "market_moving"},
+    },
+)
+
 
 @dataclass
 class CalendarEvent:
@@ -81,6 +94,8 @@ class EventCalendar:
         self._seed_fomc_dates()
         # Seed monthly options expiry (3rd Friday)
         self._seed_opex_dates()
+        # Seed known high-impact events not covered by static macro schedules.
+        self._seed_known_events()
 
     def add_event(self, event: CalendarEvent) -> None:
         """Add an event to the calendar."""
@@ -218,3 +233,18 @@ class EventCalendar:
             lines.append(f"  {e.date} {time_str} [{impact_label}] {e.description}{symbol_str}")
 
         return "\n".join(lines)
+
+    def _seed_known_events(self) -> None:
+        """Seed manually curated events used as fallback when APIs are unavailable."""
+        for raw in KNOWN_EVENTS:
+            self._events.append(
+                CalendarEvent(
+                    event_type=raw["event_type"],
+                    date=raw["date"],
+                    time=raw.get("time", ""),
+                    description=raw.get("description", ""),
+                    impact=int(raw.get("impact", EVENT_IMPACT.get(raw["event_type"], 2))),
+                    symbol=raw.get("symbol", ""),
+                    metadata=dict(raw.get("metadata", {})),
+                )
+            )

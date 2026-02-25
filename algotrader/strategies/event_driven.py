@@ -473,14 +473,27 @@ class EventDrivenStrategy(StrategyBase):
 
     def assess_opportunities(self, regime: MarketRegime | None = None) -> OpportunityAssessment:
         """Assess event-driven opportunities from today's calendar."""
+        self._log.info("assess_start", strategy=self.name)
+        raw_scanned = len(self._today_events)
+
+        def _complete(assessment: OpportunityAssessment) -> OpportunityAssessment:
+            self._log.info(
+                "assess_complete",
+                strategy=self.name,
+                num_candidates=len(assessment.candidates),
+                num_raw_scanned=raw_scanned,
+            )
+            return assessment
+
         try:
             from algotrader.strategy_selector.candidate import CandidateType, TradeCandidate
 
             if not self._events_checked_today:
                 self._check_today_events()
+                raw_scanned = len(self._today_events)
 
             if not self._today_events:
-                return OpportunityAssessment()
+                return _complete(OpportunityAssessment())
 
             # Count actionable events (not already traded)
             actionable = []
@@ -495,7 +508,7 @@ class EventDrivenStrategy(StrategyBase):
                     actionable.append(event)
 
             if not actionable:
-                return OpportunityAssessment()
+                return _complete(OpportunityAssessment())
 
             et_now = datetime.now(ET)
             trade_candidates: list[TradeCandidate] = []
@@ -623,7 +636,7 @@ class EventDrivenStrategy(StrategyBase):
                     )
 
             if not trade_candidates:
-                return OpportunityAssessment()
+                return _complete(OpportunityAssessment())
 
             trade_candidates.sort(key=lambda c: c.expected_value, reverse=True)
             top_candidates = trade_candidates[:3]
@@ -631,7 +644,7 @@ class EventDrivenStrategy(StrategyBase):
             avg_conf = sum(c.confidence for c in trade_candidates) / len(trade_candidates)
             avg_edge = sum(c.edge_estimate_pct for c in trade_candidates) / len(trade_candidates)
 
-            return OpportunityAssessment(
+            return _complete(OpportunityAssessment(
                 num_candidates=len(trade_candidates),
                 avg_risk_reward=round(max(0.0, avg_rr), 2),
                 confidence=round(max(0.0, min(1.0, avg_conf)), 2),
@@ -642,10 +655,10 @@ class EventDrivenStrategy(StrategyBase):
                 estimated_edge_pct=round(max(0.0, avg_edge), 2),
                 details=details[:5],
                 candidates=top_candidates,
-            )
-        except Exception:
-            self._log.debug("assess_opportunities_failed")
-            return OpportunityAssessment()
+            ))
+        except Exception as exc:
+            self._log.error("assess_failed", strategy=self.name, error=str(exc), exc_info=True)
+            return _complete(OpportunityAssessment())
 
     def _get_state(self) -> dict[str, Any]:
         """Serialize state for persistence."""

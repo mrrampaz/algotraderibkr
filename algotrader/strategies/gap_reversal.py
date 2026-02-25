@@ -574,15 +574,27 @@ class GapReversalStrategy(StrategyBase):
 
     def assess_opportunities(self, regime: MarketRegime | None = None) -> OpportunityAssessment:
         """Assess gap trading opportunities from scanner candidates."""
+        self._log.info("assess_start", strategy=self.name)
+        raw_scanned = len(self._gap_candidates)
+
+        def _complete(assessment: OpportunityAssessment) -> OpportunityAssessment:
+            self._log.info(
+                "assess_complete",
+                strategy=self.name,
+                num_candidates=len(assessment.candidates),
+                num_raw_scanned=raw_scanned,
+            )
+            return assessment
+
         try:
             from algotrader.strategy_selector.candidate import CandidateType, TradeCandidate
 
             # Regime gate
             if regime and regime.regime_type.value not in self._allowed_regimes:
-                return OpportunityAssessment()
+                return _complete(OpportunityAssessment())
 
             if not self._gap_candidates:
-                return OpportunityAssessment()
+                return _complete(OpportunityAssessment())
 
             et_now = datetime.now(ET)
             expiry_time = et_now.replace(hour=11, minute=0, second=0, microsecond=0).astimezone(pytz.UTC)
@@ -727,15 +739,15 @@ class GapReversalStrategy(StrategyBase):
                 qualified.append(c)
 
             if not qualified:
-                return OpportunityAssessment()
+                return _complete(OpportunityAssessment())
 
             if not trade_candidates:
-                return OpportunityAssessment(
+                return _complete(OpportunityAssessment(
                     num_candidates=0,
                     confidence=0.0,
                     details=[{"reason": "qualified_but_no_tradecandidate"}],
                     candidates=[],
-                )
+                ))
 
             trade_candidates.sort(key=lambda c: c.expected_value, reverse=True)
             top_candidates = trade_candidates[:3]
@@ -743,7 +755,7 @@ class GapReversalStrategy(StrategyBase):
             avg_conf = sum(c.confidence for c in trade_candidates) / len(trade_candidates)
             avg_edge = sum(c.edge_estimate_pct for c in trade_candidates) / len(trade_candidates)
 
-            return OpportunityAssessment(
+            return _complete(OpportunityAssessment(
                 num_candidates=len(trade_candidates),
                 avg_risk_reward=round(max(0.0, avg_rr), 2),
                 confidence=round(max(0.0, min(1.0, avg_conf)), 2),
@@ -751,10 +763,10 @@ class GapReversalStrategy(StrategyBase):
                 estimated_edge_pct=round(max(0.0, avg_edge), 2),
                 details=details[:5],
                 candidates=top_candidates,
-            )
-        except Exception:
-            self._log.debug("assess_opportunities_failed")
-            return OpportunityAssessment()
+            ))
+        except Exception as exc:
+            self._log.error("assess_failed", strategy=self.name, error=str(exc), exc_info=True)
+            return _complete(OpportunityAssessment())
 
     def _get_state(self) -> dict[str, Any]:
         """Serialize state for persistence."""

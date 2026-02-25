@@ -425,15 +425,27 @@ class MomentumStrategy(StrategyBase):
 
     def assess_opportunities(self, regime: MarketRegime | None = None) -> OpportunityAssessment:
         """Assess breakout opportunities and emit concrete TradeCandidates."""
+        self._log.info("assess_start", strategy=self.name)
+        raw_scanned = 0
+
+        def _complete(assessment: OpportunityAssessment) -> OpportunityAssessment:
+            self._log.info(
+                "assess_complete",
+                strategy=self.name,
+                num_candidates=len(assessment.candidates),
+                num_raw_scanned=raw_scanned,
+            )
+            return assessment
+
         try:
             # Regime gate
             if regime and regime.regime_type.value not in self._allowed_regimes:
-                return OpportunityAssessment()
+                return _complete(OpportunityAssessment())
 
             et_now = datetime.now(ET)
             if et_now.hour >= 15:
                 # Momentum setups are not actionable for fresh entries after 3 PM ET.
-                return OpportunityAssessment()
+                return _complete(OpportunityAssessment())
 
             from algotrader.intelligence.scanners.breakout_scanner import BreakoutScanner
             scanner = BreakoutScanner(
@@ -442,6 +454,7 @@ class MomentumStrategy(StrategyBase):
                 min_consolidation_days=self._min_consolidation_days,
             )
             breakouts = scanner.scan()
+            raw_scanned = len(breakouts)
 
             viable: list[Any] = []
             trade_candidates: list[TradeCandidate] = []
@@ -559,7 +572,7 @@ class MomentumStrategy(StrategyBase):
                 edge_values.append(edge_pct)
 
             if not viable:
-                return OpportunityAssessment()
+                return _complete(OpportunityAssessment())
 
             trade_candidates.sort(key=lambda c: c.expected_value, reverse=True)
             trade_candidates = trade_candidates[:3]
@@ -576,7 +589,7 @@ class MomentumStrategy(StrategyBase):
                 symbols=[c.symbol for c in trade_candidates],
             )
 
-            return OpportunityAssessment(
+            return _complete(OpportunityAssessment(
                 num_candidates=len(viable),
                 avg_risk_reward=round(max(0.0, avg_rr), 2),
                 confidence=round(max(0.0, min(1.0, avg_conf)), 2),
@@ -594,10 +607,10 @@ class MomentumStrategy(StrategyBase):
                     for bo in viable[:5]
                 ],
                 candidates=trade_candidates,
-            )
-        except Exception:
-            self._log.debug("assess_opportunities_failed")
-            return OpportunityAssessment()
+            ))
+        except Exception as exc:
+            self._log.error("assess_failed", strategy=self.name, error=str(exc), exc_info=True)
+            return _complete(OpportunityAssessment())
 
     def _get_state(self) -> dict[str, Any]:
         """Serialize state for persistence."""

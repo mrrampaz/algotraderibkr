@@ -26,6 +26,10 @@ params:
   # Filters
   min_vix_proxy: 15.0             # Only sell when vol is elevated enough
   use_sma5_filter: true           # Contrarian SMA5 filter
+  credit_estimate_pct: 0.30       # Rough credit estimate as % of spread width
+  win_rate_credit_spread: 0.70    # Baseline win rate assumption for credit spreads
+  win_rate_iron_condor: 0.72      # Baseline win rate assumption for iron condors
+  event_day_confidence_penalty: 0.25
 
   # Exit
   profit_target_pct: 50.0         # Close at 50% of max profit
