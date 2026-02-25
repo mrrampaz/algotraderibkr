@@ -153,13 +153,26 @@ def print_account(executor: "IBKRExecutor") -> None:
 
 def print_quote(provider: "IBKRDataProvider") -> None:
     quote = provider.get_quote("SPY")
-    if quote is None:
-        raise RuntimeError("No quote returned for SPY")
-    print(
-        "SPY quote: "
-        f"bid={quote.bid_price:.2f} x {quote.bid_size:.0f}, "
-        f"ask={quote.ask_price:.2f} x {quote.ask_size:.0f}"
-    )
+    if quote is not None:
+        print(
+            "SPY quote: "
+            f"bid={quote.bid_price:.2f} x {quote.bid_size:.0f}, "
+            f"ask={quote.ask_price:.2f} x {quote.ask_size:.0f}"
+        )
+        return
+
+    # Some IBKR accounts/sessions may not return top-of-book snapshot quote
+    # fields immediately. Fall back to trade snapshot so connectivity checks
+    # still validate market data access.
+    snapshot = provider.get_snapshot("SPY")
+    if snapshot and snapshot.latest_trade_price:
+        print(
+            "SPY quote unavailable; using snapshot trade price: "
+            f"last={snapshot.latest_trade_price:.2f}"
+        )
+        return
+
+    raise RuntimeError("No quote or snapshot returned for SPY")
 
 
 def print_bars(provider: "IBKRDataProvider") -> None:

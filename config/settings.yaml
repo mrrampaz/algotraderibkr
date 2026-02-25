@@ -13,7 +13,7 @@ broker:
   ibkr:
     host: "127.0.0.1"           # TWS/Gateway host
     port: 7497                   # 7497=TWS paper, 7496=TWS live, 4002=Gateway paper, 4001=Gateway live
-    client_id: 1                 # Use unique IDs for multiple bots
+    client_id: 117               # Use unique IDs for multiple bots
     timeout: 30                  # Connection timeout seconds
     readonly: false              # True = data-only mode (no orders)
     account: ""                  # Empty = default account
