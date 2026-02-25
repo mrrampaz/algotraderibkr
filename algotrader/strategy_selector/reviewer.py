@@ -20,6 +20,7 @@ from algotrader.core.models import MarketRegime
 from algotrader.strategies.base import StrategyBase
 from algotrader.strategy_selector.allocator import CapitalAllocator
 from algotrader.strategy_selector.scorer import StrategyScorer
+from algotrader.strategy_selector.brain import DailyBrain, BrainDecision
 
 logger = structlog.get_logger()
 
@@ -293,3 +294,33 @@ class MidDayReviewer:
         )
         self._pending_regime_review = True
         self._pending_regime = regime
+
+
+class BrainMidDayReviewer:
+    """Adapter to run DailyBrain midday reviews from legacy integration points."""
+
+    def __init__(self, brain: DailyBrain) -> None:
+        self._brain = brain
+        self._log = logger.bind(component="brain_midday_reviewer")
+
+    def review(
+        self,
+        regime: MarketRegime,
+        assessments: dict,
+        current_positions: list,
+        daily_pnl: float,
+        vix_level: float | None = None,
+    ) -> BrainDecision:
+        decision = self._brain.review_midday(
+            regime=regime,
+            assessments=assessments,
+            current_positions=current_positions,
+            daily_pnl=daily_pnl,
+            vix_level=vix_level,
+        )
+        self._log.info(
+            "brain_midday_review_complete",
+            num_trades=decision.num_trades,
+            cash_pct=decision.cash_pct,
+        )
+        return decision

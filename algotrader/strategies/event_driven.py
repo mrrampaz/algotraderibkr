@@ -474,6 +474,8 @@ class EventDrivenStrategy(StrategyBase):
     def assess_opportunities(self, regime: MarketRegime | None = None) -> OpportunityAssessment:
         """Assess event-driven opportunities from today's calendar."""
         try:
+            from algotrader.strategy_selector.candidate import CandidateType, TradeCandidate
+
             if not self._events_checked_today:
                 self._check_today_events()
 
@@ -495,24 +497,151 @@ class EventDrivenStrategy(StrategyBase):
             if not actionable:
                 return OpportunityAssessment()
 
-            # Higher impact events = higher confidence
-            avg_impact = sum(e.get("impact", 2) for e in actionable) / len(actionable)
-            confidence = min(1.0, len(actionable) * 0.2 + (avg_impact - 1) * 0.15)
-            trades_per_event = len(self._instruments)
+            et_now = datetime.now(ET)
+            trade_candidates: list[TradeCandidate] = []
+            details: list[dict] = []
+
+            for event in actionable:
+                event_type = event["type"]
+                event_time = self._parse_event_time(event.get("time", ""), et_now)
+                if event_time is None and event_type in EVENT_TIMES:
+                    hh, mm = EVENT_TIMES[event_type]
+                    event_time = et_now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+                if event_time is None:
+                    continue
+
+                is_post_event = et_now >= event_time
+                hours_to_event = (event_time - et_now).total_seconds() / 3600.0
+                if not is_post_event and hours_to_event > self._pre_event_entry_hours:
+                    continue
+
+                for symbol in self._instruments:
+                    trade_key = f"{event_type}_{symbol}"
+                    if trade_key in self._trades:
+                        continue
+
+                    current_price = self._get_current_price(symbol)
+                    if current_price is None or current_price <= 0:
+                        continue
+
+                    atr = None
+                    bars = self.data_provider.get_bars(symbol, "5Min", 30)
+                    if not bars.empty and len(bars) >= 15:
+                        highs = bars["high"].values
+                        lows = bars["low"].values
+                        closes = bars["close"].values
+                        tr_values = []
+                        for i in range(1, len(bars)):
+                            tr_values.append(max(
+                                highs[i] - lows[i],
+                                abs(highs[i] - closes[i - 1]),
+                                abs(lows[i] - closes[i - 1]),
+                            ))
+                        if tr_values:
+                            atr = float(sum(tr_values[-14:]) / len(tr_values[-14:]))
+                    if not atr or atr <= 0:
+                        atr = current_price * 0.005
+
+                    if is_post_event:
+                        pre_event_price = self._pre_event_prices.get(symbol) or self._get_pre_event_price(symbol, event_time)
+                        if pre_event_price and pre_event_price > 0:
+                            move_pct = ((current_price - pre_event_price) / pre_event_price) * 100
+                        else:
+                            move_pct = 0.0
+                        direction = "long" if move_pct >= 0 else "short"
+                        base_conf = 0.35 if event_type in {"fomc", "cpi", "ppi", "jobs", "gdp", "retail_sales", "pce"} else 0.30
+                        confidence = base_conf + (0.25 if abs(move_pct) >= self._post_event_move_threshold * 1.5 else 0.05)
+                        expiry_time = (event_time + timedelta(hours=4)).astimezone(pytz.UTC)
+                        catalyst = f"post_{event_type}_{direction}"
+                        win_rate = 0.52
+                    else:
+                        pre_event_price = self._pre_event_prices.get(symbol) or self._get_pre_event_price(symbol, event_time)
+                        if pre_event_price and pre_event_price > 0 and current_price >= pre_event_price:
+                            direction = "long"
+                        else:
+                            direction = "short"
+                        base_conf = 0.35 if event_type in {"fomc", "cpi", "ppi", "jobs", "gdp", "retail_sales", "pce"} else 0.30
+                        confidence = min(0.40, base_conf + 0.05)
+                        expiry_time = event_time.astimezone(pytz.UTC)
+                        catalyst = f"pre_{event_type}_{direction}"
+                        win_rate = 0.45
+
+                    if direction == "long":
+                        stop_price = current_price - atr
+                        target_price = current_price + 2.0 * atr
+                    else:
+                        stop_price = current_price + atr
+                        target_price = current_price - 2.0 * atr
+
+                    risk_per_share = abs(current_price - stop_price)
+                    reward_per_share = abs(target_price - current_price)
+                    if risk_per_share <= 0:
+                        continue
+                    rr_ratio = reward_per_share / risk_per_share
+
+                    regime_fit = 1.0 if regime and regime.regime_type.value == "event_day" else 0.0
+                    confidence = min(1.0, max(0.0, confidence))
+                    if not is_post_event:
+                        confidence = min(confidence, 0.40)
+
+                    risk_pct = (risk_per_share / current_price) * 100.0 if current_price > 0 else 0.0
+                    edge_pct = max(0.0, (win_rate * rr_ratio - (1.0 - win_rate)) * risk_pct)
+                    risk_budget = self.available_capital * 0.004
+                    suggested_qty = int(risk_budget / risk_per_share) if risk_per_share > 0 else 0
+
+                    trade_candidates.append(TradeCandidate(
+                        strategy_name=self.name,
+                        candidate_type=CandidateType.EVENT_DIRECTIONAL,
+                        symbol=symbol,
+                        direction=direction,
+                        entry_price=round(current_price, 2),
+                        stop_price=round(stop_price, 2),
+                        target_price=round(target_price, 2),
+                        risk_dollars=round(risk_per_share * max(1, suggested_qty), 2),
+                        suggested_qty=suggested_qty,
+                        risk_reward_ratio=round(rr_ratio, 2),
+                        confidence=round(confidence, 2),
+                        edge_estimate_pct=round(edge_pct, 2),
+                        regime_fit=round(regime_fit, 2),
+                        catalyst=catalyst,
+                        time_horizon_minutes=240 if is_post_event else int(max(30, hours_to_event * 60)),
+                        expiry_time=expiry_time,
+                        metadata={
+                            "event_type": event_type,
+                            "is_post_event": is_post_event,
+                            "event_time": event_time.isoformat(),
+                        },
+                    ))
+                    details.append(
+                        {
+                            "event": event_type,
+                            "symbol": symbol,
+                            "is_post_event": is_post_event,
+                            "time": event.get("time", ""),
+                            "impact": event.get("impact", 2),
+                        }
+                    )
+
+            if not trade_candidates:
+                return OpportunityAssessment()
+
+            trade_candidates.sort(key=lambda c: c.expected_value, reverse=True)
+            top_candidates = trade_candidates[:3]
+            avg_rr = sum(c.risk_reward_ratio for c in trade_candidates) / len(trade_candidates)
+            avg_conf = sum(c.confidence for c in trade_candidates) / len(trade_candidates)
+            avg_edge = sum(c.edge_estimate_pct for c in trade_candidates) / len(trade_candidates)
 
             return OpportunityAssessment(
-                num_candidates=len(actionable) * trades_per_event,
-                avg_risk_reward=self._target_rr,
-                confidence=round(max(0.0, confidence), 2),
+                num_candidates=len(trade_candidates),
+                avg_risk_reward=round(max(0.0, avg_rr), 2),
+                confidence=round(max(0.0, min(1.0, avg_conf)), 2),
                 estimated_daily_trades=min(
-                    len(actionable) * trades_per_event,
+                    len(trade_candidates),
                     self.config.max_positions - len(self._trades),
                 ),
-                estimated_edge_pct=round(self._post_event_move_threshold * self._target_rr * 0.4, 2),
-                details=[
-                    {"event": e["type"], "impact": e.get("impact"), "time": e.get("time", "")}
-                    for e in actionable
-                ],
+                estimated_edge_pct=round(max(0.0, avg_edge), 2),
+                details=details[:5],
+                candidates=top_candidates,
             )
         except Exception:
             self._log.debug("assess_opportunities_failed")

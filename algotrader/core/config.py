@@ -107,11 +107,32 @@ class AlertsConfig(BaseModel):
     alert_file: str = "data/logs/alerts.log"
 
 
+class BrainConfig(BaseModel):
+    """Config for the Daily Brain selector mode."""
+
+    min_confidence: float = 0.60
+    min_risk_reward: float = 1.5
+    min_edge_pct: float = 0.3
+    max_daily_trades: int = 5
+    max_capital_per_trade_pct: float = 20.0
+    max_daily_risk_pct: float = 2.0
+    cash_is_default: bool = True
+    regime_mismatch_penalty: float = 0.5
+    correlation_penalty: float = 0.3
+    recent_loss_cooldown_hours: int = 4
+    midday_confidence_multiplier: float = 1.2
+    midday_pnl_stop_pct: float = -1.0
+
+
 class StrategySelectorConfig(BaseModel):
     """Config for the Phase 4 strategy selection engine."""
 
     enabled: bool = True
+    mode: str = "brain"  # "brain" or "classic"
     regime_config: str = "config/regimes.yaml"
+    brain: BrainConfig = Field(default_factory=BrainConfig)
+
+    # Classic mode parameters
     min_activation_score: float = 0.35
     review_hour: int = 12
     review_minute: int = 0
@@ -141,6 +162,16 @@ class Settings(BaseModel):
     strategies: dict[str, StrategyConfig] = Field(default_factory=dict)
     strategy_selector: StrategySelectorConfig = Field(default_factory=StrategySelectorConfig)
     alerts: AlertsConfig = Field(default_factory=AlertsConfig)
+
+    def __init__(self, **data: Any) -> None:
+        """Load config/settings.yaml by default when called with no overrides."""
+        if not data:
+            config_path = os.getenv("ALGOTRADER_CONFIG", "config/settings.yaml")
+            path = Path(config_path)
+            if path.exists():
+                data = load_yaml(path)
+        super().__init__(**data)
+        self.alpaca = AlpacaConfig.from_env()
 
 
 # ── Loader ───────────────────────────────────────────────────────────────────

@@ -575,6 +575,8 @@ class GapReversalStrategy(StrategyBase):
     def assess_opportunities(self, regime: MarketRegime | None = None) -> OpportunityAssessment:
         """Assess gap trading opportunities from scanner candidates."""
         try:
+            from algotrader.strategy_selector.candidate import CandidateType, TradeCandidate
+
             # Regime gate
             if regime and regime.regime_type.value not in self._allowed_regimes:
                 return OpportunityAssessment()
@@ -582,29 +584,173 @@ class GapReversalStrategy(StrategyBase):
             if not self._gap_candidates:
                 return OpportunityAssessment()
 
+            et_now = datetime.now(ET)
+            expiry_time = et_now.replace(hour=11, minute=0, second=0, microsecond=0).astimezone(pytz.UTC)
+
             qualified = []
+            details: list[dict] = []
+            trade_candidates: list[TradeCandidate] = []
             for c in self._gap_candidates:
                 gap_pct = abs(c.get("gap_pct", 0.0))
-                if self._min_gap_pct <= gap_pct <= self._max_gap_pct:
-                    qualified.append(c)
+                if not (self._min_gap_pct <= gap_pct <= self._max_gap_pct):
+                    continue
+
+                symbol = c.get("symbol", "")
+                if not symbol:
+                    continue
+
+                gap_signed = float(c.get("gap_pct", 0.0))
+                prev_close = float(c.get("prev_close", 0.0))
+                gap_open = float(c.get("current_price", 0.0))
+                current_price = self._get_current_price(symbol) or gap_open
+                if current_price <= 0 or gap_open <= 0:
+                    continue
+
+                bars = self.data_provider.get_bars(symbol, "5Min", 3)
+                first_high = float(bars["high"].iloc[0]) if not bars.empty else max(current_price, gap_open)
+                first_low = float(bars["low"].iloc[0]) if not bars.empty else min(current_price, gap_open)
+                has_catalyst = self._check_catalyst(symbol)
+
+                if has_catalyst:
+                    trade_type = "go"
+                    if gap_signed > 0:
+                        direction = "long"
+                        entry_price = max(first_high, current_price)
+                        stop_price = min(first_low, gap_open * (1 - self._fade_stop_pct / 100))
+                        target_price = entry_price + abs(entry_price - stop_price) * 2.0
+                        candidate_type = CandidateType.LONG_EQUITY
+                    else:
+                        direction = "short"
+                        entry_price = min(first_low, current_price)
+                        stop_price = max(first_high, gap_open * (1 + self._fade_stop_pct / 100))
+                        target_price = entry_price - abs(stop_price - entry_price) * 2.0
+                        candidate_type = CandidateType.SHORT_EQUITY
+                else:
+                    trade_type = "fade"
+                    fill_target = prev_close + (gap_open - prev_close) * (1 - self._fade_fill_target_pct / 100)
+                    if gap_signed > 0:
+                        direction = "short"
+                        entry_price = current_price
+                        stop_price = gap_open * (1 + self._fade_stop_pct / 100)
+                        target_price = fill_target
+                        candidate_type = CandidateType.SHORT_EQUITY
+                    else:
+                        direction = "long"
+                        entry_price = current_price
+                        stop_price = gap_open * (1 - self._fade_stop_pct / 100)
+                        target_price = fill_target
+                        candidate_type = CandidateType.LONG_EQUITY
+
+                risk_per_share = abs(entry_price - stop_price)
+                reward_per_share = abs(target_price - entry_price)
+                if risk_per_share <= 0:
+                    continue
+                rr_ratio = reward_per_share / risk_per_share if risk_per_share > 0 else 0.0
+
+                pre_market_volume = float(c.get("pre_market_volume", 0.0))
+                confidence = 0.10
+                if abs(gap_signed) > 4.0:
+                    confidence += 0.15
+                else:
+                    confidence += 0.10
+
+                if pre_market_volume > 1_000_000:
+                    confidence += 0.15
+                elif pre_market_volume > 500_000:
+                    confidence += 0.10
+
+                confidence += 0.15 if has_catalyst else 0.10
+                if first_high > first_low:
+                    confidence += 0.10
+
+                if et_now.hour < 10:
+                    confidence += 0.10
+                elif et_now.hour == 10 and et_now.minute <= 30:
+                    confidence += 0.05
+
+                regime_fit = 0.6
+                if regime:
+                    regime_type = regime.regime_type.value
+                    if regime_type == "high_vol":
+                        regime_fit = 0.25
+                    elif regime_type in ("trending_up", "trending_down"):
+                        regime_fit = 0.65
+                    elif regime_type == "ranging":
+                        regime_fit = 0.55
+                    else:
+                        regime_fit = 0.5
+
+                confidence = min(1.0, max(0.0, confidence))
+                win_rate = 0.47 if has_catalyst else 0.52
+                risk_pct = (risk_per_share / entry_price) * 100.0 if entry_price > 0 else 0.0
+                edge_pct = max(0.0, (win_rate * rr_ratio - (1.0 - win_rate)) * risk_pct)
+                risk_budget = self.available_capital * 0.005
+                suggested_qty = int(risk_budget / risk_per_share) if risk_per_share > 0 else 0
+
+                trade_candidates.append(TradeCandidate(
+                    strategy_name=self.name,
+                    candidate_type=candidate_type,
+                    symbol=symbol,
+                    direction=direction,
+                    entry_price=round(entry_price, 2),
+                    stop_price=round(stop_price, 2),
+                    target_price=round(target_price, 2),
+                    risk_dollars=round(risk_per_share * max(1, suggested_qty), 2),
+                    suggested_qty=suggested_qty,
+                    risk_reward_ratio=round(rr_ratio, 2),
+                    confidence=round(confidence, 2),
+                    edge_estimate_pct=round(edge_pct, 2),
+                    regime_fit=round(regime_fit, 2),
+                    catalyst=(
+                        f"gap_{'up' if gap_signed > 0 else 'down'}_{abs(gap_signed):.1f}pct_"
+                        f"{trade_type}_{'catalyst' if has_catalyst else 'no_catalyst'}"
+                    ),
+                    time_horizon_minutes=90,
+                    expiry_time=expiry_time,
+                    metadata={
+                        "gap_pct": round(gap_signed, 2),
+                        "trade_type": trade_type,
+                        "first_high": round(first_high, 2),
+                        "first_low": round(first_low, 2),
+                        "pre_market_volume": pre_market_volume,
+                    },
+                ))
+                details.append(
+                    {
+                        "symbol": symbol,
+                        "gap_pct": round(gap_signed, 2),
+                        "trade_type": trade_type,
+                        "direction": direction,
+                        "has_catalyst": has_catalyst,
+                    }
+                )
+                qualified.append(c)
 
             if not qualified:
                 return OpportunityAssessment()
 
-            # Confidence: more candidates with larger gaps = higher confidence
-            avg_gap = sum(abs(c.get("gap_pct", 0.0)) for c in qualified) / len(qualified)
-            confidence = min(1.0, len(qualified) * 0.15 + avg_gap * 0.05)
+            if not trade_candidates:
+                return OpportunityAssessment(
+                    num_candidates=0,
+                    confidence=0.0,
+                    details=[{"reason": "qualified_but_no_tradecandidate"}],
+                    candidates=[],
+                )
+
+            trade_candidates.sort(key=lambda c: c.expected_value, reverse=True)
+            top_candidates = trade_candidates[:3]
+            avg_rr = sum(c.risk_reward_ratio for c in trade_candidates) / len(trade_candidates)
+            avg_conf = sum(c.confidence for c in trade_candidates) / len(trade_candidates)
+            avg_edge = sum(c.edge_estimate_pct for c in trade_candidates) / len(trade_candidates)
 
             return OpportunityAssessment(
-                num_candidates=len(qualified),
-                avg_risk_reward=self._go_target_rr,
-                confidence=round(confidence, 2),
-                estimated_daily_trades=min(len(qualified), self.config.max_positions),
-                estimated_edge_pct=round(avg_gap * 0.15, 2),
-                details=[
-                    {"symbol": c["symbol"], "gap_pct": c.get("gap_pct", 0.0)}
-                    for c in qualified[:5]
-                ],
+                num_candidates=len(trade_candidates),
+                avg_risk_reward=round(max(0.0, avg_rr), 2),
+                confidence=round(max(0.0, min(1.0, avg_conf)), 2),
+                estimated_daily_trades=min(len(trade_candidates), self.config.max_positions),
+                estimated_edge_pct=round(max(0.0, avg_edge), 2),
+                details=details[:5],
+                candidates=top_candidates,
             )
         except Exception:
             self._log.debug("assess_opportunities_failed")

@@ -21,6 +21,7 @@ from algotrader.core.models import (
 from algotrader.data.provider import DataProvider
 from algotrader.execution.executor import Executor
 
+from algotrader.strategy_selector.candidate import TradeCandidate
 from algotrader.tracking.journal import TradeJournal
 
 logger = structlog.get_logger()
@@ -36,10 +37,18 @@ class OpportunityAssessment:
     estimated_daily_trades: int = 0
     estimated_edge_pct: float = 0.0  # Expected return on deployed capital
     details: list[dict] = field(default_factory=list)
+    candidates: list[TradeCandidate] = field(default_factory=list)
 
     @property
     def has_opportunities(self) -> bool:
-        return self.num_candidates > 0 and self.confidence > 0.0
+        return self.num_candidates > 0 or len(self.candidates) > 0
+
+    @property
+    def top_candidate(self) -> TradeCandidate | None:
+        """Best candidate by expected value."""
+        if not self.candidates:
+            return None
+        return max(self.candidates, key=lambda c: c.expected_value)
 
 
 class StrategyBase(ABC):

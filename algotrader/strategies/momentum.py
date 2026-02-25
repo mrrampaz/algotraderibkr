@@ -25,6 +25,7 @@ from algotrader.data.provider import DataProvider
 from algotrader.execution.executor import Executor
 from algotrader.strategies.base import OpportunityAssessment, StrategyBase
 from algotrader.strategies.registry import register_strategy
+from algotrader.strategy_selector.candidate import CandidateType, TradeCandidate
 
 logger = structlog.get_logger()
 
@@ -423,10 +424,15 @@ class MomentumStrategy(StrategyBase):
         return None
 
     def assess_opportunities(self, regime: MarketRegime | None = None) -> OpportunityAssessment:
-        """Assess breakout opportunities via the BreakoutScanner."""
+        """Assess breakout opportunities and emit concrete TradeCandidates."""
         try:
             # Regime gate
             if regime and regime.regime_type.value not in self._allowed_regimes:
+                return OpportunityAssessment()
+
+            et_now = datetime.now(ET)
+            if et_now.hour >= 15:
+                # Momentum setups are not actionable for fresh entries after 3 PM ET.
                 return OpportunityAssessment()
 
             from algotrader.intelligence.scanners.breakout_scanner import BreakoutScanner
@@ -437,33 +443,157 @@ class MomentumStrategy(StrategyBase):
             )
             breakouts = scanner.scan()
 
-            qualified = [
-                bo for bo in breakouts
-                if bo.volume_ratio >= self._min_volume_ratio
-                and bo.consolidation_days >= self._min_consolidation_days
-            ]
+            viable: list[Any] = []
+            trade_candidates: list[TradeCandidate] = []
+            rr_values: list[float] = []
+            confidence_values: list[float] = []
+            edge_values: list[float] = []
+            expiry_time = et_now.replace(hour=15, minute=0, second=0, microsecond=0).astimezone(pytz.UTC)
 
-            if not qualified:
+            for bo in breakouts:
+                if bo.symbol in self._trades:
+                    continue
+                if bo.volume_ratio < self._min_volume_ratio:
+                    continue
+                if bo.consolidation_days < self._min_consolidation_days:
+                    continue
+
+                quote = self.data_provider.get_quote(bo.symbol)
+                if quote and quote.is_valid() and quote.spread_pct * 100 > self._max_spread_pct:
+                    continue
+
+                if bo.breakout_type == "resistance_break":
+                    direction = "long"
+                    entry_price = float(bo.current_price)
+                    stop_price = entry_price - float(bo.atr) * self._stop_atr_mult
+                    risk_per_share = entry_price - stop_price
+                    target_price = entry_price + (risk_per_share * max(2.0, self._fixed_target_rr))
+                    candidate_type = CandidateType.LONG_EQUITY
+                elif bo.breakout_type == "support_break":
+                    direction = "short"
+                    entry_price = float(bo.current_price)
+                    stop_price = entry_price + float(bo.atr) * self._stop_atr_mult
+                    risk_per_share = stop_price - entry_price
+                    target_price = entry_price - (risk_per_share * max(2.0, self._fixed_target_rr))
+                    candidate_type = CandidateType.SHORT_EQUITY
+                else:
+                    continue
+
+                if risk_per_share <= 0 or entry_price <= 0:
+                    continue
+
+                rr_ratio = abs(target_price - entry_price) / risk_per_share
+
+                # Confidence calibration: volume quality + regime suitability + breakout quality.
+                if bo.volume_ratio >= 2.0:
+                    confidence = 0.35
+                elif bo.volume_ratio >= 1.5:
+                    confidence = 0.25
+                else:
+                    confidence = 0.10
+
+                confidence += 0.15  # Scanner hit with consolidation and breakout structure.
+
+                regime_fit = 0.5
+                if regime:
+                    regime_type = regime.regime_type.value
+                    if regime_type in ("trending_up", "trending_down"):
+                        regime_fit = 0.8
+                        confidence += 0.20
+                    elif regime_type == "high_vol":
+                        regime_fit = 0.3
+                        confidence += 0.05
+                    elif regime_type == "ranging":
+                        regime_fit = 0.2
+                    else:
+                        regime_fit = 0.5
+                        confidence += 0.10
+
+                    if direction == "long" and regime_type == "trending_up":
+                        confidence += 0.10
+                    elif direction == "short" and regime_type == "trending_down":
+                        confidence += 0.10
+
+                confidence = min(1.0, max(0.0, confidence))
+
+                # Conservative edge model from breakout win-rate assumptions.
+                est_win_rate = 0.48 if bo.volume_ratio >= 2.0 else 0.43
+                expectancy_r = est_win_rate * rr_ratio - (1.0 - est_win_rate)
+                risk_pct = (risk_per_share / entry_price) * 100.0
+                edge_pct = max(0.0, expectancy_r * risk_pct)
+
+                risk_budget = self.available_capital * 0.005
+                suggested_qty = int(risk_budget / risk_per_share) if risk_per_share > 0 else 0
+                risk_dollars = risk_per_share * max(1, suggested_qty)
+
+                candidate = TradeCandidate(
+                    strategy_name=self.name,
+                    candidate_type=candidate_type,
+                    symbol=bo.symbol,
+                    direction=direction,
+                    entry_price=round(entry_price, 2),
+                    stop_price=round(stop_price, 2),
+                    target_price=round(target_price, 2),
+                    risk_dollars=round(risk_dollars, 2),
+                    suggested_qty=suggested_qty,
+                    risk_reward_ratio=round(rr_ratio, 2),
+                    confidence=round(confidence, 2),
+                    edge_estimate_pct=round(edge_pct, 2),
+                    regime_fit=round(regime_fit, 2),
+                    catalyst=f"breakout_vol_{bo.volume_ratio:.1f}x",
+                    time_horizon_minutes=180,
+                    expiry_time=expiry_time,
+                    metadata={
+                        "breakout_level": round(float(bo.breakout_price), 4),
+                        "breakout_type": bo.breakout_type,
+                        "volume_ratio": round(float(bo.volume_ratio), 2),
+                        "atr": round(float(bo.atr), 4),
+                        "consolidation_days": int(bo.consolidation_days),
+                    },
+                )
+
+                viable.append(bo)
+                trade_candidates.append(candidate)
+                rr_values.append(rr_ratio)
+                confidence_values.append(confidence)
+                edge_values.append(edge_pct)
+
+            if not viable:
                 return OpportunityAssessment()
 
-            avg_vol = sum(bo.volume_ratio for bo in qualified) / len(qualified)
-            confidence = min(1.0, len(qualified) * 0.12 + (avg_vol - 1.0) * 0.1)
+            trade_candidates.sort(key=lambda c: c.expected_value, reverse=True)
+            trade_candidates = trade_candidates[:3]
+
+            avg_vol = sum(bo.volume_ratio for bo in viable) / len(viable)
+            avg_rr = (sum(rr_values) / len(rr_values)) if rr_values else self._fixed_target_rr
+            avg_conf = (sum(confidence_values) / len(confidence_values)) if confidence_values else 0.0
+            avg_edge = (sum(edge_values) / len(edge_values)) if edge_values else round(0.3 * avg_vol, 2)
+
+            self._log.debug(
+                "momentum_assess_trade_candidates",
+                total_viable=len(viable),
+                emitted=len(trade_candidates),
+                symbols=[c.symbol for c in trade_candidates],
+            )
 
             return OpportunityAssessment(
-                num_candidates=len(qualified),
-                avg_risk_reward=self._fixed_target_rr,
-                confidence=round(max(0.0, confidence), 2),
-                estimated_daily_trades=min(len(qualified), self.config.max_positions),
-                estimated_edge_pct=round(0.3 * avg_vol, 2),
+                num_candidates=len(viable),
+                avg_risk_reward=round(max(0.0, avg_rr), 2),
+                confidence=round(max(0.0, min(1.0, avg_conf)), 2),
+                estimated_daily_trades=min(len(viable), self.config.max_positions),
+                estimated_edge_pct=round(max(0.0, avg_edge), 2),
                 details=[
                     {
                         "symbol": bo.symbol,
                         "type": bo.breakout_type,
                         "volume_ratio": round(bo.volume_ratio, 1),
                         "consolidation_days": bo.consolidation_days,
+                        "breakout_level": round(float(bo.breakout_price), 2),
+                        "atr": round(float(bo.atr), 2),
                     }
-                    for bo in qualified[:5]
+                    for bo in viable[:5]
                 ],
+                candidates=trade_candidates,
             )
         except Exception:
             self._log.debug("assess_opportunities_failed")

@@ -667,12 +667,31 @@ class OptionsPremiumStrategy(StrategyBase):
     def assess_opportunities(self, regime: MarketRegime | None = None) -> OpportunityAssessment:
         """Assess options premium selling conditions."""
         try:
+            from algotrader.intelligence.calendar.events import EventCalendar
+            from algotrader.strategy_selector.candidate import CandidateType, TradeCandidate
+
             # Regime gate
             if regime:
                 if regime.regime_type.value in self._blocked_regimes:
                     return OpportunityAssessment()
                 if regime.regime_type.value not in self._allowed_regimes:
                     return OpportunityAssessment()
+
+            et_now = datetime.now(ET)
+            window_end = et_now.replace(
+                hour=self._entry_end_hour,
+                minute=self._entry_end_minute,
+                second=0,
+                microsecond=0,
+            )
+            if et_now > window_end:
+                return OpportunityAssessment(
+                    num_candidates=0,
+                    confidence=0.0,
+                    details=[{"reason": "entry_window_closed"}],
+                    candidates=[],
+                )
+            expiry_time = window_end.astimezone(pytz.UTC)
 
             # VIX proxy check
             vix_level = regime.vix_level if regime and regime.vix_level else None
@@ -681,6 +700,7 @@ class OptionsPremiumStrategy(StrategyBase):
                     num_candidates=0,
                     confidence=0.0,
                     details=[{"reason": f"VIX {vix_level:.1f} < min {self._min_vix_proxy}"}],
+                    candidates=[],
                 )
 
             # Count available underlyings not already traded
@@ -688,33 +708,168 @@ class OptionsPremiumStrategy(StrategyBase):
             if not available:
                 return OpportunityAssessment()
 
-            # Estimate credit quality from ATR
-            valid = []
+            event_calendar = EventCalendar()
+            details: list[dict] = []
+            candidate_rows: list[TradeCandidate] = []
+
             for underlying in available:
                 try:
                     atr = self._get_atr(underlying)
-                    if atr and atr > 0:
-                        valid.append({"symbol": underlying, "atr": round(atr, 2)})
+                    current_price = self._get_current_price(underlying)
+                    if not atr or atr <= 0 or not current_price or current_price <= 0:
+                        continue
+
+                    bias = self._get_sma5_bias(underlying, current_price)
+                    sigma = atr * 0.6
+                    strike_distance = max(0.5, sigma * 1.1)
+
+                    # Reuse the same structure logic as _scan_entries.
+                    if bias == "bullish" or (bias == "neutral" and self._structure == "credit_spread"):
+                        structure = "put_spread"
+                        short_strike = round(current_price - strike_distance)
+                        long_strike = short_strike - self._wing_width
+                        call_short = 0.0
+                        call_long = 0.0
+                        direction = "short"
+                        candidate_type = CandidateType.CREDIT_SPREAD
+                    elif bias == "bearish":
+                        structure = "call_spread"
+                        short_strike = round(current_price + strike_distance)
+                        long_strike = short_strike + self._wing_width
+                        call_short = 0.0
+                        call_long = 0.0
+                        direction = "short"
+                        candidate_type = CandidateType.CREDIT_SPREAD
+                    else:
+                        structure = "iron_condor"
+                        short_strike = round(current_price - strike_distance)  # put short
+                        long_strike = short_strike - self._wing_width          # put long
+                        call_short = round(current_price + strike_distance)     # call short
+                        call_long = call_short + self._wing_width               # call long
+                        direction = "neutral"
+                        candidate_type = CandidateType.IRON_CONDOR
+
+                    spread_width = max(1.0, self._wing_width * 100.0)
+                    credit_single = spread_width * 0.25
+                    if structure == "iron_condor":
+                        credit_per_contract = credit_single * 2.0
+                        max_loss_per_contract = spread_width
+                    else:
+                        credit_per_contract = credit_single
+                        max_loss_per_contract = max(1.0, spread_width - credit_single)
+
+                    contracts = min(
+                        self._max_contracts,
+                        int(self._max_risk_per_trade / max_loss_per_contract) if max_loss_per_contract > 0 else 1,
+                    )
+                    contracts = max(1, contracts)
+
+                    total_credit = credit_per_contract * contracts
+                    total_max_loss = max_loss_per_contract * contracts
+                    rr_ratio = (total_credit / total_max_loss) if total_max_loss > 0 else 0.0
+
+                    confidence = 0.0
+                    if vix_level is not None:
+                        if vix_level > 20:
+                            confidence += 0.25
+                        elif vix_level >= 15:
+                            confidence += 0.15
+                        else:
+                            confidence += 0.05
+                    else:
+                        confidence += 0.10
+
+                    if self._in_entry_window(et_now):
+                        confidence += 0.15
+                    if self._use_sma5_filter and bias != "neutral":
+                        confidence += 0.10
+
+                    regime_fit = 0.5
+                    if regime:
+                        regime_type = regime.regime_type.value
+                        if regime_type == "high_vol":
+                            regime_fit = 0.9
+                            confidence += 0.15
+                        elif regime_type == "ranging":
+                            regime_fit = 0.85
+                            confidence += 0.15
+                        elif regime_type in ("trending_up", "trending_down"):
+                            regime_fit = 0.55
+                            confidence += 0.05
+                        elif regime_type == "event_day":
+                            regime_fit = 0.1
+                            confidence -= 0.30
+                        else:
+                            regime_fit = 0.4
+
+                    if not event_calendar.has_earnings(underlying):
+                        confidence += 0.10
+
+                    confidence = min(1.0, max(0.0, confidence))
+
+                    win_rate = 0.70 if structure == "iron_condor" else 0.62
+                    expected_pnl = win_rate * total_credit - (1.0 - win_rate) * total_max_loss
+                    edge_pct = max(0.0, (expected_pnl / total_max_loss * 100.0) if total_max_loss > 0 else 0.0)
+
+                    candidate_rows.append(TradeCandidate(
+                        strategy_name=self.name,
+                        candidate_type=candidate_type,
+                        symbol=underlying,
+                        direction=direction,
+                        entry_price=round(current_price, 2),
+                        stop_price=round(short_strike, 2),
+                        target_price=round(current_price, 2),
+                        risk_dollars=round(total_max_loss, 2),
+                        suggested_qty=contracts,
+                        risk_reward_ratio=round(rr_ratio, 2),
+                        confidence=round(confidence, 2),
+                        edge_estimate_pct=round(edge_pct, 2),
+                        regime_fit=round(regime_fit, 2),
+                        catalyst=f"vix_{int(round(vix_level)) if vix_level is not None else 'na'}_{bias}_premium",
+                        time_horizon_minutes=45,
+                        expiry_time=expiry_time,
+                        options_structure=structure,
+                        short_strike=round(short_strike, 2),
+                        long_strike=round(long_strike, 2),
+                        contracts=contracts,
+                        credit_received=round(total_credit, 2),
+                        max_loss=round(total_max_loss, 2),
+                        metadata={
+                            "bias": bias,
+                            "atr": round(atr, 2),
+                            "call_short_strike": call_short,
+                            "call_long_strike": call_long,
+                        },
+                    ))
+                    details.append({
+                        "symbol": underlying,
+                        "atr": round(atr, 2),
+                        "bias": bias,
+                        "structure": structure,
+                        "contracts": contracts,
+                        "credit": round(total_credit, 2),
+                        "max_loss": round(total_max_loss, 2),
+                    })
                 except Exception:
                     continue
 
-            if not valid:
+            if not candidate_rows:
                 return OpportunityAssessment()
 
-            # Higher VIX = higher confidence for premium selling
-            vix_boost = min(0.3, (vix_level - self._min_vix_proxy) * 0.02) if vix_level else 0.0
-            confidence = min(1.0, 0.4 + len(valid) * 0.1 + vix_boost)
-
-            # R:R for credit spreads: ~0.33 (25% credit / 75% risk)
-            rr = 0.33
+            candidate_rows.sort(key=lambda c: c.expected_value, reverse=True)
+            top_candidates = candidate_rows[:3]
+            avg_rr = sum(c.risk_reward_ratio for c in candidate_rows) / len(candidate_rows)
+            avg_conf = sum(c.confidence for c in candidate_rows) / len(candidate_rows)
+            avg_edge = sum(c.edge_estimate_pct for c in candidate_rows) / len(candidate_rows)
 
             return OpportunityAssessment(
-                num_candidates=len(valid),
-                avg_risk_reward=rr,
-                confidence=round(max(0.0, confidence), 2),
-                estimated_daily_trades=min(len(valid), self.config.max_positions),
-                estimated_edge_pct=round(rr * 0.5, 2),
-                details=valid,
+                num_candidates=len(candidate_rows),
+                avg_risk_reward=round(max(0.0, avg_rr), 2),
+                confidence=round(max(0.0, min(1.0, avg_conf)), 2),
+                estimated_daily_trades=min(len(candidate_rows), self.config.max_positions),
+                estimated_edge_pct=round(max(0.0, avg_edge), 2),
+                details=details[:5],
+                candidates=top_candidates,
             )
         except Exception:
             self._log.debug("assess_opportunities_failed")

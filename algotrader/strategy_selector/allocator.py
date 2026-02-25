@@ -17,6 +17,7 @@ import structlog
 
 from algotrader.core.config import RiskConfig, StrategyConfig
 from algotrader.strategies.base import StrategyBase
+from algotrader.strategy_selector.candidate import TradeCandidate
 from algotrader.strategy_selector.scorer import StrategyScore
 
 logger = structlog.get_logger()
@@ -32,6 +33,16 @@ class StrategyAllocation:
     allocation_pct: float       # % of total capital
     is_active: bool
     reason: str                 # Why this allocation (for logging)
+
+
+@dataclass
+class CandidateAllocation:
+    """Brain-style candidate allocation."""
+
+    candidate: TradeCandidate
+    allocated_capital: float
+    position_size: int
+    risk_amount: float
 
 
 class CapitalAllocator:
@@ -214,3 +225,53 @@ def _build_reason(score: StrategyScore, capital: float, total: float) -> str:
 
     pct = capital / total * 100 if total > 0 else 0
     return f"Score {score.total_score:.2f} ({', '.join(parts)}) → {pct:.1f}%"
+
+
+def allocate_candidates_greedy(
+    ranked_candidates: list[tuple[TradeCandidate, float]],
+    total_capital: float,
+    max_daily_trades: int,
+    max_capital_per_trade_pct: float,
+    max_daily_risk_pct: float,
+    compute_trade_risk,
+    compute_position_size,
+    is_correlated,
+) -> tuple[list[CandidateAllocation], list[tuple[TradeCandidate, str, float]]]:
+    """Brain-style greedy candidate allocation helper."""
+    selected: list[CandidateAllocation] = []
+    rejected: list[tuple[TradeCandidate, str, float]] = []
+
+    max_daily_risk = total_capital * (max_daily_risk_pct / 100.0)
+    max_trade_cap = total_capital * (max_capital_per_trade_pct / 100.0)
+    used_risk = 0.0
+
+    for candidate, score in ranked_candidates:
+        if len(selected) >= max_daily_trades:
+            break
+
+        risk_amount = compute_trade_risk(candidate)
+        position_size = compute_position_size(candidate, risk_amount)
+        allocated = max_trade_cap if candidate.entry_price <= 0 else candidate.entry_price * max(position_size, 1)
+        allocated = min(allocated, max_trade_cap)
+
+        if used_risk + risk_amount > max_daily_risk:
+            rejected.append((candidate, "daily_risk_limit", score))
+            continue
+        if allocated > max_trade_cap:
+            rejected.append((candidate, "single_trade_too_large", score))
+            continue
+        if is_correlated(candidate, [s.candidate for s in selected]):
+            rejected.append((candidate, "correlated_with_selected", score))
+            continue
+
+        selected.append(
+            CandidateAllocation(
+                candidate=candidate,
+                allocated_capital=allocated,
+                position_size=position_size,
+                risk_amount=risk_amount,
+            )
+        )
+        used_risk += risk_amount
+
+    return selected, rejected

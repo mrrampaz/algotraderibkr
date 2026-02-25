@@ -382,11 +382,24 @@ class VWAPReversionStrategy(StrategyBase):
     def assess_opportunities(self, regime: MarketRegime | None = None) -> OpportunityAssessment:
         """Assess VWAP deviation opportunities across universe."""
         try:
-            # Regime gate — only active in ranging/low_vol
+            from algotrader.strategy_selector.candidate import CandidateType, TradeCandidate
+
+            # Regime gate - only active in ranging/low_vol
             if regime and regime.regime_type.value not in self._allowed_regimes:
                 return OpportunityAssessment()
 
-            candidates = []
+            et_now = datetime.now(ET)
+            if et_now.hour >= 15:
+                return OpportunityAssessment(
+                    num_candidates=0,
+                    confidence=0.0,
+                    details=[{"reason": "entry_window_closed_after_1500"}],
+                    candidates=[],
+                )
+
+            candidates: list[dict] = []
+            trade_candidates: list[TradeCandidate] = []
+
             for symbol in self._universe:
                 if symbol in self._trades:
                     continue
@@ -396,25 +409,125 @@ class VWAPReversionStrategy(StrategyBase):
                     )
                     if bars.empty or len(bars) < 10:
                         continue
-                    _, z_score = calculate_vwap_zscore(bars)
-                    if abs(z_score) >= self._min_z_score:
-                        candidates.append({"symbol": symbol, "z_score": round(z_score, 2)})
+
+                    vwap_price, z_score = calculate_vwap_zscore(bars)
+                    if abs(z_score) < self._min_z_score:
+                        continue
+
+                    current_price = float(bars["close"].iloc[-1])
+                    if current_price <= 0 or vwap_price <= 0:
+                        continue
+
+                    if z_score < 0:
+                        direction = "long"
+                        stop_price = current_price * (1 - self._stop_pct / 100)
+                        candidate_type = CandidateType.LONG_EQUITY
+                    else:
+                        direction = "short"
+                        stop_price = current_price * (1 + self._stop_pct / 100)
+                        candidate_type = CandidateType.SHORT_EQUITY
+
+                    target_price = float(vwap_price)
+                    risk_per_share = abs(current_price - stop_price)
+                    reward_per_share = abs(target_price - current_price)
+                    if risk_per_share <= 0:
+                        continue
+                    rr_ratio = reward_per_share / risk_per_share if risk_per_share > 0 else 0.0
+
+                    vol_ratio = 1.0
+                    if len(bars) >= 6:
+                        avg_recent_vol = float(bars["volume"].iloc[-6:-1].mean())
+                        if avg_recent_vol > 0:
+                            vol_ratio = float(bars["volume"].iloc[-1]) / avg_recent_vol
+
+                    abs_z = abs(z_score)
+                    confidence = 0.10
+                    if abs_z > 2.5:
+                        confidence += 0.30
+                    else:
+                        confidence += 0.20
+
+                    if vol_ratio >= 1.2:
+                        confidence += 0.15
+
+                    regime_fit = 0.5
+                    if regime:
+                        regime_type = regime.regime_type.value
+                        if regime_type == "ranging":
+                            regime_fit = 0.9
+                            confidence += 0.20
+                        elif regime_type == "low_vol":
+                            regime_fit = 0.8
+                            confidence += 0.15
+                        elif regime_type in ("trending_up", "trending_down"):
+                            regime_fit = 0.2
+                            confidence += 0.05
+                        elif regime_type == "high_vol":
+                            regime_fit = 0.1
+                        else:
+                            regime_fit = 0.5
+
+                    if symbol in {"SPY", "QQQ", "AAPL", "MSFT", "AMZN", "GOOG", "META", "NVDA"}:
+                        confidence += 0.10
+
+                    confidence = min(1.0, max(0.0, confidence))
+
+                    risk_pct = (risk_per_share / current_price) * 100.0
+                    edge_pct = max(0.0, (0.55 * rr_ratio - 0.45) * risk_pct)
+                    risk_budget = self.available_capital * 0.005
+                    suggested_qty = int(risk_budget / risk_per_share) if risk_per_share > 0 else 0
+                    expiry_time = et_now.replace(hour=15, minute=0, second=0, microsecond=0).astimezone(pytz.UTC)
+
+                    trade_candidates.append(TradeCandidate(
+                        strategy_name=self.name,
+                        candidate_type=candidate_type,
+                        symbol=symbol,
+                        direction=direction,
+                        entry_price=round(current_price, 2),
+                        stop_price=round(stop_price, 2),
+                        target_price=round(target_price, 2),
+                        risk_dollars=round(risk_per_share * max(1, suggested_qty), 2),
+                        suggested_qty=suggested_qty,
+                        risk_reward_ratio=round(rr_ratio, 2),
+                        confidence=round(confidence, 2),
+                        edge_estimate_pct=round(edge_pct, 2),
+                        regime_fit=round(regime_fit, 2),
+                        catalyst=f"vwap_z_{abs_z:.1f}_{direction}_revert",
+                        time_horizon_minutes=240,
+                        expiry_time=expiry_time,
+                        metadata={
+                            "z_score": round(z_score, 2),
+                            "vwap": round(vwap_price, 2),
+                            "volume_ratio": round(vol_ratio, 2),
+                        },
+                    ))
+                    candidates.append({
+                        "symbol": symbol,
+                        "z_score": round(z_score, 2),
+                        "vwap": round(vwap_price, 2),
+                        "volume_ratio": round(vol_ratio, 2),
+                        "direction": direction,
+                    })
                 except Exception:
                     continue
 
-            if not candidates:
+            if not trade_candidates:
                 return OpportunityAssessment()
 
-            avg_z = sum(abs(c["z_score"]) for c in candidates) / len(candidates)
-            confidence = min(1.0, len(candidates) * 0.12 + (avg_z - self._min_z_score) * 0.15)
+            trade_candidates.sort(key=lambda c: c.expected_value, reverse=True)
+            top_candidates = trade_candidates[:3]
+            avg_rr = sum(c.risk_reward_ratio for c in trade_candidates) / len(trade_candidates)
+            avg_conf = sum(c.confidence for c in trade_candidates) / len(trade_candidates)
+            avg_edge = sum(c.edge_estimate_pct for c in trade_candidates) / len(trade_candidates)
 
             return OpportunityAssessment(
-                num_candidates=len(candidates),
-                avg_risk_reward=self._target_pct / self._stop_pct if self._stop_pct > 0 else 2.0,
-                confidence=round(max(0.0, confidence), 2),
-                estimated_daily_trades=min(len(candidates), self.config.max_positions),
-                estimated_edge_pct=round(0.15 * avg_z, 2),
+                num_candidates=len(trade_candidates),
+                avg_risk_reward=round(max(0.0, avg_rr), 2),
+                confidence=round(max(0.0, min(1.0, avg_conf)), 2),
+                estimated_daily_trades=min(len(trade_candidates), self.config.max_positions),
+                estimated_edge_pct=round(max(0.0, avg_edge), 2),
                 details=candidates[:5],
+                candidates=top_candidates,
             )
         except Exception:
             self._log.debug("assess_opportunities_failed")

@@ -210,7 +210,11 @@ __marimo__/
 .claude/
 
 # AlgoTrader runtime data
+data/
 data/state/
 data/logs/
 data/journal/
 data/cache/
+*.db
+*.pyc
+.venv/

@@ -92,3 +92,20 @@ modifiers:
   pre_event_day:
     options_premium: -0.2    # Don't sell premium day before FOMC
     event_driven: 0.3        # Start positioning
+
+# Brain candidate-level bonuses
+candidate_bonuses:
+  trending_up:
+    momentum: 0.10
+    options_premium: 0.05
+  trending_down:
+    momentum: 0.10
+  ranging:
+    pairs_trading: 0.10
+    vwap_reversion: 0.10
+    options_premium: 0.08
+  high_vol:
+    options_premium: 0.15
+  event_day:
+    event_driven: 0.15
+    options_premium: -0.20

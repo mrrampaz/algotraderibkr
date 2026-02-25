@@ -9,8 +9,9 @@ from __future__ import annotations
 import json
 import signal as os_signal
 import time
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytz
 import structlog
@@ -46,6 +47,9 @@ from algotrader.tracking.alerts import (
 )
 
 logger = structlog.get_logger()
+
+if TYPE_CHECKING:
+    from algotrader.strategy_selector.brain import BrainDecision, DailyBrain
 
 
 class Orchestrator:
@@ -146,49 +150,84 @@ class Orchestrator:
         self._event_calendar = EventCalendar()
         self._current_regime: MarketRegime | None = None
 
-        # Strategy selector (Phase 4)
+        # Strategy selector: Daily Brain (new) or classic scorer/allocator path.
         self._scorer: StrategyScorer | None = None
         self._allocator: CapitalAllocator | None = None
         self._reviewer: MidDayReviewer | None = None
+        self._brain: DailyBrain | None = None
+        self._use_brain: bool = False
+        self._last_brain_open_decision: date | None = None
+        self._last_brain_midday_review: date | None = None
+
         if settings.strategy_selector.enabled:
             try:
                 regime_config = load_yaml(settings.strategy_selector.regime_config)
-                self._scorer = StrategyScorer(
-                    regime_config=regime_config,
-                    trade_journal=self._trade_journal,
-                    event_calendar=self._event_calendar,
-                    total_capital=settings.trading.total_capital,
-                )
-                self._allocator = CapitalAllocator(
-                    total_capital=settings.trading.total_capital,
-                    risk_config=settings.risk,
-                    strategy_configs=settings.strategies,
-                    min_allocation_pct=settings.strategy_selector.min_allocation_pct,
-                    cash_threshold=settings.strategy_selector.cash_threshold,
-                    max_single_strategy_pct=settings.strategy_selector.max_single_strategy_pct,
-                    concentration_power=settings.strategy_selector.concentration_power,
-                )
-                self._reviewer = MidDayReviewer(
-                    scorer=self._scorer,
-                    allocator=self._allocator,
-                    event_bus=self._event_bus,
-                    strategy_configs=settings.strategies,
-                    total_capital=settings.trading.total_capital,
-                    review_hour=settings.strategy_selector.review_hour,
-                    review_minute=settings.strategy_selector.review_minute,
-                    scale_down_threshold_pct=settings.strategy_selector.scale_down_threshold_pct,
-                    disable_threshold_pct=settings.strategy_selector.disable_threshold_pct,
-                    scale_up_threshold_pct=settings.strategy_selector.scale_up_threshold_pct,
-                    scale_up_factor=settings.strategy_selector.scale_up_factor,
-                    scale_down_factor=settings.strategy_selector.scale_down_factor,
-                    min_trades_for_review=settings.strategy_selector.min_trades_for_review,
-                )
-                self._log.info("strategy_selector_initialized")
+                selector_mode = settings.strategy_selector.mode.lower().strip()
+
+                if selector_mode == "brain":
+                    from algotrader.strategy_selector.brain import DailyBrain
+
+                    brain_cfg = settings.strategy_selector.brain
+                    self._brain = DailyBrain(
+                        total_capital=settings.trading.total_capital,
+                        regime_config=regime_config,
+                        trade_journal=self._trade_journal,
+                        event_calendar=self._event_calendar,
+                        min_confidence=brain_cfg.min_confidence,
+                        min_risk_reward=brain_cfg.min_risk_reward,
+                        min_edge_pct=brain_cfg.min_edge_pct,
+                        max_daily_trades=brain_cfg.max_daily_trades,
+                        max_capital_per_trade_pct=brain_cfg.max_capital_per_trade_pct,
+                        max_daily_risk_pct=brain_cfg.max_daily_risk_pct,
+                        cash_is_default=brain_cfg.cash_is_default,
+                        regime_mismatch_penalty=brain_cfg.regime_mismatch_penalty,
+                        correlation_penalty=brain_cfg.correlation_penalty,
+                        recent_loss_cooldown_hours=brain_cfg.recent_loss_cooldown_hours,
+                        midday_confidence_multiplier=brain_cfg.midday_confidence_multiplier,
+                        midday_pnl_stop_pct=brain_cfg.midday_pnl_stop_pct,
+                    )
+                    self._use_brain = True
+                    self._log.info("strategy_selector_initialized", mode="brain")
+                else:
+                    self._scorer = StrategyScorer(
+                        regime_config=regime_config,
+                        trade_journal=self._trade_journal,
+                        event_calendar=self._event_calendar,
+                        total_capital=settings.trading.total_capital,
+                    )
+                    self._allocator = CapitalAllocator(
+                        total_capital=settings.trading.total_capital,
+                        risk_config=settings.risk,
+                        strategy_configs=settings.strategies,
+                        min_allocation_pct=settings.strategy_selector.min_allocation_pct,
+                        cash_threshold=settings.strategy_selector.cash_threshold,
+                        max_single_strategy_pct=settings.strategy_selector.max_single_strategy_pct,
+                        concentration_power=settings.strategy_selector.concentration_power,
+                    )
+                    self._reviewer = MidDayReviewer(
+                        scorer=self._scorer,
+                        allocator=self._allocator,
+                        event_bus=self._event_bus,
+                        strategy_configs=settings.strategies,
+                        total_capital=settings.trading.total_capital,
+                        review_hour=settings.strategy_selector.review_hour,
+                        review_minute=settings.strategy_selector.review_minute,
+                        scale_down_threshold_pct=settings.strategy_selector.scale_down_threshold_pct,
+                        disable_threshold_pct=settings.strategy_selector.disable_threshold_pct,
+                        scale_up_threshold_pct=settings.strategy_selector.scale_up_threshold_pct,
+                        scale_up_factor=settings.strategy_selector.scale_up_factor,
+                        scale_down_factor=settings.strategy_selector.scale_down_factor,
+                        min_trades_for_review=settings.strategy_selector.min_trades_for_review,
+                    )
+                    self._use_brain = False
+                    self._log.info("strategy_selector_initialized", mode="classic")
             except Exception:
                 self._log.exception("strategy_selector_init_failed")
                 self._scorer = None
                 self._allocator = None
                 self._reviewer = None
+                self._brain = None
+                self._use_brain = False
 
         # Phase 5: Metrics, Attribution, Learner
         self._metrics = MetricsCalculator(trade_journal=self._trade_journal)
@@ -406,8 +445,58 @@ class Orchestrator:
         # Check pending orders
         self._order_manager.check_orders()
 
-        # Mid-day review (strategy selector)
-        if self._reviewer:
+        # Daily Brain: open decision + mid-day review
+        if self._use_brain and self._brain and self._current_regime:
+            try:
+                if self._needs_brain_open_decision():
+                    assessments = self._assess_all_strategies(self._current_regime)
+                    decision = self._brain.decide(
+                        regime=self._current_regime,
+                        assessments=assessments,
+                        current_positions=self._executor.get_positions(),
+                        daily_pnl=self._get_daily_pnl(),
+                        vix_level=self._current_regime.vix_level,
+                    )
+                    self._apply_brain_decision(decision, context="market_open")
+                    self._last_brain_open_decision = datetime.now(
+                        pytz.timezone("America/New_York"),
+                    ).date()
+
+                if self._needs_brain_midday_review():
+                    assessments = self._assess_all_strategies(self._current_regime)
+                    decision = self._brain.review_midday(
+                        regime=self._current_regime,
+                        assessments=assessments,
+                        current_positions=self._executor.get_positions(),
+                        daily_pnl=self._get_daily_pnl(),
+                        vix_level=self._current_regime.vix_level,
+                    )
+                    self._apply_brain_decision(decision, context="midday")
+
+                    # Handle explicit close recommendations from the brain.
+                    for rejection in decision.rejected_trades:
+                        if not rejection.reason.startswith("close_early:"):
+                            continue
+                        symbol = rejection.candidate.symbol
+                        try:
+                            closed = self._executor.close_position(symbol)
+                            if closed:
+                                self._log.info(
+                                    "brain_close_early_executed",
+                                    symbol=symbol,
+                                    reason=rejection.reason,
+                                )
+                        except Exception:
+                            self._log.exception("brain_close_early_failed", symbol=symbol)
+
+                    self._last_brain_midday_review = datetime.now(
+                        pytz.timezone("America/New_York"),
+                    ).date()
+            except Exception:
+                self._log.exception("brain_cycle_decision_failed")
+
+        # Classic selector path (legacy scorer/allocator/reviewer)
+        elif self._reviewer:
             try:
                 if self._reviewer.needs_review:
                     actions = self._reviewer.review(
@@ -558,8 +647,22 @@ class Orchestrator:
             except Exception:
                 self._log.exception("premarket_volume_refresh_failed")
 
-        # 5. Re-score strategies with fresh data
-        if self._scorer and self._allocator and self._current_regime:
+        # 5. Refresh selector decisions with fresh data
+        if self._use_brain and self._brain and self._current_regime:
+            try:
+                assessments = self._assess_all_strategies(self._current_regime)
+                decision = self._brain.decide(
+                    regime=self._current_regime,
+                    assessments=assessments,
+                    current_positions=self._executor.get_positions(),
+                    daily_pnl=self._get_daily_pnl(),
+                    vix_level=self._current_regime.vix_level,
+                )
+                self._apply_brain_decision(decision, context="premarket_refresh")
+            except Exception:
+                self._log.exception("premarket_brain_refresh_failed")
+
+        elif self._scorer and self._allocator and self._current_regime:
             try:
                 strategy_names = list(self._strategies.keys())
                 assessments = self._assess_all_strategies(self._current_regime)
@@ -669,8 +772,22 @@ class Orchestrator:
         except Exception:
             self._log.exception("news_fetch_failed")
 
-        # 6. Score strategies and allocate capital based on initial regime
-        if self._scorer and self._allocator and self._current_regime:
+        # 6. Initial selector decision for the day
+        if self._use_brain and self._brain and self._current_regime:
+            try:
+                assessments = self._assess_all_strategies(self._current_regime)
+                decision = self._brain.decide(
+                    regime=self._current_regime,
+                    assessments=assessments,
+                    current_positions=self._executor.get_positions(),
+                    daily_pnl=self._get_daily_pnl(),
+                    vix_level=self._current_regime.vix_level,
+                )
+                self._apply_brain_decision(decision, context="pre_market")
+            except Exception:
+                self._log.exception("pre_market_brain_decision_failed")
+
+        elif self._scorer and self._allocator and self._current_regime:
             try:
                 strategy_names = list(self._strategies.keys())
                 assessments = self._assess_all_strategies(self._current_regime)
@@ -854,6 +971,78 @@ class Orchestrator:
             except Exception:
                 pass
 
+    def _get_daily_pnl(self) -> float:
+        """Get current day P&L from live portfolio snapshot."""
+        try:
+            snapshot = self._portfolio_tracker.get_snapshot()
+            return float(snapshot.get("daily_pnl", 0.0))
+        except Exception:
+            return 0.0
+
+    def _needs_brain_open_decision(self) -> bool:
+        """Run one brain open decision shortly after market open each day."""
+        et_now = datetime.now(pytz.timezone("America/New_York"))
+        today = et_now.date()
+        if self._last_brain_open_decision == today:
+            return False
+
+        open_minutes = et_now.hour * 60 + et_now.minute
+        return open_minutes >= (9 * 60 + 30)
+
+    def _needs_brain_midday_review(self) -> bool:
+        """Run one brain midday review per day at configured review time."""
+        et_now = datetime.now(pytz.timezone("America/New_York"))
+        today = et_now.date()
+        if self._last_brain_midday_review == today:
+            return False
+
+        review_hour = self._settings.strategy_selector.review_hour
+        review_minute = self._settings.strategy_selector.review_minute
+        current_minutes = et_now.hour * 60 + et_now.minute
+        review_minutes = review_hour * 60 + review_minute
+        return current_minutes >= review_minutes and et_now.hour < 16
+
+    def _apply_brain_decision(self, decision: BrainDecision, context: str = "") -> None:
+        """Apply a BrainDecision to strategy capital controls."""
+        self._log.info(
+            "brain_decision",
+            context=context,
+            num_selected=decision.num_trades,
+            is_cash_day=decision.is_cash_day,
+            cash_pct=decision.cash_pct,
+            total_risk_pct=decision.total_risk_pct,
+            reasoning=decision.reasoning,
+        )
+
+        # Enable capital only for selected strategies. Multiple selected candidates
+        # from the same strategy share a summed capital budget.
+        strategy_capital: dict[str, float] = {}
+        for selection in decision.selected_trades:
+            name = selection.candidate.strategy_name
+            strategy_capital[name] = strategy_capital.get(name, 0.0) + selection.allocated_capital
+
+        for strategy_name, capital in strategy_capital.items():
+            strategy = self._strategies.get(strategy_name)
+            if strategy is None:
+                continue
+            strategy.set_capital(capital)
+            if not strategy.is_enabled:
+                strategy.enable()
+
+        active_strategies = set(strategy_capital.keys())
+        for name, strategy in self._strategies.items():
+            if name not in active_strategies:
+                strategy.set_capital(0.0)  # Allow existing positions to keep being managed
+
+        self._save_brain_decision(decision)
+
+    def _save_brain_decision(self, decision: BrainDecision) -> None:
+        """Save latest brain decision for dashboard and diagnostics."""
+        state = decision.to_dict()
+        path = Path("data/state/brain_decision.json")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(state, indent=2, default=str))
+
     def _write_todays_plan(self, scores: list, allocations: list) -> None:
         """Write consolidated today's plan state for the dashboard."""
         state_dir = Path("data/state")
@@ -953,8 +1142,12 @@ class Orchestrator:
             total=len(assessments),
             with_opportunities=len(with_opps),
             details={
-                n: {"candidates": a.num_candidates, "confidence": a.confidence,
-                     "rr": a.avg_risk_reward}
+                n: {
+                    "aggregate_candidates": a.num_candidates,
+                    "explicit_candidates": len(a.candidates),
+                    "confidence": a.confidence,
+                    "rr": a.avg_risk_reward,
+                }
                 for n, a in with_opps.items()
             },
         )
@@ -973,6 +1166,8 @@ class Orchestrator:
                     "confidence": round(a.confidence, 2),
                     "estimated_daily_trades": a.estimated_daily_trades,
                     "estimated_edge_pct": round(a.estimated_edge_pct, 2),
+                    "candidates_count": len(a.candidates),
+                    "top_candidate_ev": round(a.top_candidate.expected_value, 4) if a.top_candidate else 0.0,
                     "details": a.details,
                 })
             with open(state_dir / "assessments.json", "w") as f:

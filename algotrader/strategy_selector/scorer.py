@@ -18,6 +18,7 @@ import structlog
 from algotrader.core.models import MarketRegime
 from algotrader.intelligence.calendar.events import EventCalendar
 from algotrader.strategies.base import OpportunityAssessment
+from algotrader.strategy_selector.candidate import TradeCandidate
 from algotrader.tracking.journal import TradeJournal
 
 logger = structlog.get_logger()
@@ -37,6 +38,16 @@ class StrategyScore:
     opportunity_score: float    # From OpportunityAssessment quality
     is_active: bool             # True if score >= min_activation_score
     assessment: OpportunityAssessment | None = None
+
+
+@dataclass
+class CandidateScore:
+    """Brain-style score for a single trade candidate."""
+
+    candidate: TradeCandidate
+    score: float
+    rejected: bool = False
+    reason: str = ""
 
 
 class StrategyScorer:
@@ -227,3 +238,34 @@ class StrategyScorer:
             return self._pre_event_day.get(strategy_name, 0.0)
 
         return 0.0
+
+
+def score_candidate_brain_style(
+    candidate: TradeCandidate,
+    regime_mismatch_penalty: float = 0.5,
+    correlation_penalty: float = 0.3,
+    correlation: float = 0.0,
+    losing_strategy_today: bool = False,
+    strong_catalyst: bool = False,
+    elevated_vix_premium_selling: bool = False,
+) -> float:
+    """Shared brain-style candidate score formula used by DailyBrain."""
+    score = (
+        candidate.confidence * 0.35
+        + min(candidate.risk_reward_ratio / 4.0, 1.0) * 0.25
+        + min(candidate.edge_estimate_pct / 2.0, 1.0) * 0.25
+        + candidate.regime_fit * 0.15
+    )
+
+    if candidate.regime_fit < 0.35:
+        score *= regime_mismatch_penalty
+    if correlation > 0:
+        score *= max(0.0, 1.0 - (correlation_penalty * correlation))
+    if losing_strategy_today:
+        score *= 0.7
+    if strong_catalyst:
+        score *= 1.15
+    if elevated_vix_premium_selling:
+        score *= 1.1
+
+    return round(max(0.0, min(1.0, score)), 4)

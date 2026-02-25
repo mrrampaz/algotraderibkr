@@ -47,31 +47,39 @@ alerts:
 
 strategy_selector:
   enabled: true
+  mode: "brain"                 # "brain" (new) or "classic" (legacy)
   regime_config: "config/regimes.yaml"
 
-  # Minimum score to receive capital allocation
-  min_activation_score: 0.35
+  # Brain-specific config (used when mode = "brain")
+  brain:
+    min_confidence: 0.60
+    min_risk_reward: 1.5
+    min_edge_pct: 0.3
+    max_daily_trades: 5
+    max_capital_per_trade_pct: 20.0
+    max_daily_risk_pct: 2.0
+    cash_is_default: true
+    regime_mismatch_penalty: 0.5
+    correlation_penalty: 0.3
+    recent_loss_cooldown_hours: 4
+    midday_confidence_multiplier: 1.2
+    midday_pnl_stop_pct: -1.0
 
-  # Mid-day review
+  # Classic mode config (used when mode = "classic")
+  min_activation_score: 0.35
   review_hour: 12              # Noon ET
   review_minute: 0
-
-  # Allocation bounds
-  min_allocation_pct: 3.0      # Floor: 3% if active
-  max_total_deployment_pct: 80.0  # Max total deployed (matches risk.max_gross_exposure_pct)
-
-  # Concentration allocation
-  cash_threshold: 0.25              # Sit in cash if best score below this
-  max_single_strategy_pct: 70.0     # Allow heavy concentration on top scorer
-  concentration_power: 2.0          # Power law exponent for weighting
-
-  # Performance-based scaling
-  scale_down_threshold_pct: -0.5    # Scale down if losing > 0.5% of allocation
-  disable_threshold_pct: -0.8       # Disable if losing > 0.8%
-  scale_up_threshold_pct: 0.3       # Scale up if winning > 0.3%
-  scale_up_factor: 1.25             # Scale up by 25%
-  scale_down_factor: 0.5            # Scale down by 50%
-  min_trades_for_review: 2          # Need at least 2 trades before judging
+  min_allocation_pct: 3.0
+  max_total_deployment_pct: 80.0
+  cash_threshold: 0.25
+  max_single_strategy_pct: 70.0
+  concentration_power: 2.0
+  scale_down_threshold_pct: -0.5
+  disable_threshold_pct: -0.8
+  scale_up_threshold_pct: 0.3
+  scale_up_factor: 1.25
+  scale_down_factor: 0.5
+  min_trades_for_review: 2
 
 # Strategy configs can also be loaded from config/strategies/<name>.yaml
 # Total allocation = 95%. Strategies won't all be active simultaneously

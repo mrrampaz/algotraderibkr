@@ -414,6 +414,8 @@ class SectorRotationStrategy(StrategyBase):
     def assess_opportunities(self, regime: MarketRegime | None = None) -> OpportunityAssessment:
         """Assess sector rotation opportunities via relative strength."""
         try:
+            from algotrader.strategy_selector.candidate import CandidateType, TradeCandidate
+
             # Regime gate
             if regime and regime.regime_type.value not in self._allowed_regimes:
                 return OpportunityAssessment()
@@ -445,23 +447,121 @@ class SectorRotationStrategy(StrategyBase):
                 return OpportunityAssessment()
 
             divergence = sorted_rs[0][1] - sorted_rs[-1][1] if len(sorted_rs) >= 2 else 0.0
-            confidence = min(1.0, len(candidates) * 0.12 + divergence * 0.05)
+            if not longs or not shorts:
+                return OpportunityAssessment(
+                    num_candidates=0,
+                    confidence=0.0,
+                    details=[{"reason": "need_both_long_and_short_legs", "divergence": round(divergence, 2)}],
+                    candidates=[],
+                )
+
+            long_symbol = longs[0]
+            short_symbol = shorts[0]
+            long_rs = self._rs_scores.get(long_symbol, 0.0)
+            short_rs = self._rs_scores.get(short_symbol, 0.0)
+            long_price = self._get_current_price(long_symbol)
+            short_price = self._get_current_price(short_symbol)
+
+            if not long_price or long_price <= 0:
+                return OpportunityAssessment()
+
+            stop_price = long_price * (1 - self._stop_pct / 100)
+            target_price = long_price + (long_price * self._stop_pct / 100 * 1.5)
+            risk_per_share = abs(long_price - stop_price)
+            reward_per_share = abs(target_price - long_price)
+            rr_ratio = reward_per_share / risk_per_share if risk_per_share > 0 else 0.0
+
+            confidence = 0.10
+            if divergence > 3.0:
+                confidence += 0.25
+            elif divergence >= 2.0:
+                confidence += 0.15
+
+            if abs(long_rs) >= self._rs_long_threshold * 1.2 and abs(short_rs) >= abs(self._rs_short_threshold) * 1.2:
+                confidence += 0.15
+
+            regime_fit = 0.5
+            if regime:
+                regime_type = regime.regime_type.value
+                if regime_type in ("trending_up", "trending_down"):
+                    regime_fit = 0.7
+                    confidence += 0.20
+                elif regime_type == "ranging":
+                    regime_fit = 0.5
+                    confidence += 0.10
+                elif regime_type == "high_vol":
+                    regime_fit = 0.4
+                else:
+                    regime_fit = 0.5
+
+            try:
+                vol_confirmed = False
+                if short_price and short_price > 0:
+                    long_bars = self.data_provider.get_bars(long_symbol, "1Day", 6)
+                    short_bars = self.data_provider.get_bars(short_symbol, "1Day", 6)
+                    if not long_bars.empty and not short_bars.empty and len(long_bars) >= 6 and len(short_bars) >= 6:
+                        long_ratio = float(long_bars["volume"].iloc[-1]) / max(1.0, float(long_bars["volume"].iloc[-6:-1].mean()))
+                        short_ratio = float(short_bars["volume"].iloc[-1]) / max(1.0, float(short_bars["volume"].iloc[-6:-1].mean()))
+                        vol_confirmed = long_ratio >= 1.1 and short_ratio >= 1.1
+                if vol_confirmed:
+                    confidence += 0.10
+            except Exception:
+                pass
+
+            confidence = min(1.0, max(0.0, confidence))
+            risk_pct = (risk_per_share / long_price) * 100.0 if long_price > 0 else 0.0
+            edge_pct = max(0.0, (0.50 * rr_ratio - 0.50) * risk_pct)
+            risk_budget = self.available_capital * 0.005
+            suggested_qty = int(risk_budget / risk_per_share) if risk_per_share > 0 else 0
+
+            trade_candidate = TradeCandidate(
+                strategy_name=self.name,
+                candidate_type=CandidateType.SECTOR_LONG_SHORT,
+                symbol=long_symbol,
+                direction="long",
+                entry_price=round(long_price, 2),
+                stop_price=round(stop_price, 2),
+                target_price=round(target_price, 2),
+                risk_dollars=round(risk_per_share * max(1, suggested_qty), 2),
+                suggested_qty=suggested_qty,
+                risk_reward_ratio=round(rr_ratio, 2),
+                confidence=round(confidence, 2),
+                edge_estimate_pct=round(edge_pct, 2),
+                regime_fit=round(regime_fit, 2),
+                catalyst=f"rotation_{long_symbol}_vs_{short_symbol}_div_{divergence:.1f}pct",
+                symbol_b=short_symbol,
+                metadata={
+                    "long_symbol": long_symbol,
+                    "short_symbol": short_symbol,
+                    "long_rs": round(long_rs, 2),
+                    "short_rs": round(short_rs, 2),
+                    "divergence": round(divergence, 2),
+                    "long_price": round(long_price, 2),
+                    "short_price": round(short_price, 2) if short_price else 0.0,
+                },
+            )
 
             return OpportunityAssessment(
-                num_candidates=len(candidates),
-                avg_risk_reward=2.0,
+                num_candidates=1,
+                avg_risk_reward=round(max(0.0, rr_ratio), 2),
                 confidence=round(max(0.0, confidence), 2),
-                estimated_daily_trades=min(len(candidates), self.config.max_positions - len(self._trades)),
-                estimated_edge_pct=round(divergence * 0.1, 2),
+                estimated_daily_trades=min(1, self.config.max_positions - len(self._trades)),
+                estimated_edge_pct=round(max(0.0, edge_pct), 2),
                 details=[
                     {
-                        "symbol": s,
-                        "sector": self._sectors.get(s, ""),
-                        "rs": round(self._rs_scores.get(s, 0.0), 2),
-                        "side": "long" if s in longs else "short",
+                        "symbol": long_symbol,
+                        "sector": self._sectors.get(long_symbol, ""),
+                        "rs": round(long_rs, 2),
+                        "side": "long",
+                    },
+                    {
+                        "symbol": short_symbol,
+                        "sector": self._sectors.get(short_symbol, ""),
+                        "rs": round(short_rs, 2),
+                        "side": "short",
                     }
-                    for s in candidates[:5]
                 ],
+                candidates=[trade_candidate],
             )
         except Exception:
             self._log.debug("assess_opportunities_failed")

@@ -559,6 +559,8 @@ class PairsTradingStrategy(StrategyBase):
     def assess_opportunities(self, regime: MarketRegime | None = None) -> OpportunityAssessment:
         """Assess pairs with cointegration and z-scores near entry."""
         try:
+            from algotrader.strategy_selector.candidate import CandidateType, TradeCandidate
+
             cointegrated = [
                 s for s in self._pair_states.values()
                 if s.is_cointegrated and not s.is_positioned
@@ -581,26 +583,153 @@ class PairsTradingStrategy(StrategyBase):
                         {"pair": s.config.pair_id, "z": round(s.z_score, 2)}
                         for s in cointegrated[:5]
                     ],
+                    candidates=[],
                 )
 
-            avg_z = sum(abs(s.z_score) for s in near_entry) / len(near_entry)
-            # Higher z-score = better setup, but cap confidence
-            confidence = min(1.0, len(near_entry) * 0.15 + (avg_z - self._z_entry) * 0.2)
+            details: list[dict] = []
+            trade_candidates: list[TradeCandidate] = []
+            capital_per_pair = self._total_capital * (self._per_pair_capital_pct / 100) if self._total_capital > 0 else 0.0
+
+            for state in near_entry:
+                pair = state.config
+                bars_a = self.data_provider.get_bars(pair.symbol_a, self._bar_timeframe, 1)
+                bars_b = self.data_provider.get_bars(pair.symbol_b, self._bar_timeframe, 1)
+                if bars_a.empty or bars_b.empty:
+                    continue
+
+                price_a = float(bars_a["close"].iloc[-1])
+                price_b = float(bars_b["close"].iloc[-1])
+                if price_a <= 0 or price_b <= 0 or state.spread_std <= 0:
+                    continue
+
+                z_abs = abs(state.z_score)
+                if z_abs <= 0:
+                    continue
+
+                # Anti-churn filter: expected move must beat transaction costs by 3x.
+                estimated_profit = abs(state.z_score - self._z_exit) / z_abs * capital_per_pair
+                estimated_cost = capital_per_pair * 0.002
+                if capital_per_pair > 0 and estimated_profit < (3.0 * estimated_cost):
+                    continue
+
+                target_z = self._z_exit if state.z_score > 0 else -self._z_exit
+                stop_z = self._z_stop if state.z_score > 0 else -self._z_stop
+                target_spread = state.spread_mean + target_z * state.spread_std
+                stop_spread = state.spread_mean + stop_z * state.spread_std
+                target_price_a = target_spread + state.hedge_ratio * price_b
+                stop_price_a = stop_spread + state.hedge_ratio * price_b
+
+                risk_per_share = abs(price_a - stop_price_a)
+                reward_per_share = abs(target_price_a - price_a)
+                if risk_per_share <= 0:
+                    continue
+                rr_ratio = reward_per_share / risk_per_share if risk_per_share > 0 else 0.0
+
+                direction = "short" if state.z_score > 0 else "long"
+                confidence = 0.10
+                if state.cointegration_pvalue < 0.01:
+                    confidence += 0.25
+                elif state.cointegration_pvalue < 0.05:
+                    confidence += 0.15
+
+                if state.correlation > 0.85:
+                    confidence += 0.15
+                elif state.correlation >= 0.70:
+                    confidence += 0.10
+
+                if z_abs > 2.0:
+                    confidence += 0.15
+                elif z_abs >= 1.5:
+                    confidence += 0.10
+
+                regime_fit = 0.6
+                if regime:
+                    regime_type = regime.regime_type.value
+                    if regime_type == "ranging":
+                        regime_fit = 0.9
+                        confidence += 0.15
+                    elif regime_type in ("trending_up", "trending_down"):
+                        regime_fit = 0.6
+                        confidence += 0.05
+                    elif regime_type == "high_vol":
+                        regime_fit = 0.4
+                    else:
+                        regime_fit = 0.5
+
+                confidence = min(1.0, max(0.0, confidence))
+                risk_pct = (risk_per_share / price_a) * 100.0
+                edge_pct = max(0.0, (0.55 * rr_ratio - 0.45) * risk_pct)
+
+                suggested_qty = int((capital_per_pair / (2.0 * price_a))) if price_a > 0 and capital_per_pair > 0 else 0
+                risk_dollars = risk_per_share * max(1, suggested_qty)
+
+                trade_candidates.append(TradeCandidate(
+                    strategy_name=self.name,
+                    candidate_type=CandidateType.PAIRS,
+                    symbol=f"{pair.symbol_a}/{pair.symbol_b}",
+                    direction=direction,
+                    entry_price=round(price_a, 2),
+                    stop_price=round(stop_price_a, 2),
+                    target_price=round(target_price_a, 2),
+                    risk_dollars=round(risk_dollars, 2),
+                    suggested_qty=suggested_qty,
+                    risk_reward_ratio=round(rr_ratio, 2),
+                    confidence=round(confidence, 2),
+                    edge_estimate_pct=round(edge_pct, 2),
+                    regime_fit=round(regime_fit, 2),
+                    catalyst=f"coint_z_{state.z_score:.1f}_corr_{state.correlation:.2f}",
+                    symbol_b=pair.symbol_b,
+                    hedge_ratio=round(state.hedge_ratio, 4),
+                    z_score=round(state.z_score, 2),
+                    metadata={
+                        "pair_id": pair.pair_id,
+                        "symbol_a": pair.symbol_a,
+                        "symbol_b": pair.symbol_b,
+                        "correlation": round(state.correlation, 3),
+                        "cointegration_pvalue": round(state.cointegration_pvalue, 4),
+                        "estimated_profit": round(estimated_profit, 2),
+                        "estimated_cost": round(estimated_cost, 2),
+                    },
+                ))
+                details.append(
+                    {
+                        "pair": pair.pair_id,
+                        "z_score": round(state.z_score, 2),
+                        "correlation": round(state.correlation, 2),
+                        "pvalue": round(state.cointegration_pvalue, 4),
+                    }
+                )
+
+            if not trade_candidates:
+                return OpportunityAssessment(
+                    num_candidates=0,
+                    avg_risk_reward=0.0,
+                    confidence=0.0,
+                    estimated_daily_trades=0,
+                    estimated_edge_pct=0.0,
+                    details=[
+                        {
+                            "reason": "pairs_filtered_by_antichurn",
+                            "near_entry": len(near_entry),
+                        }
+                    ],
+                    candidates=[],
+                )
+
+            trade_candidates.sort(key=lambda c: c.expected_value, reverse=True)
+            top_candidates = trade_candidates[:3]
+            avg_rr = sum(c.risk_reward_ratio for c in trade_candidates) / len(trade_candidates)
+            avg_conf = sum(c.confidence for c in trade_candidates) / len(trade_candidates)
+            avg_edge = sum(c.edge_estimate_pct for c in trade_candidates) / len(trade_candidates)
 
             return OpportunityAssessment(
-                num_candidates=len(near_entry),
-                avg_risk_reward=2.0,
-                confidence=round(max(0.0, confidence), 2),
-                estimated_daily_trades=min(len(near_entry), self._max_pairs),
-                estimated_edge_pct=round(0.2 * avg_z, 2),
-                details=[
-                    {
-                        "pair": s.config.pair_id,
-                        "z_score": round(s.z_score, 2),
-                        "correlation": round(s.correlation, 2),
-                    }
-                    for s in near_entry[:5]
-                ],
+                num_candidates=len(trade_candidates),
+                avg_risk_reward=round(max(0.0, avg_rr), 2),
+                confidence=round(max(0.0, min(1.0, avg_conf)), 2),
+                estimated_daily_trades=min(len(trade_candidates), self._max_pairs),
+                estimated_edge_pct=round(max(0.0, avg_edge), 2),
+                details=details[:5],
+                candidates=top_candidates,
             )
         except Exception:
             self._log.debug("assess_opportunities_failed")
