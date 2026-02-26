@@ -215,9 +215,21 @@ class PairsTradingStrategy(StrategyBase):
         # Get historical daily bars for cointegration test
         bars_a = self.data_provider.get_bars(pair.symbol_a, "1Day", self._lookback)
         bars_b = self.data_provider.get_bars(pair.symbol_b, "1Day", self._lookback)
+        self._log.info(
+            "pairs_data",
+            pair=pair.pair_id,
+            bars_a=len(bars_a) if bars_a is not None else 0,
+            bars_b=len(bars_b) if bars_b is not None else 0,
+            lookback=self._lookback,
+        )
 
         if bars_a.empty or bars_b.empty:
             state.is_cointegrated = False
+            self._log.info(
+                "pairs_cointegration_skipped",
+                pair=pair.pair_id,
+                reason="missing_daily_bars",
+            )
             return
 
         # Align on common dates
@@ -227,6 +239,12 @@ class PairsTradingStrategy(StrategyBase):
 
         if len(common_idx) < 60:  # Need at least 60 data points
             state.is_cointegrated = False
+            self._log.info(
+                "pairs_cointegration_skipped",
+                pair=pair.pair_id,
+                reason="insufficient_common_history",
+                common_points=len(common_idx),
+            )
             return
 
         prices_a = closes_a.loc[common_idx].values
@@ -236,6 +254,13 @@ class PairsTradingStrategy(StrategyBase):
         state.correlation = float(np.corrcoef(prices_a, prices_b)[0, 1])
         if state.correlation < self._min_correlation:
             state.is_cointegrated = False
+            self._log.info(
+                "pairs_cointegration_skipped",
+                pair=pair.pair_id,
+                reason="correlation_below_threshold",
+                correlation=round(state.correlation, 4),
+                min_correlation=self._min_correlation,
+            )
             return
 
         # Engle-Granger cointegration test
@@ -243,6 +268,14 @@ class PairsTradingStrategy(StrategyBase):
             score, pvalue, _ = coint(prices_a, prices_b)
             state.cointegration_pvalue = float(pvalue)
             state.is_cointegrated = pvalue < self._coint_pvalue
+            if not state.is_cointegrated:
+                self._log.info(
+                    "pairs_cointegration_skipped",
+                    pair=pair.pair_id,
+                    reason="pvalue_above_threshold",
+                    pvalue=round(state.cointegration_pvalue, 6),
+                    threshold=self._coint_pvalue,
+                )
         except Exception:
             state.is_cointegrated = False
             return
@@ -260,6 +293,11 @@ class PairsTradingStrategy(StrategyBase):
         state.spread_std = float(np.std(spread))
         if state.spread_std == 0:
             state.is_cointegrated = False
+            self._log.info(
+                "pairs_cointegration_skipped",
+                pair=pair.pair_id,
+                reason="zero_spread_std",
+            )
 
     def _update_z_score(self, state: PairState) -> None:
         """Update the current z-score for a pair using intraday bars."""
@@ -560,6 +598,7 @@ class PairsTradingStrategy(StrategyBase):
         """Assess pairs with cointegration and z-scores near entry."""
         self._log.info("assess_start", strategy=self.name)
         raw_scanned = len(self._pair_states)
+        regime_type = regime.regime_type.value if regime else "none"
 
         def _complete(assessment: OpportunityAssessment) -> OpportunityAssessment:
             self._log.info(
@@ -573,12 +612,38 @@ class PairsTradingStrategy(StrategyBase):
         try:
             from algotrader.strategy_selector.candidate import CandidateType, TradeCandidate
 
+            self._log.info(
+                "pairs_assess_context",
+                regime=regime_type,
+                total_pairs=len(self._pair_states),
+            )
+            filter_counts = {
+                "not_cointegrated_or_positioned": 0,
+                "below_entry_band": 0,
+                "missing_intraday_data": 0,
+                "invalid_price_or_spread": 0,
+                "antichurn_filtered": 0,
+                "candidate_built": 0,
+            }
             cointegrated = [
                 s for s in self._pair_states.values()
                 if s.is_cointegrated and not s.is_positioned
             ]
+            filter_counts["not_cointegrated_or_positioned"] = len(self._pair_states) - len(cointegrated)
+            self._log.info(
+                "pairs_cointegrated_pool",
+                regime=regime_type,
+                cointegrated=len(cointegrated),
+                total_pairs=len(self._pair_states),
+            )
 
             if not cointegrated:
+                self._log.info(
+                    "pairs_scan_result",
+                    regime=regime_type,
+                    final_candidates=0,
+                    filter_counts=filter_counts,
+                )
                 return _complete(OpportunityAssessment())
 
             # Count pairs near entry threshold
@@ -586,8 +651,16 @@ class PairsTradingStrategy(StrategyBase):
             for s in cointegrated:
                 if abs(s.z_score) >= self._z_entry * 0.7:
                     near_entry.append(s)
+                else:
+                    filter_counts["below_entry_band"] += 1
 
             if not near_entry:
+                self._log.info(
+                    "pairs_scan_result",
+                    regime=regime_type,
+                    final_candidates=0,
+                    filter_counts=filter_counts,
+                )
                 return _complete(OpportunityAssessment(
                     num_candidates=0,
                     confidence=0.1,
@@ -607,21 +680,32 @@ class PairsTradingStrategy(StrategyBase):
                 bars_a = self.data_provider.get_bars(pair.symbol_a, self._bar_timeframe, 1)
                 bars_b = self.data_provider.get_bars(pair.symbol_b, self._bar_timeframe, 1)
                 if bars_a.empty or bars_b.empty:
+                    filter_counts["missing_intraday_data"] += 1
                     continue
+                self._log.debug(
+                    "pairs_intraday_data",
+                    pair=pair.pair_id,
+                    bars_a=len(bars_a),
+                    bars_b=len(bars_b),
+                    timeframe=self._bar_timeframe,
+                )
 
                 price_a = float(bars_a["close"].iloc[-1])
                 price_b = float(bars_b["close"].iloc[-1])
                 if price_a <= 0 or price_b <= 0 or state.spread_std <= 0:
+                    filter_counts["invalid_price_or_spread"] += 1
                     continue
 
                 z_abs = abs(state.z_score)
                 if z_abs <= 0:
+                    filter_counts["invalid_price_or_spread"] += 1
                     continue
 
                 # Anti-churn filter: expected move must beat transaction costs by 3x.
                 estimated_profit = abs(state.z_score - self._z_exit) / z_abs * capital_per_pair
                 estimated_cost = capital_per_pair * 0.002
                 if capital_per_pair > 0 and estimated_profit < (3.0 * estimated_cost):
+                    filter_counts["antichurn_filtered"] += 1
                     continue
 
                 target_z = self._z_exit if state.z_score > 0 else -self._z_exit
@@ -711,8 +795,15 @@ class PairsTradingStrategy(StrategyBase):
                         "pvalue": round(state.cointegration_pvalue, 4),
                     }
                 )
+                filter_counts["candidate_built"] += 1
 
             if not trade_candidates:
+                self._log.info(
+                    "pairs_scan_result",
+                    regime=regime_type,
+                    final_candidates=0,
+                    filter_counts=filter_counts,
+                )
                 return _complete(OpportunityAssessment(
                     num_candidates=0,
                     avg_risk_reward=0.0,
@@ -733,6 +824,12 @@ class PairsTradingStrategy(StrategyBase):
             avg_rr = sum(c.risk_reward_ratio for c in trade_candidates) / len(trade_candidates)
             avg_conf = sum(c.confidence for c in trade_candidates) / len(trade_candidates)
             avg_edge = sum(c.edge_estimate_pct for c in trade_candidates) / len(trade_candidates)
+            self._log.info(
+                "pairs_scan_result",
+                regime=regime_type,
+                final_candidates=len(top_candidates),
+                filter_counts=filter_counts,
+            )
 
             return _complete(OpportunityAssessment(
                 num_candidates=len(trade_candidates),

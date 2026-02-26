@@ -689,28 +689,38 @@ class OptionsPremiumStrategy(StrategyBase):
         """Assess options premium selling conditions."""
         self._log.info("assess_start", strategy=self.name)
         raw_scanned = 0
+        regime_type = regime.regime_type.value if regime else "none"
+
+        def _complete(assessment: OpportunityAssessment) -> OpportunityAssessment:
+            self._log.info(
+                "assess_complete",
+                strategy=self.name,
+                num_candidates=len(assessment.candidates),
+                num_raw_scanned=raw_scanned,
+            )
+            return assessment
+
         try:
             from algotrader.intelligence.calendar.events import EventCalendar
             from algotrader.strategy_selector.candidate import CandidateType, TradeCandidate
 
-            # Regime gate
-            if regime:
-                if regime.regime_type.value in self._blocked_regimes:
-                    self._log.info(
-                        "assess_complete",
-                        strategy=self.name,
-                        num_candidates=0,
-                        num_raw_scanned=raw_scanned,
-                    )
-                    return OpportunityAssessment()
-                if regime.regime_type.value not in self._allowed_regimes:
-                    self._log.info(
-                        "assess_complete",
-                        strategy=self.name,
-                        num_candidates=0,
-                        num_raw_scanned=raw_scanned,
-                    )
-                    return OpportunityAssessment()
+            regime_blocked = regime is not None and regime.regime_type.value in self._blocked_regimes
+            regime_allowed = regime is None or regime.regime_type.value in self._allowed_regimes
+            self._log.info(
+                "options_regime_check",
+                regime=regime_type,
+                blocked=regime_blocked,
+                allowed=regime_allowed,
+                allowed_regimes=self._allowed_regimes,
+                blocked_regimes=self._blocked_regimes,
+            )
+            if regime_blocked or not regime_allowed:
+                self._log.warning(
+                    "options_regime_rejected",
+                    regime=regime_type,
+                    blocked=regime_blocked,
+                )
+                return _complete(OpportunityAssessment())
 
             et_now = datetime.now(ET)
             window_end = et_now.replace(
@@ -719,48 +729,62 @@ class OptionsPremiumStrategy(StrategyBase):
                 second=0,
                 microsecond=0,
             )
+            filter_counts = {
+                "entry_window_closed": 0,
+                "vix_below_min": 0,
+                "missing_atr_or_price": 0,
+                "candidate_built": 0,
+            }
             if et_now > window_end:
+                filter_counts["entry_window_closed"] = 1
                 self._log.info(
-                    "assess_complete",
-                    strategy=self.name,
-                    num_candidates=0,
-                    num_raw_scanned=raw_scanned,
+                    "options_scan_result",
+                    regime=regime_type,
+                    final_candidates=0,
+                    filter_counts=filter_counts,
                 )
-                return OpportunityAssessment(
+                return _complete(OpportunityAssessment(
                     num_candidates=0,
                     confidence=0.0,
                     details=[{"reason": "entry_window_closed"}],
                     candidates=[],
-                )
+                ))
             expiry_time = window_end.astimezone(pytz.UTC)
 
             # VIX proxy check
             vix_level = regime.vix_level if regime and regime.vix_level else None
             if vix_level is not None and vix_level < self._min_vix_proxy:
+                filter_counts["vix_below_min"] = 1
                 self._log.info(
-                    "assess_complete",
-                    strategy=self.name,
-                    num_candidates=0,
-                    num_raw_scanned=raw_scanned,
+                    "options_scan_result",
+                    regime=regime_type,
+                    final_candidates=0,
+                    filter_counts=filter_counts,
                 )
-                return OpportunityAssessment(
+                return _complete(OpportunityAssessment(
                     num_candidates=0,
                     confidence=0.0,
                     details=[{"reason": f"VIX {vix_level:.1f} < min {self._min_vix_proxy}"}],
                     candidates=[],
-                )
+                ))
 
             # Count available underlyings not already traded
             available = [u for u in self._underlyings if u not in self._trades]
             raw_scanned = len(available)
+            self._log.info(
+                "options_scan_universe",
+                regime=regime_type,
+                count=len(available),
+                symbols=available,
+            )
             if not available:
                 self._log.info(
-                    "assess_complete",
-                    strategy=self.name,
-                    num_candidates=0,
-                    num_raw_scanned=raw_scanned,
+                    "options_scan_result",
+                    regime=regime_type,
+                    final_candidates=0,
+                    filter_counts=filter_counts,
                 )
-                return OpportunityAssessment()
+                return _complete(OpportunityAssessment())
 
             event_calendar = EventCalendar()
             is_event_day = event_calendar.is_event_day()
@@ -772,6 +796,7 @@ class OptionsPremiumStrategy(StrategyBase):
                     atr = self._get_atr(underlying)
                     current_price = self._get_current_price(underlying)
                     if not atr or atr <= 0 or not current_price or current_price <= 0:
+                        filter_counts["missing_atr_or_price"] += 1
                         continue
 
                     bias = self._get_sma5_bias(underlying, current_price)
@@ -823,14 +848,18 @@ class OptionsPremiumStrategy(StrategyBase):
                     total_max_loss = max_loss_per_contract * contracts
                     rr_ratio = (total_credit / total_max_loss) if total_max_loss > 0 else 0.0
 
-                    confidence = 0.0
+                    confidence = 0.05
                     if vix_level is not None:
-                        if vix_level > 20:
+                        if 18.0 <= vix_level <= 28.0:
                             confidence += 0.25
+                        elif 15.0 <= vix_level < 18.0:
+                            confidence += 0.18
+                        elif vix_level > 28.0:
+                            confidence += 0.20
                         elif vix_level >= 15:
-                            confidence += 0.15
+                            confidence += 0.12
                         else:
-                            confidence += 0.05
+                            confidence += 0.08
                     else:
                         confidence += 0.10
 
@@ -838,33 +867,59 @@ class OptionsPremiumStrategy(StrategyBase):
                         confidence += 0.15
                     if self._use_sma5_filter and bias != "neutral":
                         confidence += 0.10
+                    elif structure == "iron_condor":
+                        confidence += 0.07
 
                     regime_fit = 0.5
                     if regime:
                         regime_type = regime.regime_type.value
-                        if regime_type == "high_vol":
-                            regime_fit = 0.9
-                            confidence += 0.15
-                        elif regime_type == "ranging":
+                        if regime_type == "ranging":
+                            regime_fit = 0.90
+                            confidence += 0.18
+                        elif regime_type == "high_vol":
                             regime_fit = 0.85
-                            confidence += 0.15
+                            confidence += 0.16
                         elif regime_type in ("trending_up", "trending_down"):
+                            regime_fit = 0.60
+                            confidence += 0.10
+                        elif regime_type == "low_vol":
                             regime_fit = 0.55
-                            confidence += 0.05
+                            confidence += 0.08
                         elif regime_type == "event_day":
                             regime_fit = 0.1
-                            confidence -= 0.30
+                            confidence -= 0.35
                         else:
-                            regime_fit = 0.4
+                            regime_fit = 0.45
+                            confidence += 0.05
 
-                    if is_event_day:
+                    has_earnings_today = event_calendar.has_earnings(underlying)
+                    if is_event_day or has_earnings_today:
                         confidence -= self._event_day_confidence_penalty
-                    elif not event_calendar.has_earnings(underlying):
+                    else:
                         confidence += 0.10
 
                     confidence = min(1.0, max(0.0, confidence))
 
                     win_rate = self._structure_win_rate(structure)
+                    if vix_level is not None:
+                        if 17.0 <= vix_level <= 25.0:
+                            win_rate += 0.06
+                        elif 15.0 <= vix_level < 17.0:
+                            win_rate += 0.04
+                        elif vix_level > 30.0:
+                            win_rate -= 0.05
+                    if regime and regime.regime_type.value == "ranging":
+                        win_rate += 0.05
+                    elif regime and regime.regime_type.value == "high_vol":
+                        win_rate += 0.03
+                    elif regime and regime.regime_type.value in ("trending_up", "trending_down"):
+                        win_rate -= 0.02
+                    if has_earnings_today or is_event_day:
+                        win_rate -= 0.10
+                    if bias != "neutral":
+                        win_rate += 0.02
+                    win_rate = min(0.90, max(0.45, win_rate))
+
                     edge_pct = self._edge_pct(
                         win_rate=win_rate,
                         credit=total_credit,
@@ -886,7 +941,7 @@ class OptionsPremiumStrategy(StrategyBase):
                         target_price=round(current_price, 2),
                         risk_dollars=round(total_max_loss, 2),
                         suggested_qty=contracts,
-                        risk_reward_ratio=round(adjusted_rr, 2),
+                        risk_reward_ratio=round(rr_ratio, 2),
                         confidence=round(confidence, 2),
                         edge_estimate_pct=round(edge_pct, 2),
                         regime_fit=round(regime_fit, 2),
@@ -908,8 +963,10 @@ class OptionsPremiumStrategy(StrategyBase):
                             "raw_rr": round(rr_ratio, 4),
                             "adjusted_rr": round(adjusted_rr, 4),
                             "event_day": is_event_day,
+                            "has_earnings_today": has_earnings_today,
                         },
                     ))
+                    filter_counts["candidate_built"] += 1
                     details.append({
                         "symbol": underlying,
                         "atr": round(atr, 2),
@@ -932,12 +989,12 @@ class OptionsPremiumStrategy(StrategyBase):
 
             if not candidate_rows:
                 self._log.info(
-                    "assess_complete",
-                    strategy=self.name,
-                    num_candidates=0,
-                    num_raw_scanned=raw_scanned,
+                    "options_scan_result",
+                    regime=regime_type,
+                    final_candidates=0,
+                    filter_counts=filter_counts,
                 )
-                return OpportunityAssessment()
+                return _complete(OpportunityAssessment())
 
             candidate_rows.sort(key=lambda c: c.expected_value, reverse=True)
             top_candidates = candidate_rows[:3]
@@ -946,12 +1003,12 @@ class OptionsPremiumStrategy(StrategyBase):
             avg_edge = sum(c.edge_estimate_pct for c in candidate_rows) / len(candidate_rows)
 
             self._log.info(
-                "assess_complete",
-                strategy=self.name,
-                num_candidates=len(candidate_rows),
-                num_raw_scanned=raw_scanned,
+                "options_scan_result",
+                regime=regime_type,
+                final_candidates=len(top_candidates),
+                filter_counts=filter_counts,
             )
-            return OpportunityAssessment(
+            return _complete(OpportunityAssessment(
                 num_candidates=len(candidate_rows),
                 avg_risk_reward=round(avg_rr, 2),
                 confidence=round(max(0.0, min(1.0, avg_conf)), 2),
@@ -959,10 +1016,10 @@ class OptionsPremiumStrategy(StrategyBase):
                 estimated_edge_pct=round(avg_edge, 2),
                 details=details[:5],
                 candidates=top_candidates,
-            )
+            ))
         except Exception as exc:
             self._log.error("assess_failed", strategy=self.name, error=str(exc), exc_info=True)
-            return OpportunityAssessment()
+            return _complete(OpportunityAssessment())
 
     def _get_state(self) -> dict[str, Any]:
         """Serialize state for persistence."""

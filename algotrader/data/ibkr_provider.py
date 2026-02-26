@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import threading
 import time
 from datetime import date, datetime, timedelta
 
@@ -52,6 +53,8 @@ class IBKRDataProvider:
         self._connection = connection
         self._stock_contract_cache: dict[str, object] = {}
         self._index_contract_cache: dict[str, object] = {}
+        self._index_ticker_cache: dict[str, object] = {}
+        self._index_ticker_lock = threading.RLock()
         self._log = logger.bind(component="ibkr_data")
         self._log.info("ibkr_data_provider_initialized")
 
@@ -204,6 +207,126 @@ class IBKRDataProvider:
         self._index_contract_cache[cache_key] = contract
         return contract
 
+    @staticmethod
+    def _index_cache_key(symbol: str, exchange: str) -> str:
+        return f"{symbol.upper()}:{exchange.upper()}"
+
+    def _extract_index_price(self, ticker) -> float | None:
+        market_price = self._safe_optional_float(ticker.marketPrice())
+        last_price = self._safe_optional_float(getattr(ticker, "last", None))
+        close_price = self._safe_optional_float(getattr(ticker, "close", None))
+        bid_price = self._safe_optional_float(getattr(ticker, "bid", None))
+        ask_price = self._safe_optional_float(getattr(ticker, "ask", None))
+
+        midpoint: float | None = None
+        if bid_price is not None and ask_price is not None and bid_price > 0 and ask_price > 0:
+            midpoint = (bid_price + ask_price) / 2.0
+
+        for value in (market_price, last_price, close_price, midpoint, bid_price, ask_price):
+            if value is not None and value > 0:
+                return float(value)
+        return None
+
+    def _subscribe_index_stream(
+        self,
+        symbol: str,
+        exchange: str = "CBOE",
+        force_resubscribe: bool = False,
+    ):
+        symbol = symbol.upper()
+        exchange = exchange.upper()
+        cache_key = self._index_cache_key(symbol, exchange)
+
+        with self._index_ticker_lock:
+            cached = self._index_ticker_cache.get(cache_key)
+        if cached is not None and not force_resubscribe:
+            if self._is_cached_index_stream_active(cached):
+                return cached
+            self._log.info(
+                "ibkr_index_subscription_refresh",
+                symbol=symbol,
+                exchange=exchange,
+                reason="inactive_cached_stream",
+            )
+
+        contract = self._qualify_index_contract(symbol=symbol, exchange=exchange)
+        if contract is None:
+            return None
+
+        try:
+            ticker = self._connection.execute(
+                lambda ib: ib.reqMktData(
+                    contract=contract,
+                    genericTickList="",
+                    snapshot=False,
+                    regulatorySnapshot=False,
+                )
+            )
+            with self._index_ticker_lock:
+                self._index_ticker_cache[cache_key] = ticker
+
+            self._log.info(
+                "ibkr_index_subscription_opened",
+                symbol=symbol,
+                exchange=exchange,
+                resubscribe=force_resubscribe,
+            )
+            return ticker
+        except Exception:
+            self._log.exception(
+                "ibkr_index_subscription_failed",
+                symbol=symbol,
+                exchange=exchange,
+                resubscribe=force_resubscribe,
+            )
+            return None
+
+    def _is_cached_index_stream_active(self, ticker) -> bool:
+        try:
+            def _active(ib):
+                req_map = getattr(getattr(ib, "wrapper", None), "reqId2Ticker", {}) or {}
+                return any(active is ticker for active in req_map.values())
+
+            return bool(self._connection.execute(_active))
+        except Exception:
+            return False
+
+    def _read_index_stream_price(self, ticker, wait_seconds: float = 2.0) -> float | None:
+        try:
+            def _read(ib):
+                deadline = time.time() + max(0.5, wait_seconds)
+                best_price = self._extract_index_price(ticker)
+                while best_price is None and time.time() < deadline:
+                    ib.sleep(0.2)
+                    best_price = self._extract_index_price(ticker)
+                return best_price
+
+            return self._connection.execute(_read)
+        except Exception:
+            self._log.exception("ibkr_index_stream_read_failed")
+            return None
+
+    def get_index_price_streaming(
+        self,
+        symbol: str,
+        exchange: str = "CBOE",
+        wait_seconds: float = 2.0,
+    ) -> float | None:
+        """Read a live index price from a persistent market-data subscription."""
+        ticker = self._subscribe_index_stream(symbol=symbol, exchange=exchange, force_resubscribe=False)
+        if ticker is None:
+            return None
+
+        best_price = self._read_index_stream_price(ticker=ticker, wait_seconds=wait_seconds)
+        if best_price is not None:
+            return best_price
+
+        # Re-subscribe once in case the cached stream went stale after reconnect.
+        ticker = self._subscribe_index_stream(symbol=symbol, exchange=exchange, force_resubscribe=True)
+        if ticker is None:
+            return None
+        return self._read_index_stream_price(ticker=ticker, wait_seconds=wait_seconds)
+
     def get_index_price(
         self,
         symbol: str,
@@ -211,6 +334,15 @@ class IBKRDataProvider:
         wait_seconds: float = 2.0,
     ) -> float | None:
         """Fetch a live index quote (e.g., VIX on CBOE)."""
+        streaming_price = self.get_index_price_streaming(
+            symbol=symbol,
+            exchange=exchange,
+            wait_seconds=wait_seconds,
+        )
+        if streaming_price is not None:
+            return streaming_price
+
+        # Fall back to one-shot request path if streaming is unavailable.
         contract = self._qualify_index_contract(symbol=symbol, exchange=exchange)
         if contract is None:
             return None

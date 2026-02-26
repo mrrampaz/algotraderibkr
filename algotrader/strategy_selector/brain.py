@@ -133,6 +133,9 @@ class DailyBrain:
         min_confidence: float = 0.60,
         min_risk_reward: float = 1.5,
         min_edge_pct: float = 0.3,
+        options_min_confidence: float = 0.55,
+        options_min_risk_reward: float = 0.3,
+        options_min_edge_pct: float = 0.1,
         max_daily_trades: int = 5,
         max_capital_per_trade_pct: float = 20.0,
         max_daily_risk_pct: float = 2.0,
@@ -152,6 +155,9 @@ class DailyBrain:
         self._min_confidence = min_confidence
         self._min_risk_reward = min_risk_reward
         self._min_edge_pct = min_edge_pct
+        self._options_min_confidence = options_min_confidence
+        self._options_min_risk_reward = options_min_risk_reward
+        self._options_min_edge_pct = options_min_edge_pct
         self._max_daily_trades = max_daily_trades
         self._max_capital_per_trade_pct = max_capital_per_trade_pct
         self._max_daily_risk_pct = max_daily_risk_pct
@@ -170,6 +176,9 @@ class DailyBrain:
             min_confidence=min_confidence,
             min_rr=min_risk_reward,
             min_edge=min_edge_pct,
+            options_min_confidence=options_min_confidence,
+            options_min_rr=options_min_risk_reward,
+            options_min_edge=options_min_edge_pct,
             max_daily_trades=max_daily_trades,
             max_daily_risk_pct=max_daily_risk_pct,
         )
@@ -424,12 +433,13 @@ class DailyBrain:
         min_confidence: float,
         current_positions: list[Position],
     ) -> str | None:
-        if candidate.confidence < min_confidence:
+        required_confidence = self._required_confidence(candidate, min_confidence)
+        if candidate.confidence < required_confidence:
             return "low_confidence"
         effective_rr = self._effective_rr(candidate)
         if effective_rr < self._required_rr(candidate):
             return "poor_rr"
-        if candidate.edge_estimate_pct < self._min_edge_pct:
+        if candidate.edge_estimate_pct < self._required_edge(candidate):
             return "insufficient_edge"
         if candidate.is_expired:
             return "expired"
@@ -487,10 +497,23 @@ class DailyBrain:
 
         return round(max(0.0, min(1.0, base_score)), 4)
 
+    def _required_confidence(self, candidate: TradeCandidate, min_confidence: float) -> float:
+        if not candidate.is_options:
+            return min_confidence
+        if self._min_confidence <= 0:
+            return self._options_min_confidence
+        midday_scale = max(0.5, min(2.0, min_confidence / self._min_confidence))
+        return min(1.0, self._options_min_confidence * midday_scale)
+
     def _required_rr(self, candidate: TradeCandidate) -> float:
         if candidate.is_options:
-            return max(0.5, self._min_risk_reward * 0.35)
+            return self._options_min_risk_reward
         return self._min_risk_reward
+
+    def _required_edge(self, candidate: TradeCandidate) -> float:
+        if candidate.is_options:
+            return self._options_min_edge_pct
+        return self._min_edge_pct
 
     def _effective_rr(self, candidate: TradeCandidate) -> float:
         rr = max(0.0, candidate.risk_reward_ratio)

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
@@ -83,4 +83,6 @@ class TradeCandidate:
     def is_expired(self) -> bool:
         if self.expiry_time is None:
             return False
-        return datetime.utcnow() > self.expiry_time
+        if self.expiry_time.tzinfo is None:
+            return datetime.utcnow() > self.expiry_time
+        return datetime.now(timezone.utc) > self.expiry_time.astimezone(timezone.utc)

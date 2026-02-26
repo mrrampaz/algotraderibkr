@@ -383,6 +383,7 @@ class VWAPReversionStrategy(StrategyBase):
         """Assess VWAP deviation opportunities across universe."""
         self._log.info("assess_start", strategy=self.name)
         raw_scanned = len(self._universe)
+        regime_type = regime.regime_type.value if regime else "none"
 
         def _complete(assessment: OpportunityAssessment) -> OpportunityAssessment:
             self._log.info(
@@ -397,7 +398,19 @@ class VWAPReversionStrategy(StrategyBase):
             from algotrader.strategy_selector.candidate import CandidateType, TradeCandidate
 
             # Regime gate - only active in ranging/low_vol
-            if regime and regime.regime_type.value not in self._allowed_regimes:
+            regime_allowed = regime is None or regime.regime_type.value in self._allowed_regimes
+            self._log.info(
+                "vwap_regime_check",
+                regime=regime_type,
+                allowed=regime_allowed,
+                allowed_regimes=self._allowed_regimes,
+            )
+            if not regime_allowed:
+                self._log.warning(
+                    "vwap_regime_rejected",
+                    regime=regime_type,
+                    allowed_regimes=self._allowed_regimes,
+                )
                 return _complete(OpportunityAssessment())
 
             et_now = datetime.now(ET)
@@ -409,25 +422,55 @@ class VWAPReversionStrategy(StrategyBase):
                     candidates=[],
                 ))
 
+            self._log.info(
+                "vwap_universe",
+                regime=regime_type,
+                count=len(self._universe),
+                symbols=self._universe[:10],
+            )
+
+            filter_counts = {
+                "already_tracking_trade": 0,
+                "insufficient_bar_data": 0,
+                "below_z_threshold": 0,
+                "invalid_price_or_vwap": 0,
+                "candidate_built": 0,
+            }
             candidates: list[dict] = []
             trade_candidates: list[TradeCandidate] = []
 
             for symbol in self._universe:
                 if symbol in self._trades:
+                    filter_counts["already_tracking_trade"] += 1
                     continue
                 try:
                     bars = self.data_provider.get_bars(
                         symbol, self._bar_timeframe, self._vwap_lookback_bars,
                     )
+                    self._log.debug(
+                        "vwap_bars",
+                        symbol=symbol,
+                        bars=len(bars) if bars is not None else 0,
+                        timeframe=self._bar_timeframe,
+                    )
                     if bars.empty or len(bars) < 10:
+                        filter_counts["insufficient_bar_data"] += 1
                         continue
 
                     vwap_price, z_score = calculate_vwap_zscore(bars)
+                    self._log.debug(
+                        "vwap_zscore",
+                        symbol=symbol,
+                        z_score=round(z_score, 3),
+                        threshold=self._min_z_score,
+                    )
                     if abs(z_score) < self._min_z_score:
+                        filter_counts["below_z_threshold"] += 1
                         continue
 
                     current_price = float(bars["close"].iloc[-1])
                     if current_price <= 0 or vwap_price <= 0:
+                        filter_counts["invalid_price_or_vwap"] += 1
                         continue
 
                     if z_score < 0:
@@ -513,6 +556,7 @@ class VWAPReversionStrategy(StrategyBase):
                             "volume_ratio": round(vol_ratio, 2),
                         },
                     ))
+                    filter_counts["candidate_built"] += 1
                     candidates.append({
                         "symbol": symbol,
                         "z_score": round(z_score, 2),
@@ -524,6 +568,13 @@ class VWAPReversionStrategy(StrategyBase):
                     continue
 
             if not trade_candidates:
+                self._log.info(
+                    "vwap_scan_result",
+                    regime=regime_type,
+                    universe_size=len(self._universe),
+                    final_candidates=0,
+                    filter_counts=filter_counts,
+                )
                 return _complete(OpportunityAssessment())
 
             trade_candidates.sort(key=lambda c: c.expected_value, reverse=True)
@@ -531,6 +582,13 @@ class VWAPReversionStrategy(StrategyBase):
             avg_rr = sum(c.risk_reward_ratio for c in trade_candidates) / len(trade_candidates)
             avg_conf = sum(c.confidence for c in trade_candidates) / len(trade_candidates)
             avg_edge = sum(c.edge_estimate_pct for c in trade_candidates) / len(trade_candidates)
+            self._log.info(
+                "vwap_scan_result",
+                regime=regime_type,
+                universe_size=len(self._universe),
+                final_candidates=len(top_candidates),
+                filter_counts=filter_counts,
+            )
 
             return _complete(OpportunityAssessment(
                 num_candidates=len(trade_candidates),

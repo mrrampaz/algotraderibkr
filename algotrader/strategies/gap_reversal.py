@@ -576,6 +576,7 @@ class GapReversalStrategy(StrategyBase):
         """Assess gap trading opportunities from scanner candidates."""
         self._log.info("assess_start", strategy=self.name)
         raw_scanned = len(self._gap_candidates)
+        regime_type = regime.regime_type.value if regime else "none"
 
         def _complete(assessment: OpportunityAssessment) -> OpportunityAssessment:
             self._log.info(
@@ -590,25 +591,60 @@ class GapReversalStrategy(StrategyBase):
             from algotrader.strategy_selector.candidate import CandidateType, TradeCandidate
 
             # Regime gate
-            if regime and regime.regime_type.value not in self._allowed_regimes:
+            regime_allowed = regime is None or regime.regime_type.value in self._allowed_regimes
+            self._log.info(
+                "gap_regime_check",
+                regime=regime_type,
+                allowed=regime_allowed,
+                allowed_regimes=self._allowed_regimes,
+            )
+            if not regime_allowed:
+                self._log.warning(
+                    "gap_regime_rejected",
+                    regime=regime_type,
+                    allowed_regimes=self._allowed_regimes,
+                )
                 return _complete(OpportunityAssessment())
 
             if not self._gap_candidates:
+                self._log.info(
+                    "gap_scan_universe",
+                    regime=regime_type,
+                    candidates_loaded=False,
+                    count=0,
+                )
                 return _complete(OpportunityAssessment())
 
             et_now = datetime.now(ET)
             expiry_time = et_now.replace(hour=11, minute=0, second=0, microsecond=0).astimezone(pytz.UTC)
 
+            self._log.info(
+                "gap_scan_universe",
+                regime=regime_type,
+                candidates_loaded=True,
+                count=len(self._gap_candidates),
+                symbols=[c.get("symbol", "") for c in self._gap_candidates[:10]],
+            )
+
+            filter_counts = {
+                "missing_symbol": 0,
+                "gap_outside_threshold": 0,
+                "invalid_price_data": 0,
+                "invalid_risk_setup": 0,
+                "candidate_built": 0,
+            }
             qualified = []
             details: list[dict] = []
             trade_candidates: list[TradeCandidate] = []
             for c in self._gap_candidates:
                 gap_pct = abs(c.get("gap_pct", 0.0))
                 if not (self._min_gap_pct <= gap_pct <= self._max_gap_pct):
+                    filter_counts["gap_outside_threshold"] += 1
                     continue
 
                 symbol = c.get("symbol", "")
                 if not symbol:
+                    filter_counts["missing_symbol"] += 1
                     continue
 
                 gap_signed = float(c.get("gap_pct", 0.0))
@@ -616,6 +652,7 @@ class GapReversalStrategy(StrategyBase):
                 gap_open = float(c.get("current_price", 0.0))
                 current_price = self._get_current_price(symbol) or gap_open
                 if current_price <= 0 or gap_open <= 0:
+                    filter_counts["invalid_price_data"] += 1
                     continue
 
                 bars = self.data_provider.get_bars(symbol, "5Min", 3)
@@ -656,6 +693,7 @@ class GapReversalStrategy(StrategyBase):
                 risk_per_share = abs(entry_price - stop_price)
                 reward_per_share = abs(target_price - entry_price)
                 if risk_per_share <= 0:
+                    filter_counts["invalid_risk_setup"] += 1
                     continue
                 rr_ratio = reward_per_share / risk_per_share if risk_per_share > 0 else 0.0
 
@@ -737,11 +775,24 @@ class GapReversalStrategy(StrategyBase):
                     }
                 )
                 qualified.append(c)
+                filter_counts["candidate_built"] += 1
 
             if not qualified:
+                self._log.info(
+                    "gap_scan_result",
+                    regime=regime_type,
+                    final_candidates=0,
+                    filter_counts=filter_counts,
+                )
                 return _complete(OpportunityAssessment())
 
             if not trade_candidates:
+                self._log.info(
+                    "gap_scan_result",
+                    regime=regime_type,
+                    final_candidates=0,
+                    filter_counts=filter_counts,
+                )
                 return _complete(OpportunityAssessment(
                     num_candidates=0,
                     confidence=0.0,
@@ -754,6 +805,12 @@ class GapReversalStrategy(StrategyBase):
             avg_rr = sum(c.risk_reward_ratio for c in trade_candidates) / len(trade_candidates)
             avg_conf = sum(c.confidence for c in trade_candidates) / len(trade_candidates)
             avg_edge = sum(c.edge_estimate_pct for c in trade_candidates) / len(trade_candidates)
+            self._log.info(
+                "gap_scan_result",
+                regime=regime_type,
+                final_candidates=len(top_candidates),
+                filter_counts=filter_counts,
+            )
 
             return _complete(OpportunityAssessment(
                 num_candidates=len(trade_candidates),

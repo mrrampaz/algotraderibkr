@@ -113,6 +113,9 @@ class BrainConfig(BaseModel):
     min_confidence: float = 0.60
     min_risk_reward: float = 1.5
     min_edge_pct: float = 0.3
+    options_min_confidence: float = 0.55
+    options_min_risk_reward: float = 0.3
+    options_min_edge_pct: float = 0.1
     max_daily_trades: int = 5
     max_capital_per_trade_pct: float = 20.0
     max_daily_risk_pct: float = 2.0

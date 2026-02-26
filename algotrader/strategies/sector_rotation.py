@@ -415,6 +415,7 @@ class SectorRotationStrategy(StrategyBase):
         """Assess sector rotation opportunities via relative strength."""
         self._log.info("assess_start", strategy=self.name)
         raw_scanned = len(self._sectors)
+        regime_type = regime.regime_type.value if regime else "none"
 
         def _complete(assessment: OpportunityAssessment) -> OpportunityAssessment:
             self._log.info(
@@ -429,13 +430,45 @@ class SectorRotationStrategy(StrategyBase):
             from algotrader.strategy_selector.candidate import CandidateType, TradeCandidate
 
             # Regime gate
-            if regime and regime.regime_type.value not in self._allowed_regimes:
+            regime_allowed = regime is None or regime.regime_type.value in self._allowed_regimes
+            self._log.info(
+                "sector_regime_check",
+                regime=regime_type,
+                allowed=regime_allowed,
+                allowed_regimes=self._allowed_regimes,
+            )
+            if not regime_allowed:
+                self._log.warning(
+                    "sector_regime_rejected",
+                    regime=regime_type,
+                    allowed_regimes=self._allowed_regimes,
+                )
                 return _complete(OpportunityAssessment())
 
             # Calculate RS scores
             self._calculate_all_rs()
+            self._log.info(
+                "sector_universe",
+                regime=regime_type,
+                sectors=len(self._sectors),
+                symbols=list(self._sectors.keys())[:10],
+            )
+            filter_counts = {
+                "no_rs_scores": 0,
+                "divergence_below_threshold": 0,
+                "need_both_long_short_legs": 0,
+                "missing_price_data": 0,
+                "candidate_built": 0,
+            }
 
             if not self._rs_scores:
+                filter_counts["no_rs_scores"] = 1
+                self._log.info(
+                    "sector_scan_result",
+                    regime=regime_type,
+                    final_candidates=0,
+                    filter_counts=filter_counts,
+                )
                 return _complete(OpportunityAssessment())
 
             sorted_rs = sorted(self._rs_scores.items(), key=lambda x: x[1], reverse=True)
@@ -444,6 +477,13 @@ class SectorRotationStrategy(StrategyBase):
             if len(sorted_rs) >= 2:
                 divergence = sorted_rs[0][1] - sorted_rs[-1][1]
                 if divergence < self._min_divergence_pct:
+                    filter_counts["divergence_below_threshold"] = 1
+                    self._log.info(
+                        "sector_scan_result",
+                        regime=regime_type,
+                        final_candidates=0,
+                        filter_counts=filter_counts,
+                    )
                     return _complete(OpportunityAssessment(
                         num_candidates=0,
                         confidence=0.0,
@@ -456,10 +496,23 @@ class SectorRotationStrategy(StrategyBase):
             candidates = longs + shorts
 
             if not candidates:
+                self._log.info(
+                    "sector_scan_result",
+                    regime=regime_type,
+                    final_candidates=0,
+                    filter_counts=filter_counts,
+                )
                 return _complete(OpportunityAssessment())
 
             divergence = sorted_rs[0][1] - sorted_rs[-1][1] if len(sorted_rs) >= 2 else 0.0
             if not longs or not shorts:
+                filter_counts["need_both_long_short_legs"] = 1
+                self._log.info(
+                    "sector_scan_result",
+                    regime=regime_type,
+                    final_candidates=0,
+                    filter_counts=filter_counts,
+                )
                 return _complete(OpportunityAssessment(
                     num_candidates=0,
                     confidence=0.0,
@@ -475,6 +528,13 @@ class SectorRotationStrategy(StrategyBase):
             short_price = self._get_current_price(short_symbol)
 
             if not long_price or long_price <= 0:
+                filter_counts["missing_price_data"] += 1
+                self._log.info(
+                    "sector_scan_result",
+                    regime=regime_type,
+                    final_candidates=0,
+                    filter_counts=filter_counts,
+                )
                 return _complete(OpportunityAssessment())
 
             stop_price = long_price * (1 - self._stop_pct / 100)
@@ -551,6 +611,13 @@ class SectorRotationStrategy(StrategyBase):
                     "long_price": round(long_price, 2),
                     "short_price": round(short_price, 2) if short_price else 0.0,
                 },
+            )
+            filter_counts["candidate_built"] += 1
+            self._log.info(
+                "sector_scan_result",
+                regime=regime_type,
+                final_candidates=1,
+                filter_counts=filter_counts,
             )
 
             return _complete(OpportunityAssessment(

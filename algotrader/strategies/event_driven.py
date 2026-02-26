@@ -475,6 +475,7 @@ class EventDrivenStrategy(StrategyBase):
         """Assess event-driven opportunities from today's calendar."""
         self._log.info("assess_start", strategy=self.name)
         raw_scanned = len(self._today_events)
+        regime_type = regime.regime_type.value if regime else "none"
 
         def _complete(assessment: OpportunityAssessment) -> OpportunityAssessment:
             self._log.info(
@@ -488,11 +489,32 @@ class EventDrivenStrategy(StrategyBase):
         try:
             from algotrader.strategy_selector.candidate import CandidateType, TradeCandidate
 
+            self._log.info(
+                "event_assess_context",
+                regime=regime_type,
+                tracked_events=len(self._today_events),
+                instruments=self._instruments,
+            )
+            filter_counts = {
+                "no_events_today": 0,
+                "already_traded_event": 0,
+                "outside_event_window": 0,
+                "missing_price_data": 0,
+                "missing_event_time": 0,
+                "candidate_built": 0,
+            }
             if not self._events_checked_today:
                 self._check_today_events()
                 raw_scanned = len(self._today_events)
 
             if not self._today_events:
+                filter_counts["no_events_today"] = 1
+                self._log.info(
+                    "event_scan_result",
+                    regime=regime_type,
+                    final_candidates=0,
+                    filter_counts=filter_counts,
+                )
                 return _complete(OpportunityAssessment())
 
             # Count actionable events (not already traded)
@@ -506,8 +528,16 @@ class EventDrivenStrategy(StrategyBase):
                 )
                 if not already_traded:
                     actionable.append(event)
+                else:
+                    filter_counts["already_traded_event"] += 1
 
             if not actionable:
+                self._log.info(
+                    "event_scan_result",
+                    regime=regime_type,
+                    final_candidates=0,
+                    filter_counts=filter_counts,
+                )
                 return _complete(OpportunityAssessment())
 
             et_now = datetime.now(ET)
@@ -521,11 +551,13 @@ class EventDrivenStrategy(StrategyBase):
                     hh, mm = EVENT_TIMES[event_type]
                     event_time = et_now.replace(hour=hh, minute=mm, second=0, microsecond=0)
                 if event_time is None:
+                    filter_counts["missing_event_time"] += 1
                     continue
 
                 is_post_event = et_now >= event_time
                 hours_to_event = (event_time - et_now).total_seconds() / 3600.0
                 if not is_post_event and hours_to_event > self._pre_event_entry_hours:
+                    filter_counts["outside_event_window"] += 1
                     continue
 
                 for symbol in self._instruments:
@@ -535,6 +567,7 @@ class EventDrivenStrategy(StrategyBase):
 
                     current_price = self._get_current_price(symbol)
                     if current_price is None or current_price <= 0:
+                        filter_counts["missing_price_data"] += 1
                         continue
 
                     atr = None
@@ -634,8 +667,15 @@ class EventDrivenStrategy(StrategyBase):
                             "impact": event.get("impact", 2),
                         }
                     )
+                    filter_counts["candidate_built"] += 1
 
             if not trade_candidates:
+                self._log.info(
+                    "event_scan_result",
+                    regime=regime_type,
+                    final_candidates=0,
+                    filter_counts=filter_counts,
+                )
                 return _complete(OpportunityAssessment())
 
             trade_candidates.sort(key=lambda c: c.expected_value, reverse=True)
@@ -643,6 +683,12 @@ class EventDrivenStrategy(StrategyBase):
             avg_rr = sum(c.risk_reward_ratio for c in trade_candidates) / len(trade_candidates)
             avg_conf = sum(c.confidence for c in trade_candidates) / len(trade_candidates)
             avg_edge = sum(c.edge_estimate_pct for c in trade_candidates) / len(trade_candidates)
+            self._log.info(
+                "event_scan_result",
+                regime=regime_type,
+                final_candidates=len(top_candidates),
+                filter_counts=filter_counts,
+            )
 
             return _complete(OpportunityAssessment(
                 num_candidates=len(trade_candidates),

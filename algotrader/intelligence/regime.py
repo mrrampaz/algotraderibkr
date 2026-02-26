@@ -195,72 +195,148 @@ class RegimeDetector:
         return round(np.mean(scores) if scores else 0.5, 2)
 
     def _get_vix_level(self) -> float | None:
-        """Fetch VIX from live data source with staleness and sanity checks."""
+        """Fetch VIX using live subscription first, then proxy fallbacks."""
         now = datetime.now(pytz.UTC)
+        vix_level, method = self._fetch_vix(now)
+        if vix_level is None:
+            self._log.warning("vix_fetch", method=method, value=None, stale=True)
+            return None
 
-        # Primary path: IBKR index quote via optional provider method.
+        stale = self._is_vix_stale(vix_level, now)
+        if stale:
+            self._log.warning(
+                "vix_quote_stale",
+                vix=round(vix_level, 4),
+                stale_minutes=self._stale_vix_minutes(now),
+                last_change_at=(
+                    self._last_vix_change_at.isoformat()
+                    if self._last_vix_change_at else None
+                ),
+            )
+
+        self._validate_vix(vix_level)
+        self._record_vix(vix_level, now)
+        self._log.info(
+            "vix_fetch",
+            method=method,
+            value=round(vix_level, 4),
+            stale=stale,
+        )
+        return vix_level
+
+    def _fetch_vix(self, now: datetime) -> tuple[float | None, str]:
+        """Fetch VIX with multiple fallback methods."""
+        # Method 1: persistent streaming subscription from provider.
+        try:
+            vix_live = self._get_vix_from_subscription()
+            if vix_live is not None and self._is_reasonable_vix(vix_live, 10.0, 80.0):
+                if not self._is_vix_stale(vix_live, now):
+                    return round(vix_live, 2), "ibkr_subscription"
+                self._log.warning(
+                    "vix_subscription_stale_try_fallback",
+                    vix=round(vix_live, 4),
+                    stale_minutes=self._stale_vix_minutes(now),
+                )
+        except Exception as exc:
+            self._log.warning("vix_method1_failed", error=str(exc))
+
+        # Method 2: ATM SPY options IV proxy.
+        try:
+            vix_proxy = self._compute_vix_proxy_from_options()
+            if vix_proxy is not None and self._is_reasonable_vix(vix_proxy, 8.0, 90.0):
+                self._log.info("vix_using_options_proxy", vix_proxy=round(vix_proxy, 2))
+                return round(vix_proxy, 2), "options_iv_proxy"
+        except Exception as exc:
+            self._log.warning("vix_method2_failed", error=str(exc))
+
+        # Method 3: SPY realized volatility proxy.
+        try:
+            realized_proxy = self._compute_realized_vol()
+            if realized_proxy is not None and realized_proxy > 0:
+                self._log.info("vix_using_realized_vol", vix_rv=round(realized_proxy, 2))
+                return round(realized_proxy, 2), "realized_vol_proxy"
+        except Exception as exc:
+            self._log.warning("vix_method3_failed", error=str(exc))
+
+        # Last known value to avoid hard None when data sources hiccup.
+        if self._last_vix_level is not None:
+            return float(self._last_vix_level), "last_known"
+        return None, "unavailable"
+
+    def _get_vix_from_subscription(self) -> float | None:
+        provider_stream = getattr(self._data, "get_index_price_streaming", None)
+        if callable(provider_stream):
+            return provider_stream("VIX", exchange="CBOE", wait_seconds=2.0)
+
         provider_get_index = getattr(self._data, "get_index_price", None)
         if callable(provider_get_index):
-            try:
-                vix_live = provider_get_index("VIX", exchange="CBOE", wait_seconds=2.0)
-                if vix_live is not None:
-                    if self._is_vix_stale(vix_live, now):
-                        self._log.warning(
-                            "vix_quote_stale",
-                            vix=round(vix_live, 4),
-                            stale_minutes=self._stale_vix_minutes(now),
-                            last_change_at=(
-                                self._last_vix_change_at.isoformat()
-                                if self._last_vix_change_at else None
-                            ),
-                        )
-                        # Re-fetch once with a longer wait before accepting stale print.
-                        refreshed = provider_get_index("VIX", exchange="CBOE", wait_seconds=3.5)
-                        if refreshed is not None:
-                            vix_live = refreshed
-
-                    self._validate_vix(vix_live)
-                    self._record_vix(vix_live, now)
-                    self._log.debug("vix_live_quote", source="ibkr_index", vix=round(vix_live, 4))
-                    return vix_live
-            except Exception:
-                self._log.exception("vix_live_fetch_failed")
-
-        # Fallback path: provider snapshot for configured proxy symbol.
-        try:
-            snap = self._data.get_snapshot(self._vix_symbol)
-            if snap and snap.latest_trade_price and snap.latest_trade_price > 0:
-                proxy_vix = float(snap.latest_trade_price)
-                self._validate_vix(proxy_vix)
-                self._record_vix(proxy_vix, now)
-                self._log.warning(
-                    "vix_proxy_used",
-                    symbol=self._vix_symbol,
-                    vix=round(proxy_vix, 4),
-                )
-                return proxy_vix
-        except Exception:
-            self._log.exception("vix_proxy_snapshot_failed")
-
-        # Last-resort fallback: realized-vol estimate from SPY.
-        try:
-            bars = self._data.get_bars(self._spy_symbol, "1Day", 25)
-            if bars.empty or len(bars) < 10:
-                return None
-            returns = bars["close"].pct_change().dropna()
-            realized_vol = float(returns.std() * np.sqrt(252) * 100)
-            vix_estimate = realized_vol / 0.75
-            self._validate_vix(vix_estimate)
-            self._record_vix(vix_estimate, now)
-            self._log.debug(
-                "vix_proxy_estimated_from_spy",
-                realized_vol=round(realized_vol, 2),
-                vix_estimate=round(vix_estimate, 2),
-            )
-            return vix_estimate
-        except Exception:
-            self._log.exception("vix_proxy_failed")
+            return provider_get_index("VIX", exchange="CBOE", wait_seconds=2.0)
         return None
+
+    def _compute_vix_proxy_from_options(self) -> float | None:
+        """Estimate VIX from SPY ATM call implied vol."""
+        spy_price: float | None = None
+        snapshot = self._data.get_snapshot("SPY")
+        if snapshot and snapshot.latest_trade_price and snapshot.latest_trade_price > 0:
+            spy_price = float(snapshot.latest_trade_price)
+
+        if spy_price is None:
+            quote = self._data.get_quote("SPY")
+            if quote and quote.is_valid() and quote.mid_price > 0:
+                spy_price = float(quote.mid_price)
+
+        if spy_price is None or spy_price <= 0:
+            return None
+
+        chain = self._data.get_option_chain("SPY")
+        if chain is None or chain.empty:
+            return None
+        if "strike" not in chain.columns or "type" not in chain.columns or "implied_vol" not in chain.columns:
+            return None
+
+        calls = chain[chain["type"] == "call"].copy()
+        if calls.empty:
+            return None
+
+        calls["implied_vol"] = pd.to_numeric(calls["implied_vol"], errors="coerce")
+        calls["strike"] = pd.to_numeric(calls["strike"], errors="coerce")
+        calls = calls.dropna(subset=["implied_vol", "strike"])
+        calls = calls[calls["implied_vol"] > 0]
+        if calls.empty:
+            return None
+
+        calls["strike_diff"] = (calls["strike"] - spy_price).abs()
+        if "expiration" in calls.columns:
+            today = datetime.now(pytz.UTC).date()
+            calls["expiration_dt"] = pd.to_datetime(calls["expiration"], errors="coerce")
+            calls["expiry_diff"] = calls["expiration_dt"].apply(
+                lambda ts: abs((((ts.date()) if pd.notna(ts) else today) - today).days)
+            )
+            calls = calls.sort_values(by=["expiry_diff", "strike_diff"])
+        else:
+            calls = calls.sort_values(by=["strike_diff"])
+
+        iv_raw = float(calls.iloc[0]["implied_vol"])
+        if iv_raw <= 0:
+            return None
+        # Some data sources return 0.19, others 19.0.
+        iv_pct = iv_raw * 100.0 if iv_raw <= 1.5 else iv_raw
+        return round(iv_pct, 2)
+
+    def _compute_realized_vol(self) -> float | None:
+        """Compute 20-day realized volatility from SPY daily bars."""
+        bars = self._data.get_bars(self._spy_symbol, "1Day", 25)
+        if bars is None or bars.empty or len(bars) < 20:
+            return None
+        returns = bars["close"].pct_change().dropna().tail(20)
+        if returns.empty:
+            return None
+        rv = float(returns.std() * np.sqrt(252) * 100.0)
+        return round(rv, 2)
+
+    @staticmethod
+    def _is_reasonable_vix(vix_level: float, low: float, high: float) -> bool:
+        return low <= float(vix_level) <= high
 
     def _record_vix(self, vix_level: float, now: datetime) -> None:
         if self._last_vix_level is None or abs(vix_level - self._last_vix_level) > VIX_STALE_EPSILON:

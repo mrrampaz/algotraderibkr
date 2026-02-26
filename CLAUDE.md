@@ -22,10 +22,29 @@ Cash is the default when no candidate clears thresholds.
 - `min_confidence`: 0.60
 - `min_risk_reward`: 1.5
 - `min_edge_pct`: 0.3
+- `options_min_confidence`: 0.55
+- `options_min_risk_reward`: 0.3
+- `options_min_edge_pct`: 0.1
 - `max_daily_trades`: 5
 - `max_capital_per_trade_pct`: 20.0
 - `max_daily_risk_pct`: 2.0
 - `cash_is_default`: true
+
+### Recent Root-Cause Fixes (2026-02-26)
+1. VIX feed now uses a multi-method stack in `RegimeDetector`:
+   - persistent IBKR index subscription (preferred),
+   - SPY ATM options IV proxy fallback,
+   - SPY 20-day realized volatility fallback,
+   - last-known VIX fallback.
+2. VIX market data subscription is kept open in `IBKRDataProvider` and read each regime cycle (no request/cancel loop).
+3. `scripts/run.py` singleton guard is Windows-safe (`tasklist` PID check) and rejects duplicate starts cleanly.
+4. All 7 strategies now emit scan-funnel diagnostics in `assess_opportunities()`:
+   - regime gate outcome,
+   - scan universe/context,
+   - filter-stage counters,
+   - final candidate counts.
+5. Brain now applies options-specific thresholding (`options_min_*`) so premium-selling setups are not filtered by directional-only defaults.
+6. `TradeCandidate.is_expired` handles timezone-aware expiry safely to avoid naive/aware datetime comparison crashes.
 
 ### Strategy Toolbox
 All 7 strategies emit concrete `TradeCandidate` objects (top-ranked, max 3 per strategy).

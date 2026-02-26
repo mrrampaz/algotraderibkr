@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import atexit
 import os
+import platform
 import subprocess
 import sys
 from pathlib import Path
@@ -21,28 +22,29 @@ load_dotenv()
 
 
 def _is_process_running(pid: int) -> bool:
+    """Check whether a PID is active."""
     if pid <= 0:
         return False
+
+    if platform.system() == "Windows":
+        try:
+            result = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            return str(pid) in result.stdout
+        except Exception:
+            # Safe default for lock safety.
+            return True
 
     try:
         os.kill(pid, 0)
         return True
     except OSError:
-        pass
-
-    # Windows fallback in case signal 0 behavior is environment-specific.
-    if os.name == "nt":
-        try:
-            result = subprocess.run(
-                ["tasklist", "/FI", f"PID eq {pid}"],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            return str(pid) in result.stdout
-        except Exception:
-            return False
-    return False
+        return False
 
 
 def acquire_lock() -> None:
@@ -50,20 +52,14 @@ def acquire_lock() -> None:
     if LOCK_FILE.exists():
         try:
             old_pid = int(LOCK_FILE.read_text(encoding="utf-8").strip())
-        except (ValueError, OSError):
-            old_pid = -1
-
-        if old_pid > 0 and _is_process_running(old_pid):
-            print(f"ERROR: Another instance is already running (PID {old_pid}).")
-            print(f"If this is stale, remove {LOCK_FILE} and retry.")
-            sys.exit(1)
-
-        try:
+            if _is_process_running(old_pid):
+                print(f"ERROR: Another instance is already running (PID {old_pid}).")
+                print(f"Kill it first, or delete {LOCK_FILE} if stale.")
+                sys.exit(1)
+            print(f"Removing stale lock (PID {old_pid} no longer running)")
             LOCK_FILE.unlink(missing_ok=True)
-            print(f"Removing stale lock file: {LOCK_FILE}")
-        except OSError:
-            print(f"ERROR: Could not remove stale lock file: {LOCK_FILE}")
-            sys.exit(1)
+        except (ValueError, OSError):
+            LOCK_FILE.unlink(missing_ok=True)
 
     LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
     LOCK_FILE.write_text(str(os.getpid()), encoding="utf-8")

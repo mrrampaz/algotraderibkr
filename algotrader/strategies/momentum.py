@@ -427,6 +427,7 @@ class MomentumStrategy(StrategyBase):
         """Assess breakout opportunities and emit concrete TradeCandidates."""
         self._log.info("assess_start", strategy=self.name)
         raw_scanned = 0
+        regime_type = regime.regime_type.value if regime else "none"
 
         def _complete(assessment: OpportunityAssessment) -> OpportunityAssessment:
             self._log.info(
@@ -439,7 +440,19 @@ class MomentumStrategy(StrategyBase):
 
         try:
             # Regime gate
-            if regime and regime.regime_type.value not in self._allowed_regimes:
+            regime_allowed = regime is None or regime.regime_type.value in self._allowed_regimes
+            self._log.info(
+                "momentum_regime_check",
+                regime=regime_type,
+                allowed=regime_allowed,
+                allowed_regimes=self._allowed_regimes,
+            )
+            if not regime_allowed:
+                self._log.warning(
+                    "momentum_regime_rejected",
+                    regime=regime_type,
+                    allowed_regimes=self._allowed_regimes,
+                )
                 return _complete(OpportunityAssessment())
 
             et_now = datetime.now(ET)
@@ -455,6 +468,21 @@ class MomentumStrategy(StrategyBase):
             )
             breakouts = scanner.scan()
             raw_scanned = len(breakouts)
+            self._log.info(
+                "momentum_scan_universe",
+                regime=regime_type,
+                breakout_hits=raw_scanned,
+                symbols=[bo.symbol for bo in breakouts[:10]],
+            )
+
+            filter_counts = {
+                "already_tracking_trade": 0,
+                "failed_volume_filter": 0,
+                "failed_consolidation_filter": 0,
+                "failed_spread_filter": 0,
+                "invalid_risk_setup": 0,
+                "passed_all_filters": 0,
+            }
 
             viable: list[Any] = []
             trade_candidates: list[TradeCandidate] = []
@@ -465,14 +493,18 @@ class MomentumStrategy(StrategyBase):
 
             for bo in breakouts:
                 if bo.symbol in self._trades:
+                    filter_counts["already_tracking_trade"] += 1
                     continue
                 if bo.volume_ratio < self._min_volume_ratio:
+                    filter_counts["failed_volume_filter"] += 1
                     continue
                 if bo.consolidation_days < self._min_consolidation_days:
+                    filter_counts["failed_consolidation_filter"] += 1
                     continue
 
                 quote = self.data_provider.get_quote(bo.symbol)
                 if quote and quote.is_valid() and quote.spread_pct * 100 > self._max_spread_pct:
+                    filter_counts["failed_spread_filter"] += 1
                     continue
 
                 if bo.breakout_type == "resistance_break":
@@ -493,6 +525,7 @@ class MomentumStrategy(StrategyBase):
                     continue
 
                 if risk_per_share <= 0 or entry_price <= 0:
+                    filter_counts["invalid_risk_setup"] += 1
                     continue
 
                 rr_ratio = abs(target_price - entry_price) / risk_per_share
@@ -570,8 +603,16 @@ class MomentumStrategy(StrategyBase):
                 rr_values.append(rr_ratio)
                 confidence_values.append(confidence)
                 edge_values.append(edge_pct)
+                filter_counts["passed_all_filters"] += 1
 
             if not viable:
+                self._log.info(
+                    "momentum_scan_result",
+                    regime=regime_type,
+                    breakout_hits=raw_scanned,
+                    final_candidates=0,
+                    filter_counts=filter_counts,
+                )
                 return _complete(OpportunityAssessment())
 
             trade_candidates.sort(key=lambda c: c.expected_value, reverse=True)
@@ -587,6 +628,13 @@ class MomentumStrategy(StrategyBase):
                 total_viable=len(viable),
                 emitted=len(trade_candidates),
                 symbols=[c.symbol for c in trade_candidates],
+            )
+            self._log.info(
+                "momentum_scan_result",
+                regime=regime_type,
+                breakout_hits=raw_scanned,
+                final_candidates=len(trade_candidates),
+                filter_counts=filter_counts,
             )
 
             return _complete(OpportunityAssessment(
