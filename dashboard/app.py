@@ -1,4 +1,6 @@
 """Professional Streamlit dashboard for AlgoTrader Brain + IBKR."""
+# streamlit run dashboard/app.py #
+
 
 from __future__ import annotations
 
@@ -17,7 +19,6 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as components
 
 try:
     import plotly.graph_objects as go
@@ -47,6 +48,11 @@ KNOWN_STRATEGIES = [
     "sector_rotation",
     "event_driven",
 ]
+
+# Process-wide dashboard IBKR handle to prevent duplicate client sessions
+# across Streamlit reruns/reloads.
+_DASHBOARD_IBKR_CONN: Any | None = None
+_DASHBOARD_IBKR_ERROR: str | None = None
 
 
 def _inject_project_venv_site_packages() -> bool:
@@ -335,10 +341,12 @@ def _build_dashboard_ibkr_connection() -> tuple[Any | None, str | None]:
         settings = Settings()
         base_cfg = settings.broker.ibkr.model_copy(deep=True)
         base_cfg.readonly = True
-        base_cfg.timeout = int(getattr(base_cfg, "timeout", 30) or 30)
+        # Keep dashboard connection attempts short to avoid UI freeze on refresh.
+        base_cfg.timeout = min(int(getattr(base_cfg, "timeout", 30) or 30), 5)
 
         base_client_id = int(base_cfg.client_id)
-        candidate_ids = [base_client_id + 1, base_client_id + 2, base_client_id + 10]
+        # Dashboard uses a single dedicated client ID to avoid churn on refresh.
+        candidate_ids = [base_client_id + 1]
         errors: list[str] = []
 
         for candidate_id in candidate_ids:
@@ -366,33 +374,33 @@ def _build_dashboard_ibkr_connection() -> tuple[Any | None, str | None]:
 
 
 def get_ibkr_connection(force_reconnect: bool = False) -> tuple[Any | None, str | None]:
-    """Get or establish a dashboard IBKR connection stored in session state."""
-    conn_key = "_dashboard_ibkr_conn"
-    err_key = "_dashboard_ibkr_error"
+    """Get or establish one process-wide dashboard IBKR connection."""
+    global _DASHBOARD_IBKR_CONN, _DASHBOARD_IBKR_ERROR
 
-    existing = st.session_state.get(conn_key)
-    if force_reconnect and existing is not None:
-        safe_ibkr_query(lambda: existing.disconnect(), fallback=None)
-        st.session_state.pop(conn_key, None)
+    if force_reconnect and _DASHBOARD_IBKR_CONN is not None:
+        safe_ibkr_query(lambda: _DASHBOARD_IBKR_CONN.disconnect(), fallback=None)
+        _DASHBOARD_IBKR_CONN = None
+        _DASHBOARD_IBKR_ERROR = None
 
-    existing = st.session_state.get(conn_key)
-    if existing is not None:
-        if getattr(existing, "connected", False):
-            st.session_state[err_key] = None
-            return existing, None
-        reconnected = safe_ibkr_query(lambda: existing.ensure_connected(), fallback=False)
-        if reconnected and getattr(existing, "connected", False):
-            st.session_state[err_key] = None
-            return existing, None
+    if _DASHBOARD_IBKR_CONN is not None:
+        if getattr(_DASHBOARD_IBKR_CONN, "connected", False):
+            _DASHBOARD_IBKR_ERROR = None
+            return _DASHBOARD_IBKR_CONN, None
+        reconnected = safe_ibkr_query(lambda: _DASHBOARD_IBKR_CONN.ensure_connected(), fallback=False)
+        if reconnected and getattr(_DASHBOARD_IBKR_CONN, "connected", False):
+            _DASHBOARD_IBKR_ERROR = None
+            return _DASHBOARD_IBKR_CONN, None
+        safe_ibkr_query(lambda: _DASHBOARD_IBKR_CONN.disconnect(), fallback=None)
+        _DASHBOARD_IBKR_CONN = None
 
     conn, err = _build_dashboard_ibkr_connection()
     if conn is not None:
-        st.session_state[conn_key] = conn
-        st.session_state[err_key] = None
+        _DASHBOARD_IBKR_CONN = conn
+        _DASHBOARD_IBKR_ERROR = None
         return conn, None
 
-    st.session_state[err_key] = err or "unknown connection error"
-    return None, st.session_state[err_key]
+    _DASHBOARD_IBKR_ERROR = err or "unknown connection error"
+    return None, _DASHBOARD_IBKR_ERROR
 
 
 def safe_ibkr_query(func, fallback=None):
@@ -1013,11 +1021,7 @@ def render_sidebar(ibkr_connected: bool, source_label: str, ibkr_error: str | No
 
     reconnect_now = st.sidebar.button("♻️ Reconnect IBKR", use_container_width=True)
     if reconnect_now:
-        existing = st.session_state.get("_dashboard_ibkr_conn")
-        if existing is not None:
-            safe_ibkr_query(lambda: existing.disconnect(), fallback=None)
-        st.session_state.pop("_dashboard_ibkr_conn", None)
-        st.session_state.pop("_dashboard_ibkr_error", None)
+        get_ibkr_connection(force_reconnect=True)
         st.cache_data.clear()
         st.rerun()
 
@@ -1025,7 +1029,7 @@ def render_sidebar(ibkr_connected: bool, source_label: str, ibkr_error: str | No
         st.cache_data.clear()
         st.rerun()
 
-    auto_refresh = st.sidebar.checkbox("Auto-refresh (30s)", value=True)
+    auto_refresh = st.sidebar.checkbox("Auto-refresh (30s)", value=False)
     if auto_refresh:
         try:
             from streamlit_autorefresh import st_autorefresh
@@ -1033,12 +1037,7 @@ def render_sidebar(ibkr_connected: bool, source_label: str, ibkr_error: str | No
             st_autorefresh(interval=30000, limit=None, key="brain_dashboard_refresh")
             st.sidebar.caption("Auto-refresh active")
         except Exception:
-            components.html(
-                "<script>setTimeout(function(){window.parent.location.reload();}, 30000);</script>",
-                height=0,
-                width=0,
-            )
-            st.sidebar.caption("Auto-refresh active (fallback mode)")
+            st.sidebar.caption("Auto-refresh unavailable (`streamlit-autorefresh` not installed)")
 
 
 def render_command_center(
