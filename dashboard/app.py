@@ -8,6 +8,7 @@ import platform
 import re
 import sqlite3
 import subprocess
+import sys
 from collections import Counter, defaultdict, deque
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -25,6 +26,10 @@ except Exception:  # pragma: no cover - graceful fallback if optional dep missin
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+# Ensure local package imports work no matter where `streamlit run` is launched.
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 DATA_DIR = REPO_ROOT / "data"
 STATE_DIR = DATA_DIR / "state"
 LOG_PATH = DATA_DIR / "logs" / "algotrader.log"
@@ -1391,6 +1396,10 @@ def main() -> None:
     if not ibkr_connected:
         msg = "⚠️ IBKR not connected. Showing cached state/journal data where available."
         if ibkr_error:
+            if "No module named 'algotrader'" in ibkr_error:
+                ibkr_error = (
+                    f"{ibkr_error}. Start with: `uv run python -m streamlit run {Path(__file__).as_posix()}`"
+                )
             msg = f"{msg} ({ibkr_error})"
         st.warning(msg)
 
