@@ -11,16 +11,15 @@ Cash is the default when no candidate clears thresholds.
 ### Decision Flow
 1. Startup initializes broker/data/executor, imports all strategies, and allocates configured capital slices.
 2. Warm-up restores saved strategy state (`strategy.restore_state()`) and then runs strategy warm-up logic.
-3. Pre-market intelligence refresh runs before regular trading loop.
-4. Each cycle detects market regime and asks all 7 strategies for `OpportunityAssessment` with explicit `TradeCandidate` rows.
-5. In `strategy_selector.mode: brain`, `DailyBrain` filters/scores/ranks candidates across strategies.
-6. Brain selects a concentrated set of trades under confidence/RR/edge/risk/capital limits and applies per-strategy capital (`set_capital`).
-7. Strategies still run cycles and manage existing positions even when new-entry capital is set to `0.0`.
-8. Midday review runs once and can tighten entry standards and emit close recommendations.
-9. At 3:45 PM ET to 4:00 PM ET, orchestrator expiry guard runs `_check_expiry_risk()` and closes same-day option positions to prevent exercise/assignment.
-10. Decisions/state are persisted to `data/state/*.json` (including `brain_decision.json`, `assessments.json`, `broker_snapshot.json`).
-
-Note on reconciliation: startup restores strategy state and dashboard snapshots broker positions; explicit broker-vs-internal morning mismatch alarms are not fully implemented yet.
+3. Startup morning reconciliation runs `_morning_reconciliation()` and compares broker startup positions vs strategy-restored held symbols, logging `unexpected_position_found` when mismatches exist.
+4. Pre-market intelligence refresh runs before regular trading loop.
+5. Each cycle detects market regime and asks all 7 strategies for `OpportunityAssessment` with explicit `TradeCandidate` rows.
+6. In `strategy_selector.mode: brain`, `DailyBrain` filters/scores/ranks candidates across strategies.
+7. Brain selects a concentrated set of trades under confidence/RR/edge/risk/capital limits and applies per-strategy capital (`set_capital`).
+8. Strategies still run cycles and manage existing positions even when new-entry capital is set to `0.0`.
+9. Midday review runs once and can tighten entry standards and emit close recommendations.
+10. At 3:45 PM ET to 4:00 PM ET, orchestrator expiry guard runs `_check_expiry_risk()` and closes same-day option positions to prevent exercise/assignment.
+11. Decisions/state are persisted to `data/state/*.json` (including `brain_decision.json`, `assessments.json`, `broker_snapshot.json`).
 
 ### Brain Thresholds (from `config/settings.yaml`)
 - `min_confidence`: 0.60
@@ -82,6 +81,12 @@ Note on reconciliation: startup restores strategy state and dashboard snapshots 
 7. Order-construction trace logging:
    - Strategy: `options_order_construction`.
    - Executor: `ibkr_mleg_order_construction`.
+8. Startup broker reconciliation:
+   - `orchestrator._morning_reconciliation()` checks broker positions at startup against strategy-restored state.
+   - Unexpected startup carries are logged via `unexpected_position_found` and summarized in `morning_reconciliation`.
+9. Exercise-exposure position cap:
+   - `options_premium` enforces a hard contract cap using `exercise_exposure_cap_pct` (default 20%).
+   - Formula: `floor(equity * cap_pct / (strike * 100))`, minimum 1 contract.
 
 ### Strategy Toolbox
 All 7 strategies emit concrete `TradeCandidate` objects (top-ranked, max 3 per strategy).
@@ -89,7 +94,7 @@ All 7 strategies emit concrete `TradeCandidate` objects (top-ranked, max 3 per s
 | Strategy | CandidateType | Best Regime | Notes |
 |----------|---------------|-------------|-------|
 | Momentum/Breakout | `LONG_EQUITY` / `SHORT_EQUITY` | trending | Breakout scanner + volume confirmation |
-| 0DTE Options Premium | `CREDIT_SPREAD` | ranging/high_vol | Production mode sells OTM put/call credit spreads with explicit per-leg BAG actions. Pre-expiry auto-close at 3:45 PM ET. Policy min credit: $0.10/contract (current config is stricter). |
+| 0DTE Options Premium | `CREDIT_SPREAD` | ranging/high_vol | Production mode sells OTM put/call credit spreads with explicit per-leg BAG actions. Pre-expiry auto-close at 3:45 PM ET. Policy min credit: $0.10/contract (current config is stricter). Hard exercise-exposure cap enforced at 20% equity by default. |
 | VWAP Mean Reversion | `LONG_EQUITY` / `SHORT_EQUITY` | ranging/low_vol | VWAP z-score mean reversion |
 | Pairs Trading | `PAIRS` | ranging | Includes anti-churn filter (expected profit >= 3x est. cost) |
 | Gap Reversal | `LONG_EQUITY` / `SHORT_EQUITY` | mixed AM regimes | Entry expiry around 11:00 AM ET |
@@ -228,7 +233,8 @@ grep "expiry_risk\|pre_expiry_close\|check_expiry\|closing_expiring_option\|expi
 - Verify BAG spread fills for direction sanity.
   - If intended credit spread fills as net debit, flatten immediately and investigate executor mapping.
 - Position-size options conservatively.
-  - Sizing sanity-check formula: `max_contracts = floor(equity * max_capital_pct / (strike * 100))`.
+  - Hard cap is enforced in `options_premium` using `exercise_exposure_cap_pct` (default `20.0`).
+  - Formula: `max_contracts = floor(equity * max_capital_pct / (strike * 100))`.
   - Example: SPY, $100,000 equity, `max_capital_pct=20%` -> `floor(100000*0.20/(SPY*100))` ~= 1 contract.
   - Align with Brain capital cap (`max_capital_per_trade_pct`) and strategy risk caps (`max_risk_per_trade`, `max_contracts`).
   - Avoid opening contracts that imply unintended stock-equivalent leverage at expiry.
