@@ -48,6 +48,26 @@ KNOWN_STRATEGIES = [
     "event_driven",
 ]
 
+
+def _inject_project_venv_site_packages() -> bool:
+    """Attempt to load deps from local .venv when launched with a different Python."""
+    inserted = False
+    candidates: list[Path] = []
+
+    # Windows venv layout
+    candidates.append(REPO_ROOT / ".venv" / "Lib" / "site-packages")
+    # POSIX venv layout(s)
+    candidates.extend((REPO_ROOT / ".venv" / "lib").glob("python*/site-packages"))
+
+    for path in candidates:
+        if not path.exists():
+            continue
+        text = str(path)
+        if text not in sys.path:
+            sys.path.insert(0, text)
+            inserted = True
+    return inserted
+
 st.set_page_config(
     page_title="AlgoTrader - Brain Dashboard",
     page_icon="🧠",
@@ -308,7 +328,7 @@ def get_system_health(log_entries: list[dict[str, Any]]) -> dict[str, Any]:
 
 def _build_dashboard_ibkr_connection() -> tuple[Any | None, str | None]:
     """Create a dashboard IBKR connection with safe readonly/retry behavior."""
-    try:
+    def _connect_once() -> tuple[Any | None, str | None]:
         from algotrader.core.config import Settings
         from algotrader.execution.ibkr_connection import IBKRConnection
 
@@ -330,6 +350,17 @@ def _build_dashboard_ibkr_connection() -> tuple[Any | None, str | None]:
             errors.append(f"client_id={candidate_id} failed")
 
         return None, "; ".join(errors) if errors else "connection failed"
+
+    try:
+        return _connect_once()
+    except ModuleNotFoundError as exc:
+        # Common case: dashboard launched outside project venv.
+        if _inject_project_venv_site_packages():
+            try:
+                return _connect_once()
+            except Exception as retry_exc:
+                return None, str(retry_exc)
+        return None, str(exc)
     except Exception as exc:
         return None, str(exc)
 
@@ -1396,7 +1427,7 @@ def main() -> None:
     if not ibkr_connected:
         msg = "⚠️ IBKR not connected. Showing cached state/journal data where available."
         if ibkr_error:
-            if "No module named 'algotrader'" in ibkr_error:
+            if "No module named 'algotrader'" in ibkr_error or "No module named 'nest_asyncio'" in ibkr_error:
                 ibkr_error = (
                     f"{ibkr_error}. Start with: `uv run python -m streamlit run {Path(__file__).as_posix()}`"
                 )
