@@ -105,15 +105,21 @@ class OptionsPremiumStrategy(StrategyBase):
         self._win_rate_credit_spread = params.get("win_rate_credit_spread", 0.70)
         self._win_rate_iron_condor = params.get("win_rate_iron_condor", 0.72)
         self._event_day_confidence_penalty = params.get("event_day_confidence_penalty", 0.25)
+        self._min_credit_per_spread = float(params.get("min_credit_per_spread", 50.0))
+        self._max_commission_per_spread = float(params.get("max_commission_per_spread", 4.0))
 
         # Exit
         self._profit_target_pct = params.get("profit_target_pct", 50.0)
         self._stop_loss_pct = params.get("stop_loss_pct", 200.0)
         self._close_before_minutes = params.get("close_before_minutes", 15)
+        self._expiry_risk_close_minutes = int(
+            params.get("expiry_risk_close_minutes", max(15, self._close_before_minutes)),
+        )
 
         # Sizing
         self._max_risk_per_trade = params.get("max_risk_per_trade", 500)
         self._max_contracts = params.get("max_contracts", 5)
+        self._exercise_exposure_cap_pct = float(params.get("exercise_exposure_cap_pct", 20.0))
 
         # Regime filter
         self._allowed_regimes = params.get(
@@ -169,9 +175,19 @@ class OptionsPremiumStrategy(StrategyBase):
     def _manage_positions(self, et_now: datetime, regime: MarketRegime | None) -> list[Signal]:
         """Manage open premium trades."""
         signals: list[Signal] = []
+        market_close = et_now.replace(hour=16, minute=0, second=0, microsecond=0)
+        minutes_to_close = (market_close - et_now).total_seconds() / 60
 
         for trade_key, trade in list(self._trades.items()):
             close_reason = ""
+
+            # Force-close expiring options to prevent exercise/assignment risk.
+            if (
+                trade.expiration is not None
+                and trade.expiration <= et_now.date()
+                and minutes_to_close <= self._expiry_risk_close_minutes
+            ):
+                close_reason = f"prevent_exercise_{self._expiry_risk_close_minutes}m"
 
             # Get current underlying price
             current_price = self._get_current_price(trade.underlying)
@@ -182,17 +198,15 @@ class OptionsPremiumStrategy(StrategyBase):
             estimated_pnl_pct = self._estimate_pnl_pct(trade, current_price)
 
             # 1. Profit target (close at 50% of max profit)
-            if estimated_pnl_pct >= self._profit_target_pct:
+            if not close_reason and estimated_pnl_pct >= self._profit_target_pct:
                 close_reason = f"profit_target: est {estimated_pnl_pct:.0f}% of max"
 
             # 2. Stop loss (close at 200% of credit = net 100% loss)
-            elif estimated_pnl_pct <= -self._stop_loss_pct:
+            elif not close_reason and estimated_pnl_pct <= -self._stop_loss_pct:
                 close_reason = f"stop_loss: est {estimated_pnl_pct:.0f}% of max"
 
             # 3. Close before market close
-            market_close = et_now.replace(hour=16, minute=0)
-            minutes_to_close = (market_close - et_now).total_seconds() / 60
-            if minutes_to_close <= self._close_before_minutes:
+            if not close_reason and minutes_to_close <= self._close_before_minutes:
                 close_reason = "close_before_eod"
 
             if close_reason:
@@ -267,19 +281,47 @@ class OptionsPremiumStrategy(StrategyBase):
             )
             contracts = max(contracts, 1)
 
-            total_risk = contracts * max_loss_per_contract
-            total_credit = contracts * estimated_credit
-
             # For iron condor, double the credit (two sides)
             call_short = None
             call_long = None
             if structure == "iron_condor":
                 call_short = round(current_price + strike_distance)
                 call_long = call_short + self._wing_width
+
+            exposure_strike = short_strike
+            if structure == "iron_condor" and call_short is not None:
+                exposure_strike = max(short_strike, call_short)
+            contracts = self._cap_contracts_by_exercise_exposure(
+                contracts=contracts,
+                strike_for_exposure=exposure_strike,
+                underlying=underlying,
+                structure=structure,
+                context="entry",
+            )
+
+            total_risk = contracts * max_loss_per_contract
+            total_credit = contracts * estimated_credit
+            estimated_round_trip_cost = contracts * self._max_commission_per_spread
+            if structure == "iron_condor":
                 total_credit *= 2
                 total_risk = contracts * spread_width  # Max loss is one side
+                estimated_round_trip_cost *= 2
 
             # Reserve capital for margin
+            net_credit_after_cost = total_credit - estimated_round_trip_cost
+            if total_credit < self._min_credit_per_spread or net_credit_after_cost <= 0:
+                self._log.info(
+                    "options_credit_filtered",
+                    underlying=underlying,
+                    structure=structure,
+                    contracts=contracts,
+                    gross_credit=round(total_credit, 2),
+                    est_round_trip_cost=round(estimated_round_trip_cost, 2),
+                    net_credit_after_cost=round(net_credit_after_cost, 2),
+                    min_credit_per_spread=self._min_credit_per_spread,
+                )
+                continue
+
             capital_needed = total_risk
             if not self.reserve_capital(capital_needed):
                 continue
@@ -462,6 +504,23 @@ class OptionsPremiumStrategy(StrategyBase):
             self._log.info("options_executor_no_mleg", underlying=underlying)
             return None
 
+        if structure == "put_spread" and short_strike <= long_strike:
+            self._log.error(
+                "options_invalid_strike_geometry",
+                structure=structure,
+                short_strike=short_strike,
+                long_strike=long_strike,
+            )
+            return None
+        if structure == "call_spread" and short_strike >= long_strike:
+            self._log.error(
+                "options_invalid_strike_geometry",
+                structure=structure,
+                short_strike=short_strike,
+                long_strike=long_strike,
+            )
+            return None
+
         # Resolve option type for each spread direction
         if structure == "put_spread" or structure == "iron_condor":
             put_or_call = "put"
@@ -492,6 +551,7 @@ class OptionsPremiumStrategy(StrategyBase):
             {"symbol": short_occ, "ratio_qty": 1, "side": OrderSide.SELL, "position_intent": "sell_to_open"},
             {"symbol": long_occ,  "ratio_qty": 1, "side": OrderSide.BUY,  "position_intent": "buy_to_open"},
         ]
+        primary_right = "P" if put_or_call == "put" else "C"
 
         # Iron condor: add the call-side spread as two additional legs
         call_short_occ = ""
@@ -516,6 +576,32 @@ class OptionsPremiumStrategy(StrategyBase):
                     call_short_strike=call_short_strike,
                     call_long_strike=call_long_strike,
                 )
+
+        self._log.info(
+            "options_order_construction",
+            strategy=self.name,
+            intended_structure=structure,
+            direction="short",
+            symbol=underlying,
+            short_strike=short_strike,
+            long_strike=long_strike,
+            leg1_action="SELL",
+            leg1_symbol=short_occ,
+            leg1_strike=short_strike,
+            leg1_right=primary_right,
+            leg2_action="BUY",
+            leg2_symbol=long_occ,
+            leg2_strike=long_strike,
+            leg2_right=primary_right,
+            leg3_action="SELL" if call_short_occ else "",
+            leg3_symbol=call_short_occ,
+            leg3_strike=call_short_strike if call_short_occ else None,
+            leg3_right="C" if call_short_occ else "",
+            leg4_action="BUY" if call_long_occ else "",
+            leg4_symbol=call_long_occ,
+            leg4_strike=call_long_strike if call_long_occ else None,
+            leg4_right="C" if call_long_occ else "",
+        )
 
         order_id = self.executor.submit_mleg_order(legs, qty=contracts)
         if order_id is None:
@@ -667,6 +753,63 @@ class OptionsPremiumStrategy(StrategyBase):
         except Exception:
             pass
         return None
+
+    def _get_account_equity(self) -> float | None:
+        """Best-effort account equity fetch for exercise-exposure caps."""
+        try:
+            account = self.executor.get_account()
+            equity = float(getattr(account, "equity", 0.0) or 0.0)
+            if equity > 0:
+                return equity
+        except Exception:
+            self._log.debug("options_account_equity_fetch_failed")
+        return None
+
+    def _cap_contracts_by_exercise_exposure(
+        self,
+        *,
+        contracts: int,
+        strike_for_exposure: float,
+        underlying: str,
+        structure: str,
+        context: str,
+    ) -> int:
+        """Cap contracts so notional exercise exposure stays within policy."""
+        if contracts <= 0:
+            return 0
+        if strike_for_exposure <= 0:
+            return contracts
+
+        max_capital_pct = max(0.0, self._exercise_exposure_cap_pct) / 100.0
+        if max_capital_pct <= 0:
+            return contracts
+
+        account_equity = self._get_account_equity()
+        if account_equity is None:
+            return contracts
+
+        exposure_per_contract = strike_for_exposure * 100.0
+        if exposure_per_contract <= 0:
+            return contracts
+
+        max_contracts_by_exposure = int(account_equity * max_capital_pct / exposure_per_contract)
+        max_contracts_by_exposure = max(1, max_contracts_by_exposure)
+        capped_contracts = min(contracts, max_contracts_by_exposure)
+        if capped_contracts < contracts:
+            self._log.info(
+                "contracts_capped_exercise_exposure",
+                context=context,
+                underlying=underlying,
+                structure=structure,
+                original=contracts,
+                capped=capped_contracts,
+                strike_for_exposure=round(strike_for_exposure, 2),
+                exposure_per_contract=round(exposure_per_contract, 2),
+                equity=round(account_equity, 2),
+                max_allowed=round(account_equity * max_capital_pct, 2),
+                max_capital_pct=round(max_capital_pct * 100.0, 2),
+            )
+        return capped_contracts
 
     def _structure_win_rate(self, structure: str) -> float:
         if structure == "iron_condor":
@@ -843,6 +986,16 @@ class OptionsPremiumStrategy(StrategyBase):
                         int(self._max_risk_per_trade / max_loss_per_contract) if max_loss_per_contract > 0 else 1,
                     )
                     contracts = max(1, contracts)
+                    exposure_strike = short_strike
+                    if structure == "iron_condor" and call_short > 0:
+                        exposure_strike = max(short_strike, call_short)
+                    contracts = self._cap_contracts_by_exercise_exposure(
+                        contracts=contracts,
+                        strike_for_exposure=exposure_strike,
+                        underlying=underlying,
+                        structure=structure,
+                        context="assess",
+                    )
 
                     total_credit = credit_per_contract * contracts
                     total_max_loss = max_loss_per_contract * contracts

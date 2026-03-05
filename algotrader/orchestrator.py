@@ -19,7 +19,7 @@ import structlog
 from algotrader.core.config import Settings, StrategyConfig, load_strategy_config, load_yaml
 from algotrader.core.events import EventBus, KILL_SWITCH, STRATEGY_DISABLED
 from algotrader.core.logging import setup_logging
-from algotrader.core.models import MarketRegime, RegimeType
+from algotrader.core.models import MarketRegime, OrderSide, RegimeType
 from algotrader.data.alpaca_provider import AlpacaDataProvider
 from algotrader.data.cache import DataCache
 from algotrader.execution.alpaca_executor import AlpacaExecutor
@@ -159,6 +159,8 @@ class Orchestrator:
         self._use_brain: bool = False
         self._last_brain_open_decision: date | None = None
         self._last_brain_midday_review: date | None = None
+        self._expiry_guard_date: date | None = None
+        self._expiry_guard_attempted_conids: set[int] = set()
 
         if settings.strategy_selector.enabled:
             try:
@@ -381,6 +383,13 @@ class Orchestrator:
             self.shutdown()
             return
 
+        # Startup safety: compare broker positions to strategy-held symbols and
+        # flag unexpected carry from prior sessions (e.g., exercise/assignment).
+        self._morning_reconciliation()
+        if self._shutdown_requested:
+            self.shutdown()
+            return
+
         # Pre-market intelligence
         self._run_pre_market_intelligence()
         if self._shutdown_requested:
@@ -521,6 +530,13 @@ class Orchestrator:
                                 )
             except Exception:
                 self._log.exception("midday_review_failed")
+
+        # Safety guard: near expiration close any orphan option legs from broker
+        # positions to prevent exercise/assignment.
+        try:
+            self._check_expiry_risk()
+        except Exception:
+            self._log.exception("expiry_risk_check_failed")
 
         # Run risk checks
         strategy_statuses = [s.get_status() for s in self._strategies.values()]
@@ -982,6 +998,129 @@ class Orchestrator:
             return float(snapshot.get("daily_pnl", 0.0))
         except Exception:
             return 0.0
+
+    def _morning_reconciliation(self) -> None:
+        """Check startup broker positions against strategy-restored state."""
+        try:
+            expected_symbols: set[str] = set()
+            for name, strategy in self._strategies.items():
+                try:
+                    held = strategy.get_held_symbols()
+                    for symbol in held:
+                        normalized = str(symbol or "").strip().upper()
+                        if normalized:
+                            expected_symbols.add(normalized)
+                except Exception:
+                    self._log.debug("morning_reconciliation_strategy_read_failed", strategy=name)
+
+            broker_positions = self._executor.get_positions()
+            if not broker_positions:
+                self._log.info("morning_reconciliation", result="clean", positions=0)
+                return
+
+            non_zero_positions = [
+                pos for pos in broker_positions if abs(float(getattr(pos, "qty", 0.0) or 0.0)) > 0
+            ]
+            if not non_zero_positions:
+                self._log.info("morning_reconciliation", result="clean", positions=0)
+                return
+
+            unexpected_count = 0
+            for pos in non_zero_positions:
+                symbol = str(getattr(pos, "symbol", "") or "").upper()
+                qty = float(getattr(pos, "qty", 0.0) or 0.0)
+                side = getattr(getattr(pos, "side", None), "value", "")
+                if symbol and symbol in expected_symbols:
+                    continue
+
+                unexpected_count += 1
+                self._log.warning(
+                    "unexpected_position_found",
+                    symbol=symbol or "unknown",
+                    quantity=qty,
+                    side=side,
+                    reason="Position exists in IBKR at startup; likely prior-session carry or exercise/assignment",
+                )
+
+            if unexpected_count > 0:
+                self._log.warning(
+                    "morning_reconciliation",
+                    result="positions_found",
+                    count=unexpected_count,
+                    broker_positions=len(non_zero_positions),
+                    expected_symbols=sorted(expected_symbols),
+                    action="manual_review_recommended_close_unexpected_before_trading",
+                )
+            else:
+                self._log.info(
+                    "morning_reconciliation",
+                    result="clean",
+                    positions=len(non_zero_positions),
+                    expected_symbols=sorted(expected_symbols),
+                )
+        except Exception as exc:
+            self._log.error("morning_reconciliation_failed", error=str(exc))
+
+    def _check_expiry_risk(self) -> None:
+        """Close expiring option positions near the close to prevent exercise."""
+        et_now = datetime.now(pytz.timezone("America/New_York"))
+        if et_now.hour < 15 or (et_now.hour == 15 and et_now.minute < 45) or et_now.hour >= 16:
+            return
+
+        today = et_now.date()
+        if self._expiry_guard_date != today:
+            self._expiry_guard_date = today
+            self._expiry_guard_attempted_conids.clear()
+
+        get_option_positions = getattr(self._executor, "get_option_positions", None)
+        close_option_position = getattr(self._executor, "close_option_position", None)
+        if not callable(get_option_positions) or not callable(close_option_position):
+            return
+
+        option_positions = get_option_positions()
+        for pos in option_positions:
+            expiry = pos.get("expiry")
+            con_id = int(pos.get("con_id", 0) or 0)
+            qty = float(pos.get("qty", 0.0) or 0.0)
+            if not isinstance(expiry, date) or expiry != today:
+                continue
+            if con_id <= 0 or qty == 0:
+                continue
+            if con_id in self._expiry_guard_attempted_conids:
+                continue
+
+            close_side = OrderSide.SELL if qty > 0 else OrderSide.BUY
+            self._log.warning(
+                "closing_expiring_option",
+                symbol=pos.get("symbol", ""),
+                local_symbol=pos.get("local_symbol", ""),
+                con_id=con_id,
+                right=pos.get("right", ""),
+                strike=pos.get("strike"),
+                expiry=str(expiry),
+                qty=abs(qty),
+                side=close_side.value,
+                reason="prevent_exercise",
+            )
+            close_order_id = close_option_position(
+                con_id=con_id,
+                qty=abs(qty),
+                side=close_side,
+            )
+            if close_order_id:
+                self._expiry_guard_attempted_conids.add(con_id)
+                self._log.info(
+                    "expiring_option_close_submitted",
+                    order_id=close_order_id,
+                    con_id=con_id,
+                    local_symbol=pos.get("local_symbol", ""),
+                )
+            else:
+                self._log.error(
+                    "expiring_option_close_failed",
+                    con_id=con_id,
+                    local_symbol=pos.get("local_symbol", ""),
+                )
 
     def _needs_brain_open_decision(self) -> bool:
         """Run one brain open decision shortly after market open each day."""

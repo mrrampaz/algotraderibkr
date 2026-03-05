@@ -107,6 +107,16 @@ class IBKRExecutor:
     def _local_order_id(ib_order_id: int) -> str:
         return f"ibkr_{ib_order_id}"
 
+    @staticmethod
+    def _parse_option_expiry(raw_expiry: str) -> date | None:
+        digits = "".join(ch for ch in (raw_expiry or "") if ch.isdigit())
+        if len(digits) < 8:
+            return None
+        try:
+            return datetime.strptime(digits[:8], "%Y%m%d").date()
+        except ValueError:
+            return None
+
     def _ib_order_id(self, order_id: str) -> int | None:
         if order_id in self._order_id_map:
             return self._order_id_map[order_id]
@@ -808,6 +818,7 @@ class IBKRExecutor:
             resolved_contracts.append((leg, contract))
 
         combo_legs = []
+        leg_details: list[dict[str, Any]] = []
         for leg, contract in resolved_contracts:
             side = leg.get("side", OrderSide.BUY)
             action = "BUY" if side == OrderSide.BUY else "SELL"
@@ -820,6 +831,16 @@ class IBKRExecutor:
                     exchange="SMART",
                 )
             )
+            leg_details.append({
+                "requested_symbol": str(leg.get("symbol", "")),
+                "resolved_local_symbol": str(getattr(contract, "localSymbol", "") or ""),
+                "con_id": int(getattr(contract, "conId", 0) or 0),
+                "action": action,
+                "ratio": ratio,
+                "right": str(getattr(contract, "right", "") or ""),
+                "strike": self._safe_optional_float(getattr(contract, "strike", None)),
+                "expiry": str(getattr(contract, "lastTradeDateOrContractMonth", "") or ""),
+            })
 
         first_contract = resolved_contracts[0][1]
         bag = Contract(
@@ -830,7 +851,15 @@ class IBKRExecutor:
             comboLegs=combo_legs,
         )
 
-        combo_action = "BUY" if legs[0].get("side") == OrderSide.BUY else "SELL"
+        # For mixed-leg option spreads, IBKR evaluates each ComboLeg action.
+        # A SELL combo action flips spread orientation and can invert credit/debit intent.
+        combo_action = "BUY"
+        self._log.info(
+            "ibkr_mleg_order_construction",
+            combo_action=combo_action,
+            qty=qty,
+            leg_details=leg_details,
+        )
         order = MarketOrder(
             action=combo_action,
             totalQuantity=float(qty),
@@ -851,4 +880,99 @@ class IBKRExecutor:
             return local_id
         except Exception:
             self._log.exception("ibkr_mleg_submit_failed")
+            return None
+
+    def get_option_positions(self) -> list[dict[str, Any]]:
+        try:
+            portfolio = self._connection.execute(lambda ib: ib.portfolio())
+        except Exception:
+            self._log.exception("ibkr_get_option_positions_failed")
+            return []
+
+        out: list[dict[str, Any]] = []
+        for item in portfolio or []:
+            contract = getattr(item, "contract", None)
+            if contract is None:
+                continue
+            if str(getattr(contract, "secType", "")).upper() != "OPT":
+                continue
+
+            raw_qty = self._safe_float(getattr(item, "position", 0.0))
+            if raw_qty == 0:
+                continue
+
+            con_id = int(getattr(contract, "conId", 0) or 0)
+            if con_id <= 0:
+                continue
+
+            raw_expiry = str(getattr(contract, "lastTradeDateOrContractMonth", "") or "")
+            out.append({
+                "con_id": con_id,
+                "symbol": str(getattr(contract, "symbol", "") or ""),
+                "local_symbol": str(getattr(contract, "localSymbol", "") or ""),
+                "right": str(getattr(contract, "right", "") or ""),
+                "strike": self._safe_optional_float(getattr(contract, "strike", None)),
+                "expiry": self._parse_option_expiry(raw_expiry),
+                "expiry_raw": raw_expiry,
+                "qty": raw_qty,
+            })
+        return out
+
+    def close_option_position(
+        self,
+        con_id: int,
+        qty: float,
+        side: OrderSide,
+        client_order_id: str | None = None,
+    ) -> str | None:
+        if not self._require_writable("close_option_position"):
+            return None
+        if con_id <= 0 or qty <= 0:
+            return None
+
+        base_contract = Contract(conId=int(con_id), exchange="SMART")
+        try:
+            qualified = self._connection.execute(lambda ib: ib.qualifyContracts(base_contract))
+        except Exception:
+            self._log.exception("ibkr_option_close_qualify_failed", con_id=con_id)
+            return None
+
+        if not qualified:
+            self._log.warning("ibkr_option_close_unqualified", con_id=con_id)
+            return None
+
+        contract = qualified[0]
+        client_order_id = client_order_id or f"close_opt_{con_id}_{uuid.uuid4()}"
+        action = "BUY" if side == OrderSide.BUY else "SELL"
+        order = MarketOrder(
+            action=action,
+            totalQuantity=float(qty),
+            tif="DAY",
+            orderRef=client_order_id,
+        )
+
+        try:
+            trade = self._connection.execute(lambda ib: ib.placeOrder(contract, order))
+            self._register_trade(trade)
+            local_id = self._local_order_id(int(trade.order.orderId))
+            self._log.info(
+                "ibkr_option_close_submitted",
+                order_id=local_id,
+                con_id=con_id,
+                symbol=str(getattr(contract, "symbol", "") or ""),
+                local_symbol=str(getattr(contract, "localSymbol", "") or ""),
+                side=side.value,
+                qty=qty,
+                right=str(getattr(contract, "right", "") or ""),
+                strike=self._safe_optional_float(getattr(contract, "strike", None)),
+                expiry=str(getattr(contract, "lastTradeDateOrContractMonth", "") or ""),
+            )
+            return local_id
+        except Exception:
+            self._log.exception(
+                "ibkr_option_close_submit_failed",
+                con_id=con_id,
+                side=side.value,
+                qty=qty,
+            )
             return None
