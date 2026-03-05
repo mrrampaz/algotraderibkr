@@ -301,25 +301,62 @@ def get_system_health(log_entries: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-@st.cache_resource(show_spinner=False)
-def get_ibkr_connection() -> Any | None:
-    """Dashboard IBKR connection using readonly mode and distinct client ID."""
+def _build_dashboard_ibkr_connection() -> tuple[Any | None, str | None]:
+    """Create a dashboard IBKR connection with safe readonly/retry behavior."""
     try:
         from algotrader.core.config import Settings
         from algotrader.execution.ibkr_connection import IBKRConnection
 
         settings = Settings()
-        ibkr_cfg = settings.broker.ibkr.model_copy(deep=True)
-        ibkr_cfg.client_id = int(ibkr_cfg.client_id) + 1
-        ibkr_cfg.readonly = True
-        ibkr_cfg.timeout = min(int(getattr(ibkr_cfg, "timeout", 5) or 5), 5)
+        base_cfg = settings.broker.ibkr.model_copy(deep=True)
+        base_cfg.readonly = True
+        base_cfg.timeout = int(getattr(base_cfg, "timeout", 30) or 30)
 
-        conn = IBKRConnection(config=ibkr_cfg)
-        if conn.connect() and conn.connected:
-            return conn
-    except Exception:
-        return None
-    return None
+        base_client_id = int(base_cfg.client_id)
+        candidate_ids = [base_client_id + 1, base_client_id + 2, base_client_id + 10]
+        errors: list[str] = []
+
+        for candidate_id in candidate_ids:
+            cfg = base_cfg.model_copy(deep=True)
+            cfg.client_id = candidate_id
+            conn = IBKRConnection(config=cfg)
+            if conn.connect() and conn.connected:
+                return conn, None
+            errors.append(f"client_id={candidate_id} failed")
+
+        return None, "; ".join(errors) if errors else "connection failed"
+    except Exception as exc:
+        return None, str(exc)
+
+
+def get_ibkr_connection(force_reconnect: bool = False) -> tuple[Any | None, str | None]:
+    """Get or establish a dashboard IBKR connection stored in session state."""
+    conn_key = "_dashboard_ibkr_conn"
+    err_key = "_dashboard_ibkr_error"
+
+    existing = st.session_state.get(conn_key)
+    if force_reconnect and existing is not None:
+        safe_ibkr_query(lambda: existing.disconnect(), fallback=None)
+        st.session_state.pop(conn_key, None)
+
+    existing = st.session_state.get(conn_key)
+    if existing is not None:
+        if getattr(existing, "connected", False):
+            st.session_state[err_key] = None
+            return existing, None
+        reconnected = safe_ibkr_query(lambda: existing.ensure_connected(), fallback=False)
+        if reconnected and getattr(existing, "connected", False):
+            st.session_state[err_key] = None
+            return existing, None
+
+    conn, err = _build_dashboard_ibkr_connection()
+    if conn is not None:
+        st.session_state[conn_key] = conn
+        st.session_state[err_key] = None
+        return conn, None
+
+    st.session_state[err_key] = err or "unknown connection error"
+    return None, st.session_state[err_key]
 
 
 def safe_ibkr_query(func, fallback=None):
@@ -341,7 +378,15 @@ def fetch_ibkr_live_data(conn: Any | None) -> dict[str, Any]:
         "trades": [],
     }
 
-    if conn is None or not getattr(conn, "connected", False):
+    if conn is None:
+        return payload
+
+    if not getattr(conn, "connected", False):
+        reconnected = safe_ibkr_query(lambda: conn.ensure_connected(), fallback=False)
+        if not reconnected:
+            return payload
+
+    if not getattr(conn, "connected", False):
         return payload
 
     ib = safe_ibkr_query(lambda: conn.ib, fallback=None)
@@ -921,12 +966,24 @@ def build_summary_stats(
     return stats
 
 
-def render_sidebar(ibkr_connected: bool, source_label: str) -> None:
+def render_sidebar(ibkr_connected: bool, source_label: str, ibkr_error: str | None) -> None:
     """Render sidebar controls and refresh behavior."""
     st.sidebar.title("AlgoTrader")
     st.sidebar.caption("Brain-native dashboard")
     st.sidebar.caption(f"Trade source: {source_label}")
     st.sidebar.caption(f"IBKR: {'Connected' if ibkr_connected else 'Disconnected'}")
+    if ibkr_error:
+        st.sidebar.caption(f"IBKR error: {ibkr_error}")
+
+    reconnect_now = st.sidebar.button("♻️ Reconnect IBKR", use_container_width=True)
+    if reconnect_now:
+        existing = st.session_state.get("_dashboard_ibkr_conn")
+        if existing is not None:
+            safe_ibkr_query(lambda: existing.disconnect(), fallback=None)
+        st.session_state.pop("_dashboard_ibkr_conn", None)
+        st.session_state.pop("_dashboard_ibkr_error", None)
+        st.cache_data.clear()
+        st.rerun()
 
     if st.sidebar.button("🔄 Refresh Now", use_container_width=True):
         st.cache_data.clear()
@@ -1327,15 +1384,18 @@ def main() -> None:
     regime_state = load_regime_state()
     broker_snapshot = load_broker_snapshot()
 
-    conn = get_ibkr_connection()
+    conn, ibkr_error = get_ibkr_connection()
     live_data = fetch_ibkr_live_data(conn)
     ibkr_connected = bool(live_data.get("connected", False))
 
     if not ibkr_connected:
-        st.warning("⚠️ IBKR not connected. Showing cached state/journal data where available.")
+        msg = "⚠️ IBKR not connected. Showing cached state/journal data where available."
+        if ibkr_error:
+            msg = f"{msg} ({ibkr_error})"
+        st.warning(msg)
 
     trades_df, source_label = get_trade_dataset(live_data)
-    render_sidebar(ibkr_connected=ibkr_connected, source_label=source_label)
+    render_sidebar(ibkr_connected=ibkr_connected, source_label=source_label, ibkr_error=ibkr_error)
 
     account = build_account_overview(live_data, broker_snapshot)
     positions_df = build_positions_df(live_data, broker_snapshot)
