@@ -1019,13 +1019,13 @@ def render_sidebar(ibkr_connected: bool, source_label: str, ibkr_error: str | No
     if ibkr_error:
         st.sidebar.caption(f"IBKR error: {ibkr_error}")
 
-    reconnect_now = st.sidebar.button("♻️ Reconnect IBKR", use_container_width=True)
+    reconnect_now = st.sidebar.button("♻️ Reconnect IBKR", width="stretch")
     if reconnect_now:
         get_ibkr_connection(force_reconnect=True)
         st.cache_data.clear()
         st.rerun()
 
-    if st.sidebar.button("🔄 Refresh Now", use_container_width=True):
+    if st.sidebar.button("🔄 Refresh Now", width="stretch"):
         st.cache_data.clear()
         st.rerun()
 
@@ -1151,7 +1151,7 @@ def render_command_center(
             )
             .map(pnl_cell_style, subset=["Unrealized P&L", "Realized P&L"])
         )
-        st.dataframe(styled, hide_index=True, use_container_width=True)
+        st.dataframe(styled, hide_index=True, width="stretch")
 
     st.subheader("📋 Open Orders")
     if open_orders_df.empty:
@@ -1165,7 +1165,7 @@ def render_command_center(
                 "Stop": "${:,.2f}",
             }
         )
-        st.dataframe(styled, hide_index=True, use_container_width=True)
+        st.dataframe(styled, hide_index=True, width="stretch")
 
     st.subheader("⚡ Strategy Activity")
     for row_start in range(0, len(KNOWN_STRATEGIES), 4):
@@ -1217,7 +1217,7 @@ def render_scoreboard(
                 for m in metrics
             ]
         )
-        st.dataframe(scoreboard, hide_index=True, use_container_width=True)
+        st.dataframe(scoreboard, hide_index=True, width="stretch")
 
     st.subheader("Brain Filter Funnel (Today)")
     funnel_df = build_funnel_data(today_logs, trades_df, brain_decision)
@@ -1237,7 +1237,7 @@ def render_scoreboard(
             height=320,
             margin=dict(l=20, r=20, t=20, b=20),
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     st.subheader("Why Candidates Get Rejected")
     rejection_counts = count_rejections(brain_decision, all_logs)
@@ -1256,7 +1256,7 @@ def render_scoreboard(
             ]
         )
         fig.update_layout(height=320, margin=dict(l=20, r=20, t=20, b=20))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     st.subheader("Strategy Performance by Regime")
     matrix = compute_regime_heatmap(period_df)
@@ -1276,7 +1276,7 @@ def render_scoreboard(
             )
         )
         fig.update_layout(height=420, margin=dict(l=20, r=20, t=20, b=20))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
 
 def render_performance(
@@ -1315,7 +1315,7 @@ def render_performance(
             hovermode="x unified",
             margin=dict(l=20, r=20, t=20, b=20),
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     st.subheader("Daily P&L")
     if go is None:
@@ -1334,7 +1334,7 @@ def render_performance(
             ]
         )
         fig.update_layout(height=300, margin=dict(l=20, r=20, t=20, b=20))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     st.subheader("Cumulative P&L by Strategy")
     if go is None:
@@ -1357,7 +1357,7 @@ def render_performance(
                 )
             )
         fig.update_layout(height=400, hovermode="x unified", margin=dict(l=20, r=20, t=20, b=20))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     stats = build_summary_stats(trades_df, daily_pnl, equity_curve, all_logs)
     st.subheader("Summary")
@@ -1404,7 +1404,7 @@ def render_performance(
             )
         )
         fig.update_layout(height=260, yaxis_title="Drawdown %", margin=dict(l=20, r=20, t=20, b=20))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
 
 def main() -> None:
