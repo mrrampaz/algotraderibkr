@@ -36,8 +36,9 @@ params:
   # Exit
   profit_target_pct: 50.0         # Close at 50% of max profit
   stop_loss_pct: 200.0            # Close at 200% of credit received (loss)
+  min_hold_minutes_for_profit_target: 60  # Avoid premature profit exits in first hour
   close_before_minutes: 15        # Close 15 min before market close
-  expiry_risk_close_minutes: 30   # Force-close expiring options by 3:30 PM ET
+  expiry_risk_close_minutes: 15   # Force-close expiring options by 3:45 PM ET
 
   # Sizing
   max_risk_per_trade: 500         # Max dollar risk per spread

@@ -906,6 +906,11 @@ class IBKRExecutor:
                 continue
 
             raw_expiry = str(getattr(contract, "lastTradeDateOrContractMonth", "") or "")
+            market_price = self._safe_optional_float(getattr(item, "marketPrice", None))
+            average_cost = self._safe_optional_float(getattr(item, "averageCost", None))
+            market_value = self._safe_optional_float(getattr(item, "marketValue", None))
+            unrealized_pnl = self._safe_optional_float(getattr(item, "unrealizedPNL", None))
+            realized_pnl = self._safe_optional_float(getattr(item, "realizedPNL", None))
             out.append({
                 "con_id": con_id,
                 "symbol": str(getattr(contract, "symbol", "") or ""),
@@ -915,6 +920,11 @@ class IBKRExecutor:
                 "expiry": self._parse_option_expiry(raw_expiry),
                 "expiry_raw": raw_expiry,
                 "qty": raw_qty,
+                "market_price": market_price,
+                "average_cost": average_cost,
+                "market_value": market_value,
+                "unrealized_pnl": unrealized_pnl,
+                "realized_pnl": realized_pnl,
             })
         return out
 

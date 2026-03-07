@@ -15,11 +15,12 @@ from algotrader.core.models import (
     OrderSide,
     Quote,
     RegimeType,
+    SignalDirection,
     Snapshot,
 )
 from algotrader.strategies.event_driven import EventDrivenStrategy
 from algotrader.strategies.gap_reversal import GapReversalStrategy
-from algotrader.strategies.options_premium import OptionsPremiumStrategy
+from algotrader.strategies.options_premium import OptionsPremiumStrategy, PremiumTrade
 from algotrader.strategies.pairs_trading import PairsTradingStrategy
 from algotrader.strategies.sector_rotation import SectorRotationStrategy
 from algotrader.strategies.vwap_reversion import VWAPReversionStrategy
@@ -123,6 +124,22 @@ class StubExecutor:
         return None
 
 
+class OptionsMarkExecutor(StubExecutor):
+    def __init__(self, option_positions: list[dict] | None = None) -> None:
+        self._option_positions = option_positions or []
+        self.mleg_submissions = 0
+
+    def set_option_positions(self, option_positions: list[dict]) -> None:
+        self._option_positions = option_positions
+
+    def get_option_positions(self):
+        return self._option_positions
+
+    def submit_mleg_order(self, legs, qty=1, tif="DAY", client_order_id=None):
+        self.mleg_submissions += 1
+        return f"ibkr_test_{self.mleg_submissions}"
+
+
 def _regime(regime_type: RegimeType, vix: float = 18.0) -> MarketRegime:
     return MarketRegime(
         regime_type=regime_type,
@@ -181,6 +198,166 @@ def test_options_premium_returns_candidates() -> None:
     assert candidate.short_strike > 0
     assert candidate.credit_received > 0
     assert candidate.max_loss > 0
+
+
+def test_options_profit_target_min_hold_blocks_early_close() -> None:
+    provider = StubDataProvider()
+    executor = StubExecutor()
+    provider.set_price("SPY", 500.0)
+
+    strategy = OptionsPremiumStrategy(
+        name="options_premium",
+        config=StrategyConfig(params={"min_hold_minutes_for_profit_target": 60}),
+        data_provider=provider,
+        executor=executor,
+        event_bus=EventBus(),
+    )
+    strategy.set_capital(100000.0)
+    strategy._trades["SPY"] = PremiumTrade(
+        underlying="SPY",
+        structure="put_spread",
+        short_strike=490.0,
+        long_strike=485.0,
+        contracts=1,
+        credit_received=150.0,
+        max_profit=150.0,
+        max_loss=350.0,
+        entry_time=datetime.now(pytz.UTC),
+        expiration=datetime.now(pytz.timezone("America/New_York")).date(),
+        simulated=True,
+        capital_used=350.0,
+        trade_id="test_trade",
+    )
+
+    et_now = datetime.now(pytz.timezone("America/New_York")).replace(
+        hour=11,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    signals = strategy._manage_positions(et_now, None)
+
+    assert not signals
+    assert "SPY" in strategy._trades
+
+
+def test_options_live_marks_override_proxy_and_prevent_false_profit_close() -> None:
+    provider = StubDataProvider()
+    provider.set_price("SPY", 500.0)  # Proxy model would look strongly profitable.
+    executor = OptionsMarkExecutor(
+        option_positions=[
+            {
+                "local_symbol": "SPY   260306C00679000",
+                "qty": -1.0,
+                "average_cost": 52.0,
+                "market_price": 0.70,
+            },
+            {
+                "local_symbol": "SPY   260306C00684000",
+                "qty": 1.0,
+                "average_cost": 12.0,
+                "market_price": 0.15,
+            },
+        ],
+    )
+
+    strategy = OptionsPremiumStrategy(
+        name="options_premium",
+        config=StrategyConfig(params={"min_hold_minutes_for_profit_target": 60}),
+        data_provider=provider,
+        executor=executor,
+        event_bus=EventBus(),
+    )
+    strategy.set_capital(100000.0)
+    strategy._trades["SPY"] = PremiumTrade(
+        underlying="SPY",
+        structure="call_spread",
+        short_strike=679.0,
+        long_strike=684.0,
+        contracts=1,
+        credit_received=40.0,
+        max_profit=40.0,
+        max_loss=460.0,
+        entry_time=datetime.now(pytz.UTC) - timedelta(hours=2),
+        expiration=datetime.now(pytz.timezone("America/New_York")).date(),
+        simulated=False,
+        capital_used=460.0,
+        trade_id="test_trade",
+        short_occ_symbol="SPY   260306C00679000",
+        long_occ_symbol="SPY   260306C00684000",
+    )
+
+    et_now = datetime.now(pytz.timezone("America/New_York")).replace(
+        hour=11,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    signals = strategy._manage_positions(et_now, None)
+
+    assert not signals
+    assert "SPY" in strategy._trades
+
+
+def test_options_close_on_live_mark_profit_target_after_min_hold() -> None:
+    provider = StubDataProvider()
+    provider.set_price("SPY", 500.0)
+    executor = OptionsMarkExecutor(
+        option_positions=[
+            {
+                "local_symbol": "SPY   260306C00679000",
+                "qty": -1.0,
+                "average_cost": 70.0,
+                "market_price": 0.30,
+            },
+            {
+                "local_symbol": "SPY   260306C00684000",
+                "qty": 1.0,
+                "average_cost": 15.0,
+                "market_price": 0.05,
+            },
+        ],
+    )
+
+    strategy = OptionsPremiumStrategy(
+        name="options_premium",
+        config=StrategyConfig(params={"min_hold_minutes_for_profit_target": 60}),
+        data_provider=provider,
+        executor=executor,
+        event_bus=EventBus(),
+    )
+    strategy.set_capital(100000.0)
+    strategy._trades["SPY"] = PremiumTrade(
+        underlying="SPY",
+        structure="call_spread",
+        short_strike=679.0,
+        long_strike=684.0,
+        contracts=1,
+        credit_received=55.0,
+        max_profit=55.0,
+        max_loss=445.0,
+        entry_time=datetime.now(pytz.UTC) - timedelta(hours=2),
+        expiration=datetime.now(pytz.timezone("America/New_York")).date(),
+        simulated=False,
+        capital_used=445.0,
+        trade_id="test_trade",
+        short_occ_symbol="SPY   260306C00679000",
+        long_occ_symbol="SPY   260306C00684000",
+    )
+
+    et_now = datetime.now(pytz.timezone("America/New_York")).replace(
+        hour=11,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    signals = strategy._manage_positions(et_now, None)
+
+    assert signals
+    assert signals[0].direction == SignalDirection.CLOSE
+    assert "profit_target" in signals[0].reason
+    assert executor.mleg_submissions == 1
+    assert "SPY" not in strategy._trades
 
 
 def test_vwap_reversion_returns_candidates() -> None:
@@ -352,6 +529,71 @@ def test_sector_rotation_returns_candidates() -> None:
         candidate = assessment.candidates[0]
         assert candidate.candidate_type == CandidateType.SECTOR_LONG_SHORT
         assert "long_symbol" in candidate.metadata and "short_symbol" in candidate.metadata
+
+
+def test_sector_rotation_skips_candidate_when_capital_below_min_notional() -> None:
+    provider = StubDataProvider()
+    executor = StubExecutor()
+
+    provider.set_price("XLK", 200.0)
+    provider.set_price("XLU", 80.0)
+    provider.set_bars("SPY", "1Day", _bars_from_closes([100 + i * 0.2 for i in range(12)], 1_000_000))
+    provider.set_bars("XLK", "1Day", _bars_from_closes([100 + i * 1.0 for i in range(12)], 1_500_000))
+    provider.set_bars("XLU", "1Day", _bars_from_closes([100 - i * 0.8 for i in range(12)], 1_500_000))
+
+    strategy = SectorRotationStrategy(
+        name="sector_rotation",
+        config=StrategyConfig(
+            params={
+                "sectors": {"XLK": "Technology", "XLU": "Utilities"},
+                "rs_long_threshold": 0.5,
+                "rs_short_threshold": -0.5,
+                "min_divergence_pct": 1.0,
+                "min_notional_per_leg": 2000,
+            }
+        ),
+        data_provider=provider,
+        executor=executor,
+        event_bus=EventBus(),
+    )
+    strategy.set_capital(3000.0)
+
+    assessment = strategy.assess_opportunities(_regime(RegimeType.TRENDING_UP))
+    assert not assessment.candidates
+
+
+def test_sector_rotation_candidate_respects_min_notional_qty() -> None:
+    provider = StubDataProvider()
+    executor = StubExecutor()
+
+    provider.set_price("XLK", 200.0)
+    provider.set_price("XLU", 80.0)
+    provider.set_bars("SPY", "1Day", _bars_from_closes([100 + i * 0.2 for i in range(12)], 1_000_000))
+    provider.set_bars("XLK", "1Day", _bars_from_closes([100 + i * 1.0 for i in range(12)], 1_500_000))
+    provider.set_bars("XLU", "1Day", _bars_from_closes([100 - i * 0.8 for i in range(12)], 1_500_000))
+
+    strategy = SectorRotationStrategy(
+        name="sector_rotation",
+        config=StrategyConfig(
+            params={
+                "sectors": {"XLK": "Technology", "XLU": "Utilities"},
+                "rs_long_threshold": 0.5,
+                "rs_short_threshold": -0.5,
+                "min_divergence_pct": 1.0,
+                "min_notional_per_leg": 2000,
+            }
+        ),
+        data_provider=provider,
+        executor=executor,
+        event_bus=EventBus(),
+    )
+    strategy.set_capital(20000.0)
+
+    assessment = strategy.assess_opportunities(_regime(RegimeType.TRENDING_UP))
+    assert assessment.candidates
+    candidate = assessment.candidates[0]
+    # At $200/$80 with $2,000 minimum notional per leg, qty floor is max(10, 25)=25.
+    assert candidate.suggested_qty >= 25
 
 
 def test_event_driven_returns_candidates_on_event_day() -> None:

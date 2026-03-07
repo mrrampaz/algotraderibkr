@@ -6,6 +6,7 @@ strongest sectors, short the weakest relative to SPY.
 
 from __future__ import annotations
 
+import math
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -115,6 +116,7 @@ class SectorRotationStrategy(StrategyBase):
         # Position management
         self._rebalance_interval_hours = params.get("rebalance_interval_hours", 4)
         self._stop_pct = params.get("stop_pct", 2.0)
+        self._min_notional_per_leg = float(params.get("min_notional_per_leg", 2000.0))
 
         # Regime filter
         self._allowed_regimes = params.get(
@@ -295,9 +297,29 @@ class SectorRotationStrategy(StrategyBase):
 
         # Equal-weight sizing across max_positions (_total_capital is already allocated)
         per_position_capital = self._total_capital / self.config.max_positions
+        min_qty = self._min_qty_for_notional(current_price)
+        if per_position_capital < self._min_notional_per_leg:
+            self._log.info(
+                "sector_entry_skipped_min_notional",
+                symbol=symbol,
+                direction=direction,
+                allocated_capital=round(per_position_capital, 2),
+                min_notional_per_leg=round(self._min_notional_per_leg, 2),
+            )
+            return None
         shares = int(per_position_capital / current_price)
 
-        if shares <= 0:
+        if shares <= 0 or shares < min_qty:
+            self._log.info(
+                "sector_entry_skipped_min_qty",
+                symbol=symbol,
+                direction=direction,
+                allocated_capital=round(per_position_capital, 2),
+                min_notional_per_leg=round(self._min_notional_per_leg, 2),
+                min_qty=min_qty,
+                implied_qty=shares,
+                price=round(current_price, 4),
+            )
             return None
 
         side = OrderSide.BUY if direction == "long" else OrderSide.SELL
@@ -410,6 +432,12 @@ class SectorRotationStrategy(StrategyBase):
         except Exception:
             pass
         return None
+
+    def _min_qty_for_notional(self, *prices: float) -> int:
+        positive_prices = [float(p) for p in prices if p and p > 0]
+        if not positive_prices:
+            return 1
+        return max(1, max(math.ceil(self._min_notional_per_leg / p) for p in positive_prices))
 
     def assess_opportunities(self, regime: MarketRegime | None = None) -> OpportunityAssessment:
         """Assess sector rotation opportunities via relative strength."""
@@ -536,6 +564,15 @@ class SectorRotationStrategy(StrategyBase):
                     filter_counts=filter_counts,
                 )
                 return _complete(OpportunityAssessment())
+            if not short_price or short_price <= 0:
+                filter_counts["missing_price_data"] += 1
+                self._log.info(
+                    "sector_scan_result",
+                    regime=regime_type,
+                    final_candidates=0,
+                    filter_counts=filter_counts,
+                )
+                return _complete(OpportunityAssessment())
 
             stop_price = long_price * (1 - self._stop_pct / 100)
             target_price = long_price + (long_price * self._stop_pct / 100 * 1.5)
@@ -585,6 +622,29 @@ class SectorRotationStrategy(StrategyBase):
             edge_pct = max(0.0, (0.50 * rr_ratio - 0.50) * risk_pct)
             risk_budget = self.available_capital * 0.005
             suggested_qty = int(risk_budget / risk_per_share) if risk_per_share > 0 else 0
+            min_leg_qty = self._min_qty_for_notional(long_price, short_price)
+            required_capital = min_leg_qty * (long_price + short_price)
+            if self.available_capital < required_capital:
+                filter_counts["need_both_long_short_legs"] += 1
+                self._log.info(
+                    "sector_scan_result",
+                    regime=regime_type,
+                    final_candidates=0,
+                    filter_counts=filter_counts,
+                )
+                return _complete(OpportunityAssessment(
+                    num_candidates=0,
+                    confidence=0.0,
+                    details=[{
+                        "reason": "allocated_capital_below_min_notional",
+                        "available_capital": round(self.available_capital, 2),
+                        "required_capital": round(required_capital, 2),
+                        "min_notional_per_leg": round(self._min_notional_per_leg, 2),
+                    }],
+                    candidates=[],
+                ))
+
+            suggested_qty = max(min_leg_qty, suggested_qty)
 
             trade_candidate = TradeCandidate(
                 strategy_name=self.name,
@@ -609,7 +669,9 @@ class SectorRotationStrategy(StrategyBase):
                     "short_rs": round(short_rs, 2),
                     "divergence": round(divergence, 2),
                     "long_price": round(long_price, 2),
-                    "short_price": round(short_price, 2) if short_price else 0.0,
+                    "short_price": round(short_price, 2),
+                    "min_notional_per_leg": round(self._min_notional_per_leg, 2),
+                    "required_capital_for_min_notional": round(required_capital, 2),
                 },
             )
             filter_counts["candidate_built"] += 1

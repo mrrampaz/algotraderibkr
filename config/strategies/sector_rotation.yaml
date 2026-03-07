@@ -27,6 +27,7 @@ params:
   # Position management
   rebalance_interval_hours: 4     # Recheck every 4 hours
   stop_pct: 2.0                   # Stop loss per position
+  min_notional_per_leg: 2000      # Minimum dollar value per leg to justify commissions
 
   # Regime filter
   allowed_regimes:

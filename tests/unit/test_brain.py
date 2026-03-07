@@ -216,6 +216,24 @@ def test_only_one_candidate_passes_thresholds() -> None:
     assert "insufficient_edge" in reasons
 
 
+def test_commission_gate_rejects_low_edge_dollar_candidates() -> None:
+    brain = _brain()
+    low_commission_edge = _candidate(symbol="THIN", risk_dollars=50.0, edge=0.8)
+    good = _candidate(symbol="GOOD", risk_dollars=600.0, edge=0.8)
+
+    decision = brain.decide(
+        regime=_regime(),
+        assessments={"momentum": OpportunityAssessment(candidates=[low_commission_edge, good])},
+        current_positions=[],
+        daily_pnl=0.0,
+    )
+
+    assert decision.num_trades == 1
+    assert decision.selected_trades[0].candidate.symbol == "GOOD"
+    reasons = {(r.candidate.symbol, r.reason) for r in decision.rejected_trades}
+    assert ("THIN", "commission_exceeds_edge") in reasons
+
+
 def test_multiple_good_candidates_ranked_and_limited_by_risk() -> None:
     brain = _brain(max_daily_trades=5, max_daily_risk_pct=1.0)
     c1 = _candidate(symbol="AAA", confidence=0.90, risk_dollars=400.0)

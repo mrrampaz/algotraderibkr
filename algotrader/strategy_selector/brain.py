@@ -17,6 +17,18 @@ from algotrader.tracking.journal import TradeJournal
 
 logger = structlog.get_logger()
 
+COMMISSION_ESTIMATES = {
+    "options_premium": 3.20,
+    "sector_rotation": 2.20,
+    "momentum": 1.10,
+    "vwap_reversion": 1.10,
+    "pairs_trading": 2.20,
+    "gap_reversal": 1.10,
+    "event_driven": 1.10,
+}
+DEFAULT_COMMISSION_ESTIMATE = 2.00
+MIN_PROFIT_TO_COMMISSION_MULTIPLIER = 2.0
+
 
 @dataclass
 class TradeSelection:
@@ -441,6 +453,8 @@ class DailyBrain:
             return "poor_rr"
         if candidate.edge_estimate_pct < self._required_edge(candidate):
             return "insufficient_edge"
+        if self._commission_exceeds_expected_edge(candidate):
+            return "commission_exceeds_edge"
         if candidate.is_expired:
             return "expired"
         if self._already_positioned(candidate, current_positions):
@@ -448,6 +462,24 @@ class DailyBrain:
         if self._in_recent_loss_cooldown(candidate):
             return "cooldown"
         return None
+
+    def _commission_exceeds_expected_edge(self, candidate: TradeCandidate) -> bool:
+        if bool(candidate.metadata.get("synthetic")):
+            return False
+        est_commission = self._estimate_round_trip_commission(candidate)
+        est_profit = self._estimate_profit_dollars(candidate)
+        if est_profit <= 0:
+            return False
+        return est_profit < (est_commission * MIN_PROFIT_TO_COMMISSION_MULTIPLIER)
+
+    def _estimate_round_trip_commission(self, candidate: TradeCandidate) -> float:
+        return float(COMMISSION_ESTIMATES.get(candidate.strategy_name, DEFAULT_COMMISSION_ESTIMATE))
+
+    def _estimate_profit_dollars(self, candidate: TradeCandidate) -> float:
+        risk_dollars = candidate.risk_dollars
+        if risk_dollars <= 0:
+            risk_dollars = self._compute_trade_risk(candidate)
+        return max(0.0, float(candidate.edge_estimate_pct) / 100.0 * max(0.0, risk_dollars))
 
     def _score_candidate(
         self,

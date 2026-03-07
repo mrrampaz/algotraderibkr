@@ -111,6 +111,9 @@ class OptionsPremiumStrategy(StrategyBase):
         # Exit
         self._profit_target_pct = params.get("profit_target_pct", 50.0)
         self._stop_loss_pct = params.get("stop_loss_pct", 200.0)
+        self._min_hold_minutes_for_profit_target = int(
+            params.get("min_hold_minutes_for_profit_target", 60),
+        )
         self._close_before_minutes = params.get("close_before_minutes", 15)
         self._expiry_risk_close_minutes = int(
             params.get("expiry_risk_close_minutes", max(15, self._close_before_minutes)),
@@ -175,6 +178,7 @@ class OptionsPremiumStrategy(StrategyBase):
     def _manage_positions(self, et_now: datetime, regime: MarketRegime | None) -> list[Signal]:
         """Manage open premium trades."""
         signals: list[Signal] = []
+        utc_now = datetime.now(pytz.UTC)
         market_close = et_now.replace(hour=16, minute=0, second=0, microsecond=0)
         minutes_to_close = (market_close - et_now).total_seconds() / 60
 
@@ -194,12 +198,36 @@ class OptionsPremiumStrategy(StrategyBase):
             if current_price is None:
                 continue
 
-            # Estimate current P&L from underlying price movement
-            estimated_pnl_pct = self._estimate_pnl_pct(trade, current_price)
+            # Prefer live options marks when available; fallback to an underlying proxy.
+            live_pnl = self._estimate_live_option_pnl(trade)
+            if live_pnl is not None:
+                estimated_pnl_pct = live_pnl["pnl_pct"]
+                pnl_source = "options_mark"
+            else:
+                estimated_pnl_pct = self._estimate_pnl_pct(trade, current_price)
+                pnl_source = "underlying_proxy"
+
+            held_minutes = 0.0
+            if trade.entry_time is not None:
+                held_minutes = max(
+                    0.0,
+                    (utc_now - trade.entry_time).total_seconds() / 60.0,
+                )
 
             # 1. Profit target (close at 50% of max profit)
             if not close_reason and estimated_pnl_pct >= self._profit_target_pct:
-                close_reason = f"profit_target: est {estimated_pnl_pct:.0f}% of max"
+                if held_minutes >= self._min_hold_minutes_for_profit_target:
+                    close_reason = f"profit_target: est {estimated_pnl_pct:.0f}% of max"
+                else:
+                    self._log.info(
+                        "profit_target_deferred_min_hold",
+                        underlying=trade.underlying,
+                        structure=trade.structure,
+                        held_minutes=round(held_minutes, 1),
+                        min_hold_minutes=self._min_hold_minutes_for_profit_target,
+                        est_pnl_pct=round(estimated_pnl_pct, 2),
+                        pnl_source=pnl_source,
+                    )
 
             # 2. Stop loss (close at 200% of credit = net 100% loss)
             elif not close_reason and estimated_pnl_pct <= -self._stop_loss_pct:
@@ -216,7 +244,12 @@ class OptionsPremiumStrategy(StrategyBase):
                     symbol=trade.underlying,
                     direction=SignalDirection.CLOSE,
                     reason=close_reason,
-                    metadata={"structure": trade.structure, "simulated": trade.simulated},
+                    metadata={
+                        "structure": trade.structure,
+                        "simulated": trade.simulated,
+                        "pnl_source": pnl_source,
+                        "held_minutes": round(held_minutes, 1),
+                    },
                     timestamp=datetime.now(pytz.UTC),
                 ))
 
@@ -441,40 +474,102 @@ class OptionsPremiumStrategy(StrategyBase):
         """Estimate current P&L as percentage of max profit.
 
         Positive = winning, negative = losing.
-        Uses a simplified model based on short strike proximity.
+        Uses a conservative proxy when live option marks are unavailable.
         """
         if trade.max_profit <= 0:
             return 0.0
 
+        width = max(0.5, float(self._wing_width))
+
         if trade.structure == "put_spread":
-            if current_price >= trade.short_strike:
-                # Above short strike — likely profitable
-                return min(100.0, 50.0 + (current_price - trade.short_strike) / trade.short_strike * 1000)
-            else:
-                # Below short strike — losing
-                loss_ratio = (trade.short_strike - current_price) / self._wing_width
-                return -loss_ratio * 100
+            distance = current_price - trade.short_strike
+            if distance >= 0:
+                return min(100.0, (distance / width) * 100.0)
+            return (distance / width) * 100.0
 
-        elif trade.structure == "call_spread":
-            if current_price <= trade.short_strike:
-                return min(100.0, 50.0 + (trade.short_strike - current_price) / trade.short_strike * 1000)
-            else:
-                loss_ratio = (current_price - trade.short_strike) / self._wing_width
-                return -loss_ratio * 100
+        if trade.structure == "call_spread":
+            distance = trade.short_strike - current_price
+            if distance >= 0:
+                return min(100.0, (distance / width) * 100.0)
+            return (distance / width) * 100.0
 
-        elif trade.structure == "iron_condor":
-            # Iron condor: profitable if price stays between short strikes
-            if (trade.call_short_strike and
-                    trade.short_strike <= current_price <= trade.call_short_strike):
-                return 50.0  # In the safe zone
-            elif current_price < trade.short_strike:
-                loss_ratio = (trade.short_strike - current_price) / self._wing_width
-                return -loss_ratio * 100
-            elif trade.call_short_strike and current_price > trade.call_short_strike:
-                loss_ratio = (current_price - trade.call_short_strike) / self._wing_width
-                return -loss_ratio * 100
+        if trade.structure == "iron_condor":
+            if trade.call_short_strike is None:
+                return 0.0
+            if trade.short_strike <= current_price <= trade.call_short_strike:
+                safe_buffer = min(
+                    current_price - trade.short_strike,
+                    trade.call_short_strike - current_price,
+                )
+                return min(100.0, (safe_buffer / width) * 100.0)
+            if current_price < trade.short_strike:
+                return ((current_price - trade.short_strike) / width) * 100.0
+            return ((trade.call_short_strike - current_price) / width) * 100.0
 
         return 0.0
+
+    @staticmethod
+    def _normalize_option_local_symbol(symbol: str | None) -> str:
+        return str(symbol or "").strip()
+
+    def _estimate_live_option_pnl(self, trade: PremiumTrade) -> dict[str, float] | None:
+        """Estimate spread P&L using broker-reported option leg marks."""
+        if not hasattr(self.executor, "get_option_positions"):
+            return None
+
+        try:
+            positions = self.executor.get_option_positions()
+        except Exception:
+            return None
+
+        if not positions:
+            return None
+
+        leg_symbols = [
+            self._normalize_option_local_symbol(trade.short_occ_symbol),
+            self._normalize_option_local_symbol(trade.long_occ_symbol),
+        ]
+        if trade.call_short_occ_symbol and trade.call_long_occ_symbol:
+            leg_symbols.extend([
+                self._normalize_option_local_symbol(trade.call_short_occ_symbol),
+                self._normalize_option_local_symbol(trade.call_long_occ_symbol),
+            ])
+        if any(not s for s in leg_symbols):
+            return None
+
+        by_symbol = {
+            self._normalize_option_local_symbol(pos.get("local_symbol")): pos
+            for pos in positions
+        }
+
+        entry_credit = 0.0
+        close_debit = 0.0
+        for symbol in leg_symbols:
+            pos = by_symbol.get(symbol)
+            if pos is None:
+                return None
+
+            qty = float(pos.get("qty", 0.0))
+            avg_cost = float(pos.get("average_cost", 0.0))
+            mark_price = float(pos.get("market_price", 0.0))
+            if qty == 0 or avg_cost <= 0 or mark_price <= 0:
+                return None
+
+            mark_cost = mark_price * 100.0
+            entry_credit += (-qty) * avg_cost
+            close_debit += (-qty) * mark_cost
+
+        if entry_credit <= 0:
+            return None
+
+        pnl_dollars = entry_credit - close_debit
+        pnl_pct = (pnl_dollars / entry_credit) * 100.0
+        return {
+            "pnl_pct": pnl_pct,
+            "pnl_dollars": pnl_dollars,
+            "entry_credit": entry_credit,
+            "close_debit": close_debit,
+        }
 
     def _submit_credit_spread(
         self,
@@ -697,10 +792,14 @@ class OptionsPremiumStrategy(StrategyBase):
             )
             return
 
-        # For real trades, close by reversing the MLEG legs
-        # P&L is estimated from underlying price (options legs aren't equity positions)
-        current_price = self._get_current_price(trade.underlying) or 0.0
-        pnl = self._estimate_simulated_pnl(trade, current_price)
+        # For real trades, close by reversing the MLEG legs.
+        # Prefer live mark-based option P&L when available.
+        live_pnl = self._estimate_live_option_pnl(trade)
+        if live_pnl is not None:
+            pnl = live_pnl["pnl_dollars"]
+        else:
+            current_price = self._get_current_price(trade.underlying) or 0.0
+            pnl = self._estimate_simulated_pnl(trade, current_price)
 
         close_success = self._close_real_spread(trade)
         if not close_success:
@@ -715,7 +814,7 @@ class OptionsPremiumStrategy(StrategyBase):
             side=OrderSide.SELL,
             qty=trade.contracts,
             entry_price=trade.short_strike,
-            exit_price=current_price,
+            exit_price=self._get_current_price(trade.underlying) or 0.0,
             entry_time=trade.entry_time,
             entry_reason=f"premium_sell: {trade.structure}",
             exit_reason=reason,

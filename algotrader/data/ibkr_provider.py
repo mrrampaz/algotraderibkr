@@ -89,6 +89,18 @@ class IBKRDataProvider:
         return as_float
 
     @staticmethod
+    def _is_retryable_historical_error(exc: Exception) -> bool:
+        message = str(exc).lower()
+        retry_tokens = (
+            "timeout",
+            "timed out",
+            "error 366",
+            "pacing",
+            "historical data",
+        )
+        return any(token in message for token in retry_tokens)
+
+    @staticmethod
     def _to_utc_timestamp(value) -> datetime:
         ts = pd.Timestamp(value)
         if ts.tzinfo is None:
@@ -488,9 +500,10 @@ class IBKRDataProvider:
         if end is not None:
             end_dt = end if end.tzinfo else end.replace(tzinfo=pytz.UTC)
 
-        try:
-            request_timeout = max(5, min(30, int(self._connection.config.timeout)))
-            bars = self._connection.execute(
+        request_timeout = max(5, min(30, int(self._connection.config.timeout)))
+
+        def _request_historical():
+            return self._connection.execute(
                 lambda ib: ib.reqHistoricalData(
                     contract=contract,
                     endDateTime=end_dt,
@@ -503,14 +516,38 @@ class IBKRDataProvider:
                     timeout=request_timeout,
                 )
             )
-        except Exception:
-            self._log.exception(
-                "ibkr_get_bars_failed",
-                symbol=symbol,
-                timeframe=timeframe,
-                limit=limit,
-            )
-            return self._empty_bars_df()
+
+        try:
+            bars = _request_historical()
+        except Exception as exc:
+            if self._is_retryable_historical_error(exc):
+                self._log.warning(
+                    "ibkr_get_bars_retry",
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    limit=limit,
+                    reason=str(exc),
+                    backoff_seconds=2,
+                )
+                time.sleep(2)
+                try:
+                    bars = _request_historical()
+                except Exception:
+                    self._log.exception(
+                        "ibkr_get_bars_failed_after_retry",
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        limit=limit,
+                    )
+                    return self._empty_bars_df()
+            else:
+                self._log.exception(
+                    "ibkr_get_bars_failed",
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    limit=limit,
+                )
+                return self._empty_bars_df()
 
         if not bars:
             return self._empty_bars_df()

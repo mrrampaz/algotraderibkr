@@ -9,6 +9,24 @@ from pathlib import Path
 import structlog
 
 
+class _IBKRFilledOrderNoiseFilter(logging.Filter):
+    """Downgrade harmless IBKR "already filled" wrapper errors to debug noise."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.name != "ib_async.wrapper":
+            return True
+
+        try:
+            message = record.getMessage()
+        except Exception:
+            return True
+
+        if "Error 201" in message and "already filled" in message.lower():
+            record.levelno = logging.DEBUG
+            record.levelname = "DEBUG"
+        return True
+
+
 def setup_logging(level: str = "INFO", log_file: str | None = None, json_format: bool = True) -> None:
     """Configure structlog with JSON output to file and human-readable to console."""
 
@@ -81,3 +99,8 @@ def setup_logging(level: str = "INFO", log_file: str | None = None, json_format:
         wrapper_class=structlog.stdlib.BoundLogger,
         cache_logger_on_first_use=True,
     )
+
+    # Reduce noisy IBKR wrapper error logs for already-filled orders.
+    ib_wrapper_logger = logging.getLogger("ib_async.wrapper")
+    if not any(isinstance(f, _IBKRFilledOrderNoiseFilter) for f in ib_wrapper_logger.filters):
+        ib_wrapper_logger.addFilter(_IBKRFilledOrderNoiseFilter())
