@@ -41,8 +41,11 @@ params:
   expiry_risk_close_minutes: 15   # Force-close expiring options by 3:45 PM ET
 
   # Sizing
-  max_risk_per_trade: 500         # Max dollar risk per spread
-  max_contracts: 5                # Max contracts per position
+  max_risk_per_trade: 500         # Legacy fallback for non-spread sizing paths
+  max_contracts: 5                # Absolute safety cap across all sizing modes
+  max_contracts_per_spread: 3     # Conservative rollout cap for credit spreads
+  sizing_method: "max_loss"       # "max_loss" for credit spreads, legacy "exercise_exposure" otherwise
+  max_loss_risk_budget_pct: 2.0   # Size spread risk off 2% of account equity
   exercise_exposure_cap_pct: 20.0 # Cap assignment/exercise notional to 20% of equity
 
   # Regime filter

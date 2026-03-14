@@ -97,6 +97,10 @@ class MomentumStrategy(StrategyBase):
         self._close_by_minute = params.get("close_by_minute", 30)
         self._scan_interval_minutes = params.get("scan_interval_minutes", 15)
         self._bar_timeframe = params.get("bar_timeframe", "5Min")
+        self._scanner_max_range_pct = float(params.get("scanner_max_range_pct", 5.0))
+        self._high_vol_scanner_max_range_pct = float(
+            params.get("high_vol_scanner_max_range_pct", max(8.0, self._scanner_max_range_pct)),
+        )
 
         # Regime filter
         self._allowed_regimes = params.get(
@@ -107,6 +111,11 @@ class MomentumStrategy(StrategyBase):
         # Internal state
         self._trades: dict[str, MomentumTrade] = {}
         self._last_scan_time: datetime | None = None
+
+    def _scanner_range_pct_for_regime(self, regime: MarketRegime | None) -> float:
+        if regime and regime.regime_type.value == "high_vol":
+            return max(self._scanner_max_range_pct, self._high_vol_scanner_max_range_pct)
+        return self._scanner_max_range_pct
 
     def warm_up(self) -> None:
         """Initialize — no heavy warm-up needed, scanner runs on demand."""
@@ -130,7 +139,7 @@ class MomentumStrategy(StrategyBase):
 
         # 3. Scan for new entries if scan interval elapsed
         if self._should_scan(et_now) and len(self._trades) < self.config.max_positions:
-            signals.extend(self._scan_entries(et_now))
+            signals.extend(self._scan_entries(et_now, regime))
 
         return signals
 
@@ -242,16 +251,18 @@ class MomentumStrategy(StrategyBase):
             if updated:
                 trade.bracket_stop_order_id = updated.id
 
-    def _scan_entries(self, et_now: datetime) -> list[Signal]:
+    def _scan_entries(self, et_now: datetime, regime: MarketRegime | None = None) -> list[Signal]:
         """Run breakout scanner and enter on confirmed breaks."""
         signals: list[Signal] = []
         self._last_scan_time = datetime.now(pytz.UTC)
+        scanner_max_range_pct = self._scanner_range_pct_for_regime(regime)
 
         try:
             from algotrader.intelligence.scanners.breakout_scanner import BreakoutScanner
             scanner = BreakoutScanner(
                 data_provider=self.data_provider,
                 min_volume_ratio=self._min_volume_ratio,
+                max_range_pct=scanner_max_range_pct,
                 min_consolidation_days=self._min_consolidation_days,
             )
             breakouts = scanner.scan()
@@ -461,9 +472,11 @@ class MomentumStrategy(StrategyBase):
                 return _complete(OpportunityAssessment())
 
             from algotrader.intelligence.scanners.breakout_scanner import BreakoutScanner
+            scanner_max_range_pct = self._scanner_range_pct_for_regime(regime)
             scanner = BreakoutScanner(
                 data_provider=self.data_provider,
                 min_volume_ratio=self._min_volume_ratio,
+                max_range_pct=scanner_max_range_pct,
                 min_consolidation_days=self._min_consolidation_days,
             )
             breakouts = scanner.scan()
@@ -472,6 +485,7 @@ class MomentumStrategy(StrategyBase):
                 "momentum_scan_universe",
                 regime=regime_type,
                 breakout_hits=raw_scanned,
+                scanner_max_range_pct=round(scanner_max_range_pct, 2),
                 symbols=[bo.symbol for bo in breakouts[:10]],
             )
 

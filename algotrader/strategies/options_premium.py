@@ -121,7 +121,12 @@ class OptionsPremiumStrategy(StrategyBase):
 
         # Sizing
         self._max_risk_per_trade = params.get("max_risk_per_trade", 500)
-        self._max_contracts = params.get("max_contracts", 5)
+        self._max_contracts_per_spread = int(
+            params.get("max_contracts_per_spread", params.get("max_contracts", 5)),
+        )
+        self._max_contracts = self._max_contracts_per_spread
+        self._sizing_method = str(params.get("sizing_method", "exercise_exposure")).lower()
+        self._max_loss_risk_budget_pct = float(params.get("max_loss_risk_budget_pct", 2.0))
         self._exercise_exposure_cap_pct = float(params.get("exercise_exposure_cap_pct", 20.0))
 
         # Regime filter
@@ -308,12 +313,6 @@ class OptionsPremiumStrategy(StrategyBase):
             spread_width = self._wing_width * 100  # Per contract in dollars
             estimated_credit = spread_width * self._credit_estimate_pct
             max_loss_per_contract = max(1.0, spread_width - estimated_credit)
-            contracts = min(
-                self._max_contracts,
-                int(self._max_risk_per_trade / max_loss_per_contract) if max_loss_per_contract > 0 else 1,
-            )
-            contracts = max(contracts, 1)
-
             # For iron condor, double the credit (two sides)
             call_short = None
             call_long = None
@@ -321,16 +320,16 @@ class OptionsPremiumStrategy(StrategyBase):
                 call_short = round(current_price + strike_distance)
                 call_long = call_short + self._wing_width
 
-            exposure_strike = short_strike
-            if structure == "iron_condor" and call_short is not None:
-                exposure_strike = max(short_strike, call_short)
-            contracts = self._cap_contracts_by_exercise_exposure(
-                contracts=contracts,
-                strike_for_exposure=exposure_strike,
-                underlying=underlying,
+            contracts = self._size_contracts_for_structure(
                 structure=structure,
+                underlying=underlying,
+                short_strike=short_strike,
+                max_loss_per_contract=max_loss_per_contract,
+                call_short_strike=call_short,
                 context="entry",
             )
+            if contracts <= 0:
+                continue
 
             total_risk = contracts * max_loss_per_contract
             total_credit = contracts * estimated_credit
@@ -910,6 +909,93 @@ class OptionsPremiumStrategy(StrategyBase):
             )
         return capped_contracts
 
+    def _spread_risk_budget(self, *, context: str) -> float:
+        account_equity = self._get_account_equity()
+        if account_equity is None or account_equity <= 0:
+            account_equity = self._total_capital if self._total_capital > 0 else 0.0
+
+        equity_budget = 0.0
+        if account_equity > 0 and self._max_loss_risk_budget_pct > 0:
+            equity_budget = account_equity * (self._max_loss_risk_budget_pct / 100.0)
+
+        if context == "entry":
+            if self.available_capital > 0 and equity_budget > 0:
+                return min(self.available_capital, equity_budget)
+            if self.available_capital > 0:
+                return self.available_capital
+            return 0.0
+
+        if equity_budget > 0:
+            return equity_budget
+        if self._max_risk_per_trade > 0:
+            return float(self._max_risk_per_trade)
+        if self._total_capital > 0:
+            return self._total_capital
+        return 0.0
+
+    def _size_contracts_for_structure(
+        self,
+        *,
+        structure: str,
+        underlying: str,
+        short_strike: float,
+        max_loss_per_contract: float,
+        call_short_strike: float | None,
+        context: str,
+    ) -> int:
+        if max_loss_per_contract <= 0:
+            return 0 if context == "entry" else 1
+
+        if structure in {"put_spread", "call_spread"} and self._sizing_method == "max_loss":
+            risk_budget = self._spread_risk_budget(context=context)
+            raw_contracts = int(risk_budget / max_loss_per_contract) if risk_budget > 0 else 0
+            contracts = min(self._max_contracts_per_spread, raw_contracts)
+            if context == "assess":
+                contracts = max(contracts, 1)
+            self._log.info(
+                "options_contract_sizing",
+                context=context,
+                underlying=underlying,
+                structure=structure,
+                sizing_method="max_loss",
+                contracts=contracts,
+                max_contracts_per_spread=self._max_contracts_per_spread,
+                max_loss_per_contract=round(max_loss_per_contract, 2),
+                risk_budget=round(risk_budget, 2),
+                available_capital=round(self.available_capital, 2),
+                risk_budget_pct=round(self._max_loss_risk_budget_pct, 2),
+            )
+            return contracts
+
+        contracts = min(
+            self._max_contracts_per_spread,
+            int(self._max_risk_per_trade / max_loss_per_contract) if max_loss_per_contract > 0 else 1,
+        )
+        contracts = max(contracts, 1)
+        exposure_strike = short_strike
+        if structure == "iron_condor" and call_short_strike is not None and call_short_strike > 0:
+            exposure_strike = max(short_strike, call_short_strike)
+        contracts = self._cap_contracts_by_exercise_exposure(
+            contracts=contracts,
+            strike_for_exposure=exposure_strike,
+            underlying=underlying,
+            structure=structure,
+            context=context,
+        )
+        self._log.info(
+            "options_contract_sizing",
+            context=context,
+            underlying=underlying,
+            structure=structure,
+            sizing_method="exercise_exposure",
+            contracts=contracts,
+            max_contracts_per_spread=self._max_contracts_per_spread,
+            max_loss_per_contract=round(max_loss_per_contract, 2),
+            available_capital=round(self.available_capital, 2),
+            exercise_exposure_cap_pct=round(self._exercise_exposure_cap_pct, 2),
+        )
+        return contracts
+
     def _structure_win_rate(self, structure: str) -> float:
         if structure == "iron_condor":
             return float(self._win_rate_iron_condor)
@@ -1080,21 +1166,17 @@ class OptionsPremiumStrategy(StrategyBase):
                         credit_per_contract = credit_single
                         max_loss_per_contract = max(1.0, spread_width - credit_single)
 
-                    contracts = min(
-                        self._max_contracts,
-                        int(self._max_risk_per_trade / max_loss_per_contract) if max_loss_per_contract > 0 else 1,
-                    )
-                    contracts = max(1, contracts)
-                    exposure_strike = short_strike
-                    if structure == "iron_condor" and call_short > 0:
-                        exposure_strike = max(short_strike, call_short)
-                    contracts = self._cap_contracts_by_exercise_exposure(
-                        contracts=contracts,
-                        strike_for_exposure=exposure_strike,
-                        underlying=underlying,
+                    contracts = self._size_contracts_for_structure(
                         structure=structure,
+                        underlying=underlying,
+                        short_strike=short_strike,
+                        max_loss_per_contract=max_loss_per_contract,
+                        call_short_strike=call_short,
                         context="assess",
                     )
+                    if contracts <= 0:
+                        filter_counts["missing_atr_or_price"] += 1
+                        continue
 
                     total_credit = credit_per_contract * contracts
                     total_max_loss = max_loss_per_contract * contracts

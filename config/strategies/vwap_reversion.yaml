@@ -17,6 +17,8 @@ params:
 
   # Entry
   min_z_score: 2.0               # Z-score from VWAP for entry
+  allow_high_vol: true           # Allow high-vol mean reversion with stricter entry stretch
+  high_vol_min_z_score: 2.5      # Require a larger deviation in high_vol
   min_volume_ratio: 1.0          # At least average volume
   max_spread_pct: 0.15           # Tight spread for mean reversion
 

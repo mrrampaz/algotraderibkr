@@ -6,6 +6,8 @@ params:
   min_volume_ratio: 1.5          # Volume must be 1.5x+ 20d average
   min_consolidation_days: 3      # Range must have held 3+ days
   max_spread_pct: 0.2            # Max bid-ask spread
+  scanner_max_range_pct: 5.0     # Baseline consolidation range width
+  high_vol_scanner_max_range_pct: 8.0  # Loosen range width in high-vol markets
 
   # Entry
   entry_confirmation_bars: 1     # Wait N bars above breakout level

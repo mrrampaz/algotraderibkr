@@ -124,6 +124,10 @@ class VWAPReversionStrategy(StrategyBase):
 
         # Regime filter — ONLY ranging/low_vol
         self._allowed_regimes = params.get("allowed_regimes", ["ranging", "low_vol"])
+        self._allow_high_vol = bool(params.get("allow_high_vol", False))
+        self._high_vol_min_z_score = float(
+            params.get("high_vol_min_z_score", max(2.5, self._min_z_score)),
+        )
 
         # Internal state
         self._trades: dict[str, VWAPTrade] = {}
@@ -132,6 +136,17 @@ class VWAPReversionStrategy(StrategyBase):
         """No heavy warm-up needed; VWAP calculated from intraday bars."""
         self._log.info("warming_up", universe_size=len(self._universe))
         self._warmed_up = True
+
+    def _effective_allowed_regimes(self) -> list[str]:
+        allowed_regimes = list(self._allowed_regimes)
+        if self._allow_high_vol and "high_vol" not in allowed_regimes:
+            allowed_regimes.append("high_vol")
+        return allowed_regimes
+
+    def _effective_min_z_score(self, regime: MarketRegime | None) -> float:
+        if regime and regime.regime_type.value == "high_vol" and self._allow_high_vol:
+            return max(self._min_z_score, self._high_vol_min_z_score)
+        return float(self._min_z_score)
 
     def run_cycle(self, regime: MarketRegime | None = None) -> list[Signal]:
         """Run one cycle: manage positions, scan for VWAP deviations."""
@@ -145,7 +160,8 @@ class VWAPReversionStrategy(StrategyBase):
         signals.extend(self._manage_positions(et_now))
 
         # 2. Check regime filter (only gates new entries)
-        if regime and regime.regime_type.value not in self._allowed_regimes:
+        allowed_regimes = self._effective_allowed_regimes()
+        if regime and regime.regime_type.value not in allowed_regimes:
             return signals
 
         # 3. Check time window for new entries
@@ -155,7 +171,7 @@ class VWAPReversionStrategy(StrategyBase):
 
         # 4. Scan for new entries
         if len(self._trades) < self.config.max_positions:
-            signals.extend(self._scan_entries(et_now))
+            signals.extend(self._scan_entries(et_now, regime))
 
         return signals
 
@@ -208,9 +224,10 @@ class VWAPReversionStrategy(StrategyBase):
 
         return signals
 
-    def _scan_entries(self, et_now: datetime) -> list[Signal]:
+    def _scan_entries(self, et_now: datetime, regime: MarketRegime | None = None) -> list[Signal]:
         """Scan universe for VWAP deviation entries."""
         signals: list[Signal] = []
+        effective_min_z_score = self._effective_min_z_score(regime)
 
         for symbol in self._universe:
             if symbol in self._trades:
@@ -228,7 +245,7 @@ class VWAPReversionStrategy(StrategyBase):
                 continue
 
             # Check z-score threshold
-            if abs(z_score) < self._min_z_score:
+            if abs(z_score) < effective_min_z_score:
                 continue
 
             # Get current price
@@ -398,18 +415,21 @@ class VWAPReversionStrategy(StrategyBase):
             from algotrader.strategy_selector.candidate import CandidateType, TradeCandidate
 
             # Regime gate - only active in ranging/low_vol
-            regime_allowed = regime is None or regime.regime_type.value in self._allowed_regimes
+            allowed_regimes = self._effective_allowed_regimes()
+            effective_min_z_score = self._effective_min_z_score(regime)
+            regime_allowed = regime is None or regime.regime_type.value in allowed_regimes
             self._log.info(
                 "vwap_regime_check",
                 regime=regime_type,
                 allowed=regime_allowed,
-                allowed_regimes=self._allowed_regimes,
+                allowed_regimes=allowed_regimes,
+                effective_min_z_score=round(effective_min_z_score, 2),
             )
             if not regime_allowed:
                 self._log.warning(
                     "vwap_regime_rejected",
                     regime=regime_type,
-                    allowed_regimes=self._allowed_regimes,
+                    allowed_regimes=allowed_regimes,
                 )
                 return _complete(OpportunityAssessment())
 
@@ -462,9 +482,9 @@ class VWAPReversionStrategy(StrategyBase):
                         "vwap_zscore",
                         symbol=symbol,
                         z_score=round(z_score, 3),
-                        threshold=self._min_z_score,
+                        threshold=round(effective_min_z_score, 2),
                     )
-                    if abs(z_score) < self._min_z_score:
+                    if abs(z_score) < effective_min_z_score:
                         filter_counts["below_z_threshold"] += 1
                         continue
 
@@ -574,6 +594,7 @@ class VWAPReversionStrategy(StrategyBase):
                     universe_size=len(self._universe),
                     final_candidates=0,
                     filter_counts=filter_counts,
+                    effective_min_z_score=round(effective_min_z_score, 2),
                 )
                 return _complete(OpportunityAssessment())
 
@@ -588,6 +609,7 @@ class VWAPReversionStrategy(StrategyBase):
                 universe_size=len(self._universe),
                 final_candidates=len(top_candidates),
                 filter_counts=filter_counts,
+                effective_min_z_score=round(effective_min_z_score, 2),
             )
 
             return _complete(OpportunityAssessment(

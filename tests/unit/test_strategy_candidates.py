@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 
 import pandas as pd
 import pytz
+import pytest
 
 from algotrader.core.config import StrategyConfig
 from algotrader.core.events import EventBus
@@ -20,6 +21,7 @@ from algotrader.core.models import (
 )
 from algotrader.strategies.event_driven import EventDrivenStrategy
 from algotrader.strategies.gap_reversal import GapReversalStrategy
+from algotrader.strategies.momentum import MomentumStrategy
 from algotrader.strategies.options_premium import OptionsPremiumStrategy, PremiumTrade
 from algotrader.strategies.pairs_trading import PairsTradingStrategy
 from algotrader.strategies.sector_rotation import SectorRotationStrategy
@@ -198,6 +200,42 @@ def test_options_premium_returns_candidates() -> None:
     assert candidate.short_strike > 0
     assert candidate.credit_received > 0
     assert candidate.max_loss > 0
+
+
+def test_options_premium_max_loss_sizing_caps_credit_spread_contracts() -> None:
+    provider = StubDataProvider()
+    executor = StubExecutor()
+    provider.set_price("SPY", 500.0)
+    provider.set_bars("SPY", "1Day", _bars_from_closes([490 + i for i in range(20)], 2_000_000))
+
+    strategy = OptionsPremiumStrategy(
+        name="options_premium",
+        config=StrategyConfig(
+            params={
+                "underlyings": ["SPY"],
+                "entry_start_hour": 0,
+                "entry_start_minute": 0,
+                "entry_end_hour": 23,
+                "entry_end_minute": 59,
+                "min_vix_proxy": 10.0,
+                "sizing_method": "max_loss",
+                "max_loss_risk_budget_pct": 2.0,
+                "max_contracts_per_spread": 3,
+                "max_contracts": 5,
+            }
+        ),
+        data_provider=provider,
+        executor=executor,
+        event_bus=EventBus(),
+    )
+    strategy.set_capital(100000.0)
+
+    assessment = strategy.assess_opportunities(_regime(RegimeType.HIGH_VOL, vix=24.0))
+    assert assessment.candidates
+    candidate = assessment.candidates[0]
+    assert candidate.candidate_type == CandidateType.CREDIT_SPREAD
+    assert candidate.contracts == 3
+    assert candidate.suggested_qty == 3
 
 
 def test_options_profit_target_min_hold_blocks_early_close() -> None:
@@ -386,6 +424,96 @@ def test_vwap_reversion_returns_candidates() -> None:
     else:
         assert candidate.stop_price > candidate.entry_price
     assert abs(candidate.target_price - candidate.metadata["vwap"]) <= 0.5
+
+
+def test_vwap_high_vol_requires_config_enable_and_stricter_threshold() -> None:
+    provider = StubDataProvider()
+    executor = StubExecutor()
+    closes = [100.0] * 35 + [94.0]
+    provider.set_bars("XYZ", "5Min", _bars_from_closes(closes, 1_000_000))
+    provider.set_price("XYZ", 94.0)
+
+    disabled = VWAPReversionStrategy(
+        name="vwap_reversion",
+        config=StrategyConfig(params={"universe": ["XYZ"], "min_z_score": 2.0}),
+        data_provider=provider,
+        executor=executor,
+        event_bus=EventBus(),
+    )
+    disabled.set_capital(100000.0)
+    disabled_assessment = disabled.assess_opportunities(_regime(RegimeType.HIGH_VOL, vix=28.0))
+    assert not disabled_assessment.candidates
+
+    strict_enabled = VWAPReversionStrategy(
+        name="vwap_reversion",
+        config=StrategyConfig(
+            params={
+                "universe": ["XYZ"],
+                "min_z_score": 2.0,
+                "allow_high_vol": True,
+                "high_vol_min_z_score": 5.0,
+            }
+        ),
+        data_provider=provider,
+        executor=executor,
+        event_bus=EventBus(),
+    )
+    strict_enabled.set_capital(100000.0)
+    strict_assessment = strict_enabled.assess_opportunities(_regime(RegimeType.HIGH_VOL, vix=28.0))
+    assert not strict_assessment.candidates
+
+    enabled = VWAPReversionStrategy(
+        name="vwap_reversion",
+        config=StrategyConfig(
+            params={
+                "universe": ["XYZ"],
+                "min_z_score": 2.0,
+                "allow_high_vol": True,
+                "high_vol_min_z_score": 2.5,
+            }
+        ),
+        data_provider=provider,
+        executor=executor,
+        event_bus=EventBus(),
+    )
+    enabled.set_capital(100000.0)
+    enabled_assessment = enabled.assess_opportunities(_regime(RegimeType.HIGH_VOL, vix=28.0))
+    assert enabled_assessment.candidates
+
+
+def test_momentum_uses_high_vol_scanner_range(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider = StubDataProvider()
+    executor = StubExecutor()
+    captured: dict[str, float] = {}
+
+    class DummyScanner:
+        def __init__(self, data_provider, min_volume_ratio, max_range_pct, min_consolidation_days):
+            captured["max_range_pct"] = float(max_range_pct)
+
+        def scan(self):
+            return []
+
+    import algotrader.intelligence.scanners.breakout_scanner as breakout_module
+
+    monkeypatch.setattr(breakout_module, "BreakoutScanner", DummyScanner)
+
+    strategy = MomentumStrategy(
+        name="momentum",
+        config=StrategyConfig(
+            params={
+                "scanner_max_range_pct": 5.0,
+                "high_vol_scanner_max_range_pct": 8.0,
+                "allowed_regimes": ["high_vol"],
+            }
+        ),
+        data_provider=provider,
+        executor=executor,
+        event_bus=EventBus(),
+    )
+    strategy.set_capital(100000.0)
+
+    strategy.assess_opportunities(_regime(RegimeType.HIGH_VOL, vix=30.0))
+    assert captured["max_range_pct"] == 8.0
 
 
 def test_pairs_trading_antichurn_filter() -> None:
