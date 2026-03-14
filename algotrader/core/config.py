@@ -110,6 +110,15 @@ class AlertsConfig(BaseModel):
 class BrainConfig(BaseModel):
     """Config for the Daily Brain selector mode."""
 
+    class AdaptiveRiskTiersConfig(BaseModel):
+        single_strategy_risk_pct: float = 5.0
+        few_strategies_risk_pct: float = 4.0
+        diversified_risk_pct: float = 3.0
+
+    class DrawdownGovernorConfig(BaseModel):
+        moderate_threshold_pct: float = 1.5
+        severe_threshold_pct: float = 3.0
+
     min_confidence: float = 0.60
     min_risk_reward: float = 1.5
     min_edge_pct: float = 0.3
@@ -125,6 +134,12 @@ class BrainConfig(BaseModel):
     recent_loss_cooldown_hours: int = 4
     midday_confidence_multiplier: float = 1.2
     midday_pnl_stop_pct: float = -1.0
+    adaptive_sizing: bool = True
+    adaptive_risk_tiers: AdaptiveRiskTiersConfig = Field(default_factory=AdaptiveRiskTiersConfig)
+    drawdown_governor: DrawdownGovernorConfig = Field(default_factory=DrawdownGovernorConfig)
+    max_contracts_hard_cap: int = 5
+    recent_win_rate_lookback_trades: int = 15
+    recent_win_rate_fallback: float = 0.80
 
 
 class StrategySelectorConfig(BaseModel):

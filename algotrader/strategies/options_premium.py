@@ -121,13 +121,19 @@ class OptionsPremiumStrategy(StrategyBase):
 
         # Sizing
         self._max_risk_per_trade = params.get("max_risk_per_trade", 500)
+        self._max_contracts = int(params.get("max_contracts", 5))
+        self._max_contracts = max(1, min(self._max_contracts, 5))
         self._max_contracts_per_spread = int(
-            params.get("max_contracts_per_spread", params.get("max_contracts", 5)),
+            params.get("max_contracts_per_spread", self._max_contracts),
         )
-        self._max_contracts = self._max_contracts_per_spread
+        self._max_contracts_per_spread = max(
+            1,
+            min(self._max_contracts_per_spread, self._max_contracts),
+        )
         self._sizing_method = str(params.get("sizing_method", "exercise_exposure")).lower()
         self._max_loss_risk_budget_pct = float(params.get("max_loss_risk_budget_pct", 2.0))
         self._exercise_exposure_cap_pct = float(params.get("exercise_exposure_cap_pct", 20.0))
+        self._brain_max_contracts_override: int | None = None
 
         # Regime filter
         self._allowed_regimes = params.get(
@@ -144,6 +150,26 @@ class OptionsPremiumStrategy(StrategyBase):
         """No heavy warm-up needed."""
         self._log.info("warming_up", underlyings=self._underlyings)
         self._warmed_up = True
+
+    def set_brain_contract_cap(self, max_contracts: int | None) -> None:
+        """Allow Brain decisions to override per-spread contract caps at runtime."""
+        if max_contracts is None:
+            self._brain_max_contracts_override = None
+            self._log.info(
+                "options_brain_contract_cap_cleared",
+                configured_max_contracts=self._max_contracts_per_spread,
+            )
+            return
+
+        clamped = max(1, min(int(max_contracts), self._max_contracts))
+        self._brain_max_contracts_override = clamped
+        self._log.info(
+            "options_brain_contract_cap_set",
+            requested=max_contracts,
+            effective=clamped,
+            configured_max_contracts=self._max_contracts_per_spread,
+            hard_max_contracts=self._max_contracts,
+        )
 
     def run_cycle(self, regime: MarketRegime | None = None) -> list[Signal]:
         """Run one cycle: manage positions, check entry window."""
@@ -919,6 +945,8 @@ class OptionsPremiumStrategy(StrategyBase):
             equity_budget = account_equity * (self._max_loss_risk_budget_pct / 100.0)
 
         if context == "entry":
+            if self.available_capital > 0 and self._brain_max_contracts_override is not None:
+                return self.available_capital
             if self.available_capital > 0 and equity_budget > 0:
                 return min(self.available_capital, equity_budget)
             if self.available_capital > 0:
@@ -933,6 +961,12 @@ class OptionsPremiumStrategy(StrategyBase):
             return self._total_capital
         return 0.0
 
+    def _effective_max_contracts_per_spread(self) -> int:
+        configured_cap = max(1, min(self._max_contracts_per_spread, self._max_contracts))
+        if self._brain_max_contracts_override is None:
+            return configured_cap
+        return max(1, min(self._brain_max_contracts_override, self._max_contracts))
+
     def _size_contracts_for_structure(
         self,
         *,
@@ -946,10 +980,11 @@ class OptionsPremiumStrategy(StrategyBase):
         if max_loss_per_contract <= 0:
             return 0 if context == "entry" else 1
 
+        effective_contract_cap = self._effective_max_contracts_per_spread()
         if structure in {"put_spread", "call_spread"} and self._sizing_method == "max_loss":
             risk_budget = self._spread_risk_budget(context=context)
             raw_contracts = int(risk_budget / max_loss_per_contract) if risk_budget > 0 else 0
-            contracts = min(self._max_contracts_per_spread, raw_contracts)
+            contracts = min(effective_contract_cap, raw_contracts)
             if context == "assess":
                 contracts = max(contracts, 1)
             self._log.info(
@@ -959,7 +994,9 @@ class OptionsPremiumStrategy(StrategyBase):
                 structure=structure,
                 sizing_method="max_loss",
                 contracts=contracts,
-                max_contracts_per_spread=self._max_contracts_per_spread,
+                max_contracts_per_spread=effective_contract_cap,
+                configured_max_contracts_per_spread=self._max_contracts_per_spread,
+                brain_max_contracts_override=self._brain_max_contracts_override,
                 max_loss_per_contract=round(max_loss_per_contract, 2),
                 risk_budget=round(risk_budget, 2),
                 available_capital=round(self.available_capital, 2),
@@ -968,7 +1005,7 @@ class OptionsPremiumStrategy(StrategyBase):
             return contracts
 
         contracts = min(
-            self._max_contracts_per_spread,
+            effective_contract_cap,
             int(self._max_risk_per_trade / max_loss_per_contract) if max_loss_per_contract > 0 else 1,
         )
         contracts = max(contracts, 1)
@@ -989,7 +1026,9 @@ class OptionsPremiumStrategy(StrategyBase):
             structure=structure,
             sizing_method="exercise_exposure",
             contracts=contracts,
-            max_contracts_per_spread=self._max_contracts_per_spread,
+            max_contracts_per_spread=effective_contract_cap,
+            configured_max_contracts_per_spread=self._max_contracts_per_spread,
+            brain_max_contracts_override=self._brain_max_contracts_override,
             max_loss_per_contract=round(max_loss_per_contract, 2),
             available_capital=round(self.available_capital, 2),
             exercise_exposure_cap_pct=round(self._exercise_exposure_cap_pct, 2),

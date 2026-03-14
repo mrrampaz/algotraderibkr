@@ -119,6 +119,12 @@ def _brain(**kwargs) -> DailyBrain:
         recent_loss_cooldown_hours=kwargs.pop("recent_loss_cooldown_hours", 4),
         midday_confidence_multiplier=kwargs.pop("midday_confidence_multiplier", 1.2),
         midday_pnl_stop_pct=kwargs.pop("midday_pnl_stop_pct", -1.0),
+        adaptive_sizing=kwargs.pop("adaptive_sizing", False),
+        adaptive_risk_tiers=kwargs.pop("adaptive_risk_tiers", None),
+        drawdown_governor=kwargs.pop("drawdown_governor", None),
+        max_contracts_hard_cap=kwargs.pop("max_contracts_hard_cap", 5),
+        recent_win_rate_lookback_trades=kwargs.pop("recent_win_rate_lookback_trades", 15),
+        recent_win_rate_fallback=kwargs.pop("recent_win_rate_fallback", 0.80),
     )
 
 
@@ -136,6 +142,10 @@ def _candidate(
     stop_price: float = 95.0,
     target_price: float = 110.0,
     candidate_type: CandidateType = CandidateType.LONG_EQUITY,
+    options_structure: str = "",
+    contracts: int = 0,
+    credit_received: float = 0.0,
+    max_loss: float = 0.0,
     suggested_qty: int = 0,
     metadata: dict | None = None,
 ) -> TradeCandidate:
@@ -154,6 +164,10 @@ def _candidate(
         edge_estimate_pct=edge,
         regime_fit=regime_fit,
         catalyst="breakout_volume_2.0x",
+        options_structure=options_structure,
+        contracts=contracts,
+        credit_received=credit_received,
+        max_loss=max_loss,
         metadata=metadata or {},
     )
 
@@ -351,3 +365,81 @@ def test_regime_mismatch_penalty_lowers_selection_priority() -> None:
 
     assert decision.num_trades == 1
     assert decision.selected_trades[0].candidate.symbol == "FIT"
+
+
+def test_adaptive_risk_tier_single_strategy_boosts_to_hard_cap() -> None:
+    brain = _brain(adaptive_sizing=True, max_daily_risk_pct=6.0)
+    limits = brain._compute_adaptive_risk_limits(
+        active_strategy_count=1,
+        recent_win_rate=0.90,
+        current_drawdown_pct=0.0,
+    )
+
+    assert limits["max_daily_risk_pct"] == 6.0
+    assert limits["max_contracts"] == 5
+
+
+def test_adaptive_risk_tier_moderate_drawdown_reduces_risk_and_contracts() -> None:
+    brain = _brain(adaptive_sizing=True, max_daily_risk_pct=6.0)
+    limits = brain._compute_adaptive_risk_limits(
+        active_strategy_count=1,
+        recent_win_rate=0.90,
+        current_drawdown_pct=2.0,
+    )
+
+    assert limits["max_daily_risk_pct"] == 4.2
+    assert limits["max_contracts"] == 4
+
+
+def test_adaptive_risk_tier_severe_drawdown_halves_and_clamps() -> None:
+    brain = _brain(adaptive_sizing=True, max_daily_risk_pct=6.0)
+    limits = brain._compute_adaptive_risk_limits(
+        active_strategy_count=1,
+        recent_win_rate=0.90,
+        current_drawdown_pct=4.0,
+    )
+
+    assert limits["max_daily_risk_pct"] == 3.0
+    assert limits["max_contracts"] == 2
+
+
+def test_decide_applies_adaptive_options_contract_override() -> None:
+    brain = _brain(
+        adaptive_sizing=True,
+        max_daily_risk_pct=6.0,
+        max_capital_per_trade_pct=25.0,
+    )
+    brain._get_recent_win_rate = lambda lookback_trades=15: 0.90  # type: ignore[method-assign]
+    brain._get_current_drawdown = lambda: 0.0  # type: ignore[method-assign]
+
+    options = _candidate(
+        symbol="SPY",
+        strategy_name="options_premium",
+        candidate_type=CandidateType.CREDIT_SPREAD,
+        direction="neutral",
+        entry_price=500.0,
+        stop_price=495.0,
+        target_price=500.0,
+        risk_dollars=1425.0,
+        confidence=0.80,
+        rr=0.35,
+        edge=0.9,
+        options_structure="put_spread",
+        contracts=3,
+        suggested_qty=3,
+        credit_received=300.0,
+        max_loss=1425.0,
+        metadata={"win_rate": 0.90},
+    )
+
+    decision = brain.decide(
+        regime=_regime(RegimeType.HIGH_VOL, vix=24.0),
+        assessments={"options_premium": OpportunityAssessment(candidates=[options])},
+        current_positions=[],
+        daily_pnl=0.0,
+    )
+
+    assert decision.num_trades == 1
+    selected = decision.selected_trades[0]
+    assert selected.position_size == 5
+    assert selected.risk_amount == 2375.0

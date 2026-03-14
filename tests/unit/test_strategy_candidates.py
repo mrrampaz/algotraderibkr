@@ -238,6 +238,60 @@ def test_options_premium_max_loss_sizing_caps_credit_spread_contracts() -> None:
     assert candidate.suggested_qty == 3
 
 
+def test_options_premium_brain_contract_cap_override_applies_at_entry() -> None:
+    provider = StubDataProvider()
+    executor = StubExecutor()
+    provider.set_price("SPY", 500.0)
+    provider.set_bars("SPY", "1Day", _bars_from_closes([490 + i for i in range(20)], 2_000_000))
+
+    strategy = OptionsPremiumStrategy(
+        name="options_premium",
+        config=StrategyConfig(
+            params={
+                "underlyings": ["SPY"],
+                "entry_start_hour": 0,
+                "entry_start_minute": 0,
+                "entry_end_hour": 23,
+                "entry_end_minute": 59,
+                "min_vix_proxy": 10.0,
+                "sizing_method": "max_loss",
+                "max_loss_risk_budget_pct": 2.0,
+                "max_contracts_per_spread": 3,
+                "max_contracts": 5,
+            }
+        ),
+        data_provider=provider,
+        executor=executor,
+        event_bus=EventBus(),
+    )
+    strategy.set_capital(5000.0)
+
+    # Baseline: configured spread cap (3) is enforced.
+    baseline = strategy._size_contracts_for_structure(
+        structure="put_spread",
+        underlying="SPY",
+        short_strike=495.0,
+        max_loss_per_contract=475.0,
+        call_short_strike=None,
+        context="entry",
+    )
+    assert baseline == 3
+
+    # Brain override: allow up to 5 contracts using allocated capital budget.
+    strategy.set_brain_contract_cap(5)
+    overridden = strategy._size_contracts_for_structure(
+        structure="put_spread",
+        underlying="SPY",
+        short_strike=495.0,
+        max_loss_per_contract=475.0,
+        call_short_strike=None,
+        context="entry",
+    )
+    assert overridden == 5
+
+    strategy.set_brain_contract_cap(None)
+
+
 def test_options_profit_target_min_hold_blocks_early_close() -> None:
     provider = StubDataProvider()
     executor = StubExecutor()

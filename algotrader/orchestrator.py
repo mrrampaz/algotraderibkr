@@ -191,6 +191,12 @@ class Orchestrator:
                         recent_loss_cooldown_hours=brain_cfg.recent_loss_cooldown_hours,
                         midday_confidence_multiplier=brain_cfg.midday_confidence_multiplier,
                         midday_pnl_stop_pct=brain_cfg.midday_pnl_stop_pct,
+                        adaptive_sizing=brain_cfg.adaptive_sizing,
+                        adaptive_risk_tiers=brain_cfg.adaptive_risk_tiers.model_dump(),
+                        drawdown_governor=brain_cfg.drawdown_governor.model_dump(),
+                        max_contracts_hard_cap=brain_cfg.max_contracts_hard_cap,
+                        recent_win_rate_lookback_trades=brain_cfg.recent_win_rate_lookback_trades,
+                        recent_win_rate_fallback=brain_cfg.recent_win_rate_fallback,
                     )
                     self._use_brain = True
                     self._log.info("strategy_selector_initialized", mode="brain")
@@ -1160,15 +1166,29 @@ class Orchestrator:
         # Enable capital only for selected strategies. Multiple selected candidates
         # from the same strategy share a summed capital budget.
         strategy_capital: dict[str, float] = {}
+        strategy_contract_caps: dict[str, int] = {}
         for selection in decision.selected_trades:
             name = selection.candidate.strategy_name
             strategy_capital[name] = strategy_capital.get(name, 0.0) + selection.allocated_capital
+            if selection.candidate.is_options:
+                strategy_contract_caps[name] = max(
+                    strategy_contract_caps.get(name, 0),
+                    max(1, int(selection.position_size)),
+                )
 
         for strategy_name, capital in strategy_capital.items():
             strategy = self._strategies.get(strategy_name)
             if strategy is None:
                 continue
             strategy.set_capital(capital)
+            if hasattr(strategy, "set_brain_contract_cap"):
+                try:
+                    strategy.set_brain_contract_cap(strategy_contract_caps.get(strategy_name))
+                except Exception:
+                    self._log.exception(
+                        "brain_contract_cap_apply_failed",
+                        strategy=strategy_name,
+                    )
             if not strategy.is_enabled:
                 strategy.enable()
 
@@ -1176,6 +1196,14 @@ class Orchestrator:
         for name, strategy in self._strategies.items():
             if name not in active_strategies:
                 strategy.set_capital(0.0)  # Allow existing positions to keep being managed
+                if hasattr(strategy, "set_brain_contract_cap"):
+                    try:
+                        strategy.set_brain_contract_cap(None)
+                    except Exception:
+                        self._log.exception(
+                            "brain_contract_cap_clear_failed",
+                            strategy=name,
+                        )
 
         self._save_brain_decision(decision)
 

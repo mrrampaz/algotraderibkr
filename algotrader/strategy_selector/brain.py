@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
@@ -157,12 +160,20 @@ class DailyBrain:
         recent_loss_cooldown_hours: int = 4,
         midday_confidence_multiplier: float = 1.2,
         midday_pnl_stop_pct: float = -1.0,
+        adaptive_sizing: bool = True,
+        adaptive_risk_tiers: dict[str, float] | None = None,
+        drawdown_governor: dict[str, float] | None = None,
+        max_contracts_hard_cap: int = 5,
+        recent_win_rate_lookback_trades: int = 15,
+        recent_win_rate_fallback: float = 0.80,
     ) -> None:
         self._log = logger.bind(component="daily_brain")
         self._total_capital = total_capital
         self._trade_journal = trade_journal or TradeJournal()
         self._event_calendar = event_calendar or EventCalendar()
         regime_config = regime_config or {}
+        adaptive_risk_tiers = adaptive_risk_tiers or {}
+        drawdown_governor = drawdown_governor or {}
 
         self._min_confidence = min_confidence
         self._min_risk_reward = min_risk_reward
@@ -172,7 +183,34 @@ class DailyBrain:
         self._options_min_edge_pct = options_min_edge_pct
         self._max_daily_trades = max_daily_trades
         self._max_capital_per_trade_pct = max_capital_per_trade_pct
-        self._max_daily_risk_pct = max_daily_risk_pct
+        self._absolute_max_daily_risk_pct = 6.0
+        self._max_daily_risk_pct = min(
+            max_daily_risk_pct,
+            self._absolute_max_daily_risk_pct,
+        )
+        self._adaptive_sizing = adaptive_sizing
+        self._single_strategy_risk_pct = float(
+            adaptive_risk_tiers.get("single_strategy_risk_pct", 5.0),
+        )
+        self._few_strategies_risk_pct = float(
+            adaptive_risk_tiers.get("few_strategies_risk_pct", 4.0),
+        )
+        self._diversified_risk_pct = float(
+            adaptive_risk_tiers.get("diversified_risk_pct", 3.0),
+        )
+        self._moderate_drawdown_threshold_pct = float(
+            drawdown_governor.get("moderate_threshold_pct", 1.5),
+        )
+        self._severe_drawdown_threshold_pct = float(
+            drawdown_governor.get("severe_threshold_pct", 3.0),
+        )
+        self._absolute_max_contracts = 5
+        self._max_contracts_hard_cap = max(
+            1,
+            min(max_contracts_hard_cap, self._absolute_max_contracts),
+        )
+        self._recent_win_rate_lookback_trades = max(1, int(recent_win_rate_lookback_trades))
+        self._recent_win_rate_fallback = min(0.99, max(0.01, float(recent_win_rate_fallback)))
         self._cash_is_default = cash_is_default
         self._regime_mismatch_penalty = regime_mismatch_penalty
         self._correlation_penalty = correlation_penalty
@@ -192,7 +230,9 @@ class DailyBrain:
             options_min_rr=options_min_risk_reward,
             options_min_edge=options_min_edge_pct,
             max_daily_trades=max_daily_trades,
-            max_daily_risk_pct=max_daily_risk_pct,
+            max_daily_risk_pct=self._max_daily_risk_pct,
+            adaptive_sizing=self._adaptive_sizing,
+            max_contracts_hard_cap=self._max_contracts_hard_cap,
         )
 
     def decide(
@@ -299,6 +339,39 @@ class DailyBrain:
         min_confidence: float,
     ) -> BrainDecision:
         all_candidates, classic_fallback = self._collect_candidates(regime, assessments)
+        active_strategy_count = len({candidate.strategy_name for candidate in all_candidates})
+        recent_win_rate = self._get_recent_win_rate(
+            lookback_trades=self._recent_win_rate_lookback_trades,
+        )
+        win_rate_fallback_used = recent_win_rate is None
+        if recent_win_rate is None:
+            recent_win_rate = self._recent_win_rate_fallback
+        current_drawdown_pct = self._get_current_drawdown()
+
+        effective_max_risk_pct = self._max_daily_risk_pct
+        effective_max_contracts: int | None = None
+        adaptive_reason = "adaptive_sizing_disabled"
+        if self._adaptive_sizing:
+            adaptive = self._compute_adaptive_risk_limits(
+                active_strategy_count=active_strategy_count,
+                recent_win_rate=recent_win_rate,
+                current_drawdown_pct=current_drawdown_pct,
+            )
+            effective_max_risk_pct = float(adaptive["max_daily_risk_pct"])
+            effective_max_contracts = int(adaptive["max_contracts"])
+            adaptive_reason = str(adaptive["reason"])
+
+        self._log.info(
+            "adaptive_risk_computed",
+            active_strategies=active_strategy_count,
+            recent_win_rate=recent_win_rate,
+            recent_win_rate_fallback_used=win_rate_fallback_used,
+            drawdown_pct=current_drawdown_pct,
+            effective_max_risk_pct=effective_max_risk_pct,
+            effective_max_contracts=effective_max_contracts,
+            reason=adaptive_reason,
+        )
+
         rejected: list[TradeRejection] = []
         scored: list[tuple[TradeCandidate, float]] = []
 
@@ -325,14 +398,20 @@ class DailyBrain:
 
         selected: list[TradeSelection] = []
         total_risk_dollars = 0.0
-        max_daily_risk_dollars = self._total_capital * (self._max_daily_risk_pct / 100.0)
+        max_daily_risk_dollars = self._total_capital * (effective_max_risk_pct / 100.0)
         max_trade_capital = self._total_capital * (self._max_capital_per_trade_pct / 100.0)
 
         for candidate, score in scored:
             if len(selected) >= self._max_daily_trades:
                 break
 
-            risk_amount, position_size, allocated_capital = self._allocation_for_candidate(candidate)
+            option_contract_cap: int | None = None
+            if candidate.is_options and effective_max_contracts is not None:
+                option_contract_cap = effective_max_contracts
+            risk_amount, position_size, allocated_capital = self._allocation_for_candidate(
+                candidate,
+                options_contract_cap=option_contract_cap,
+            )
 
             if total_risk_dollars + risk_amount > max_daily_risk_dollars:
                 rejected.append(
@@ -398,6 +477,50 @@ class DailyBrain:
             reasoning=reasoning,
         )
         return decision
+
+    def _compute_adaptive_risk_limits(
+        self,
+        active_strategy_count: int,
+        recent_win_rate: float | None,
+        current_drawdown_pct: float,
+    ) -> dict[str, Any]:
+        """Compute dynamic risk limits based on portfolio concentration/performance."""
+        if active_strategy_count <= 1:
+            base_risk_pct = self._single_strategy_risk_pct
+            base_max_contracts = self._max_contracts_hard_cap
+        elif active_strategy_count <= 3:
+            base_risk_pct = self._few_strategies_risk_pct
+            base_max_contracts = max(1, self._max_contracts_hard_cap - 1)
+        else:
+            base_risk_pct = self._diversified_risk_pct
+            base_max_contracts = max(1, self._max_contracts_hard_cap - 2)
+
+        if recent_win_rate is not None and recent_win_rate > 0.70:
+            win_rate_multiplier = 1.0 + (recent_win_rate - 0.70)
+            base_risk_pct *= win_rate_multiplier
+            base_risk_pct = min(base_risk_pct, self._max_daily_risk_pct)
+
+        if current_drawdown_pct > self._severe_drawdown_threshold_pct:
+            base_risk_pct *= 0.5
+            base_max_contracts = max(1, base_max_contracts // 2)
+        elif current_drawdown_pct > self._moderate_drawdown_threshold_pct:
+            base_risk_pct *= 0.7
+            base_max_contracts = max(1, base_max_contracts - 1)
+
+        base_risk_pct = min(base_risk_pct, self._max_daily_risk_pct)
+        base_max_contracts = max(
+            1,
+            min(base_max_contracts, self._max_contracts_hard_cap),
+        )
+        win_rate_txt = f"{recent_win_rate:.0%}" if recent_win_rate is not None else "unknown"
+        return {
+            "max_daily_risk_pct": round(base_risk_pct, 2),
+            "max_contracts": base_max_contracts,
+            "reason": (
+                f"{active_strategy_count} active strategies, "
+                f"win_rate={win_rate_txt}, dd={current_drawdown_pct:.1f}%"
+            ),
+        }
 
     def _collect_candidates(
         self,
@@ -569,11 +692,20 @@ class DailyBrain:
         adjusted_rr = (win_rate * credit) / (loss_rate * max_loss)
         return max(0.0, adjusted_rr)
 
-    def _allocation_for_candidate(self, candidate: TradeCandidate) -> tuple[float, int, float]:
+    def _allocation_for_candidate(
+        self,
+        candidate: TradeCandidate,
+        options_contract_cap: int | None = None,
+    ) -> tuple[float, int, float]:
         max_trade_capital = self._total_capital * (self._max_capital_per_trade_pct / 100.0)
-        risk_amount = self._compute_trade_risk(candidate)
+        risk_amount = self._compute_trade_risk(
+            candidate,
+            options_contracts=options_contract_cap if candidate.is_options else None,
+        )
 
-        if candidate.suggested_qty > 0:
+        if candidate.is_options and options_contract_cap is not None:
+            position_size = max(1, min(int(options_contract_cap), self._max_contracts_hard_cap))
+        elif candidate.suggested_qty > 0:
             position_size = candidate.suggested_qty
         elif candidate.entry_price > 0:
             risk_per_unit = abs(candidate.entry_price - candidate.stop_price)
@@ -587,7 +719,9 @@ class DailyBrain:
         if candidate.entry_price > 0:
             allocated_capital = candidate.entry_price * position_size
         elif candidate.is_options and candidate.max_loss > 0:
-            allocated_capital = candidate.max_loss * max(candidate.contracts, 1)
+            base_contracts = max(candidate.contracts, candidate.suggested_qty, 1)
+            per_contract_max_loss = candidate.max_loss / base_contracts
+            allocated_capital = per_contract_max_loss * max(position_size, 1)
         else:
             allocated_capital = max(risk_amount, max_trade_capital * 0.25)
 
@@ -595,13 +729,25 @@ class DailyBrain:
         risk_amount = min(risk_amount, allocated_capital)
         return float(risk_amount), int(position_size), float(allocated_capital)
 
-    def _compute_trade_risk(self, candidate: TradeCandidate) -> float:
+    def _compute_trade_risk(
+        self,
+        candidate: TradeCandidate,
+        options_contracts: int | None = None,
+    ) -> float:
+        if candidate.is_options and options_contracts is not None and options_contracts > 0:
+            base_contracts = max(candidate.contracts, candidate.suggested_qty, 1)
+            if candidate.risk_dollars > 0:
+                per_contract_risk = candidate.risk_dollars / base_contracts
+                return per_contract_risk * options_contracts
+            if candidate.max_loss > 0:
+                per_contract_risk = candidate.max_loss / base_contracts
+                return per_contract_risk * options_contracts
+
         if candidate.risk_dollars > 0:
             return candidate.risk_dollars
 
         if candidate.is_options and candidate.max_loss > 0:
-            contracts = max(candidate.contracts, 1)
-            return candidate.max_loss * contracts
+            return candidate.max_loss
 
         risk_per_unit = abs(candidate.entry_price - candidate.stop_price)
         if risk_per_unit > 0:
@@ -618,6 +764,63 @@ class DailyBrain:
             return risk_per_unit * fallback_qty
 
         return self._total_capital * 0.0025
+
+    def _get_recent_win_rate(self, lookback_trades: int = 15) -> float | None:
+        """Get recent win rate from the last N closed trades in journal DB."""
+        try:
+            db_path = Path(getattr(self._trade_journal, "_db_path", "data/journal/trades.db"))
+            if not db_path.exists():
+                return None
+
+            conn = sqlite3.connect(str(db_path))
+            try:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT realized_pnl
+                    FROM trades
+                    WHERE exit_time IS NOT NULL
+                      AND realized_pnl IS NOT NULL
+                    ORDER BY exit_time DESC
+                    LIMIT ?
+                    """,
+                    (max(1, int(lookback_trades)),),
+                )
+                rows = cursor.fetchall()
+            finally:
+                conn.close()
+
+            if len(rows) < 5:
+                return None
+
+            wins = sum(1 for row in rows if float(row[0]) > 0)
+            return wins / len(rows)
+        except Exception:
+            self._log.debug("recent_win_rate_fetch_failed", exc_info=True)
+            return None
+
+    def _load_broker_snapshot(self) -> dict[str, Any] | None:
+        """Load latest broker snapshot from dashboard state, if present."""
+        try:
+            path = Path("data/state/broker_snapshot.json")
+            if not path.exists():
+                return None
+            with path.open("r", encoding="utf-8") as fh:
+                raw = json.load(fh)
+            return raw if isinstance(raw, dict) else None
+        except Exception:
+            self._log.debug("broker_snapshot_load_failed", exc_info=True)
+            return None
+
+    def _get_current_drawdown(self) -> float:
+        """Get current drawdown percentage from broker snapshot state."""
+        snapshot = self._load_broker_snapshot()
+        if not snapshot:
+            return 0.0
+        value = snapshot.get("drawdown_pct", 0.0)
+        if isinstance(value, (int, float)):
+            return float(value)
+        return 0.0
 
     def _already_positioned(
         self,
