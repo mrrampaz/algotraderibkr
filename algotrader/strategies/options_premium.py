@@ -1002,13 +1002,28 @@ class OptionsPremiumStrategy(StrategyBase):
                 available_capital=round(self.available_capital, 2),
                 risk_budget_pct=round(self._max_loss_risk_budget_pct, 2),
             )
+            self._log.info(
+                "options_sizing_decision",
+                context=context,
+                underlying=underlying,
+                structure=structure,
+                sizing_method="max_loss",
+                brain_cap=self._brain_max_contracts_override,
+                config_max=self._max_contracts_per_spread,
+                budget_contracts=raw_contracts,
+                final_contracts=contracts,
+            )
             return contracts
 
+        budget_contracts = (
+            int(self._max_risk_per_trade / max_loss_per_contract) if max_loss_per_contract > 0 else 0
+        )
         contracts = min(
             effective_contract_cap,
-            int(self._max_risk_per_trade / max_loss_per_contract) if max_loss_per_contract > 0 else 1,
+            budget_contracts,
         )
         contracts = max(contracts, 1)
+        pre_exposure_contracts = contracts
         exposure_strike = short_strike
         if structure == "iron_condor" and call_short_strike is not None and call_short_strike > 0:
             exposure_strike = max(short_strike, call_short_strike)
@@ -1032,6 +1047,18 @@ class OptionsPremiumStrategy(StrategyBase):
             max_loss_per_contract=round(max_loss_per_contract, 2),
             available_capital=round(self.available_capital, 2),
             exercise_exposure_cap_pct=round(self._exercise_exposure_cap_pct, 2),
+        )
+        self._log.info(
+            "options_sizing_decision",
+            context=context,
+            underlying=underlying,
+            structure=structure,
+            sizing_method="exercise_exposure",
+            brain_cap=self._brain_max_contracts_override,
+            config_max=self._max_contracts_per_spread,
+            budget_contracts=budget_contracts,
+            pre_exposure_contracts=pre_exposure_contracts,
+            final_contracts=contracts,
         )
         return contracts
 

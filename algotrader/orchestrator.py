@@ -314,9 +314,7 @@ class Orchestrator:
                 self._log.info("initialize_aborted_shutdown_requested")
                 break
 
-            config = self._settings.strategies.get(name)
-            if config is None:
-                config = load_strategy_config(name)
+            config = self._resolve_strategy_config(name)
 
             if not config.enabled:
                 self._log.info("strategy_disabled", name=name)
@@ -339,6 +337,22 @@ class Orchestrator:
                 self._log.info("strategy_initialized", name=name, capital=capital)
 
         self._log.info("initialization_complete", strategies=list(self._strategies.keys()))
+
+    def _resolve_strategy_config(self, name: str) -> StrategyConfig:
+        """Resolve strategy config by merging file defaults with inline overrides."""
+        file_config = load_strategy_config(name)
+        inline_config = self._settings.strategies.get(name)
+        if inline_config is None:
+            return file_config
+
+        merged_params = dict(file_config.params)
+        merged_params.update(inline_config.params or {})
+        return StrategyConfig(
+            enabled=inline_config.enabled,
+            capital_allocation_pct=inline_config.capital_allocation_pct,
+            max_positions=inline_config.max_positions,
+            params=merged_params,
+        )
 
     def _import_strategies(self) -> None:
         """Import strategy modules to trigger @register_strategy decorators."""
@@ -1182,8 +1196,15 @@ class Orchestrator:
                 continue
             strategy.set_capital(capital)
             if hasattr(strategy, "set_brain_contract_cap"):
+                requested_contracts = strategy_contract_caps.get(strategy_name)
                 try:
-                    strategy.set_brain_contract_cap(strategy_contract_caps.get(strategy_name))
+                    strategy.set_brain_contract_cap(requested_contracts)
+                    self._log.info(
+                        "brain_contract_cap_applied",
+                        strategy=strategy_name,
+                        brain_contracts=requested_contracts,
+                        method="set_brain_contract_cap",
+                    )
                 except Exception:
                     self._log.exception(
                         "brain_contract_cap_apply_failed",
