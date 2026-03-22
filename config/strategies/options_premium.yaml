@@ -6,7 +6,6 @@ params:
   underlyings:
     - SPY
     - QQQ
-    - IWM
 
   # Structure
   structure: "credit_spread"      # "credit_spread" or "iron_condor"
@@ -28,6 +27,9 @@ params:
   use_sma5_filter: true           # Contrarian SMA5 filter
   credit_estimate_pct: 0.30       # Rough credit estimate as % of spread width
   min_credit_per_spread: 50.0     # Skip low-credit setups (pre-commission)
+  min_credit_per_contract: 10.0   # Hard floor: $10 credit minimum per contract (0.10 option price)
+  min_credit_to_max_loss_ratio: 0.05  # Credit must be at least 5% of max loss per contract
+  require_live_credit_estimate: true  # Skip entries when live option-chain credit cannot be estimated
   max_commission_per_spread: 4.0  # Est. round-trip commission per 1-lot spread
   win_rate_credit_spread: 0.70    # Baseline win rate assumption for credit spreads
   win_rate_iron_condor: 0.72      # Baseline win rate assumption for iron condors

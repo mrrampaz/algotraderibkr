@@ -1,6 +1,6 @@
 """Options Premium Selling strategy.
 
-Sells credit spreads and iron condors on SPY/QQQ/IWM to capture theta
+Sells credit spreads and iron condors on SPY/QQQ to capture theta
 decay. Uses SMA5 contrarian filter for directional bias.
 
 IEX limitation: Options quotes are 15-min delayed. This strategy uses
@@ -67,7 +67,7 @@ class PremiumTrade:
 class OptionsPremiumStrategy(StrategyBase):
     """Options premium selling via credit spreads / iron condors.
 
-    Sells premium on SPY/QQQ/IWM during elevated vol using SMA5 contrarian
+    Sells premium on SPY/QQQ during elevated vol using SMA5 contrarian
     filter. Falls back to simulated tracking if options orders aren't
     supported by the current broker.
     """
@@ -83,7 +83,7 @@ class OptionsPremiumStrategy(StrategyBase):
         super().__init__(name, config, data_provider, executor, event_bus)
 
         params = config.params
-        self._underlyings = params.get("underlyings", ["SPY", "QQQ", "IWM"])
+        self._underlyings = params.get("underlyings", ["SPY", "QQQ"])
         self._structure = params.get("structure", "credit_spread")
         self._short_delta_target = params.get("short_delta_target", 14)
         self._wing_width = params.get("wing_width", 5)
@@ -106,6 +106,11 @@ class OptionsPremiumStrategy(StrategyBase):
         self._win_rate_iron_condor = params.get("win_rate_iron_condor", 0.72)
         self._event_day_confidence_penalty = params.get("event_day_confidence_penalty", 0.25)
         self._min_credit_per_spread = float(params.get("min_credit_per_spread", 50.0))
+        self._min_credit_per_contract = float(params.get("min_credit_per_contract", 10.0))
+        self._min_credit_per_contract = max(0.0, self._min_credit_per_contract)
+        self._min_credit_to_max_loss_ratio = float(params.get("min_credit_to_max_loss_ratio", 0.05))
+        self._min_credit_to_max_loss_ratio = max(0.0, min(1.0, self._min_credit_to_max_loss_ratio))
+        self._require_live_credit_estimate = bool(params.get("require_live_credit_estimate", True))
         self._max_commission_per_spread = float(params.get("max_commission_per_spread", 4.0))
 
         # Exit
@@ -337,14 +342,36 @@ class OptionsPremiumStrategy(StrategyBase):
 
             # Calculate contracts and risk
             spread_width = self._wing_width * 100  # Per contract in dollars
-            estimated_credit = spread_width * self._credit_estimate_pct
-            max_loss_per_contract = max(1.0, spread_width - estimated_credit)
+            estimated_credit_per_contract = spread_width * self._credit_estimate_pct
             # For iron condor, double the credit (two sides)
             call_short = None
             call_long = None
             if structure == "iron_condor":
                 call_short = round(current_price + strike_distance)
                 call_long = call_short + self._wing_width
+                estimated_credit_per_contract *= 2
+            max_loss_per_contract = max(1.0, spread_width - estimated_credit_per_contract)
+
+            modeled_ok, modeled_ratio, modeled_reason = self._passes_credit_quality_gate(
+                credit_per_contract=estimated_credit_per_contract,
+                max_loss_per_contract=max_loss_per_contract,
+            )
+            if not modeled_ok:
+                self._log.info(
+                    "options_credit_quality_filtered",
+                    stage="entry_model",
+                    reason=modeled_reason,
+                    underlying=underlying,
+                    structure=structure,
+                    credit_per_contract=round(estimated_credit_per_contract, 2),
+                    credit_per_contract_quote=round(estimated_credit_per_contract / 100.0, 4),
+                    max_loss_per_contract=round(max_loss_per_contract, 2),
+                    credit_to_max_loss_ratio=round(modeled_ratio, 4),
+                    min_credit_per_contract=round(self._min_credit_per_contract, 2),
+                    min_credit_per_contract_quote=round(self._min_credit_per_contract / 100.0, 4),
+                    min_credit_to_max_loss_ratio=round(self._min_credit_to_max_loss_ratio, 4),
+                )
+                continue
 
             contracts = self._size_contracts_for_structure(
                 structure=structure,
@@ -357,12 +384,69 @@ class OptionsPremiumStrategy(StrategyBase):
             if contracts <= 0:
                 continue
 
+            entry_expiration = et_now.date()
+            live_credit_per_contract = self._estimate_live_credit_per_contract(
+                underlying=underlying,
+                short_strike=short_strike,
+                long_strike=long_strike,
+                structure=structure,
+                expiration=entry_expiration,
+                call_short_strike=call_short,
+                call_long_strike=call_long,
+            )
+            selected_credit_per_contract = estimated_credit_per_contract
+            if live_credit_per_contract is not None:
+                live_max_loss_per_contract = max(1.0, spread_width - live_credit_per_contract)
+                live_ok, live_ratio, live_reason = self._passes_credit_quality_gate(
+                    credit_per_contract=live_credit_per_contract,
+                    max_loss_per_contract=live_max_loss_per_contract,
+                )
+                self._log.info(
+                    "options_live_credit_estimate",
+                    underlying=underlying,
+                    structure=structure,
+                    contracts=contracts,
+                    credit_per_contract=round(live_credit_per_contract, 2),
+                    credit_per_contract_quote=round(live_credit_per_contract / 100.0, 4),
+                    max_loss_per_contract=round(live_max_loss_per_contract, 2),
+                    credit_to_max_loss_ratio=round(live_ratio, 4),
+                    passed=live_ok,
+                    reason=live_reason if live_reason else "",
+                )
+                if not live_ok:
+                    self._log.info(
+                        "options_credit_quality_filtered",
+                        stage="entry_live",
+                        reason=live_reason,
+                        underlying=underlying,
+                        structure=structure,
+                        contracts=contracts,
+                        credit_per_contract=round(live_credit_per_contract, 2),
+                        credit_per_contract_quote=round(live_credit_per_contract / 100.0, 4),
+                        max_loss_per_contract=round(live_max_loss_per_contract, 2),
+                        credit_to_max_loss_ratio=round(live_ratio, 4),
+                        min_credit_per_contract=round(self._min_credit_per_contract, 2),
+                        min_credit_per_contract_quote=round(self._min_credit_per_contract / 100.0, 4),
+                        min_credit_to_max_loss_ratio=round(self._min_credit_to_max_loss_ratio, 4),
+                    )
+                    continue
+                selected_credit_per_contract = live_credit_per_contract
+                max_loss_per_contract = live_max_loss_per_contract
+            elif self._require_live_credit_estimate:
+                self._log.info(
+                    "options_credit_quality_filtered",
+                    stage="entry_live",
+                    reason="missing_live_credit_estimate",
+                    underlying=underlying,
+                    structure=structure,
+                    contracts=contracts,
+                )
+                continue
+
             total_risk = contracts * max_loss_per_contract
-            total_credit = contracts * estimated_credit
+            total_credit = contracts * selected_credit_per_contract
             estimated_round_trip_cost = contracts * self._max_commission_per_spread
             if structure == "iron_condor":
-                total_credit *= 2
-                total_risk = contracts * spread_width  # Max loss is one side
                 estimated_round_trip_cost *= 2
 
             # Reserve capital for margin
@@ -387,7 +471,7 @@ class OptionsPremiumStrategy(StrategyBase):
             # Attempt to submit the trade as a real MLEG order
             order_result = self._submit_credit_spread(
                 underlying, short_strike, long_strike,
-                structure, contracts, et_now.date(),
+                structure, contracts, entry_expiration,
                 call_short_strike=call_short,
                 call_long_strike=call_long,
             )
@@ -427,6 +511,8 @@ class OptionsPremiumStrategy(StrategyBase):
                 contracts=contracts,
                 credit=round(total_credit, 2),
                 max_loss=round(total_risk, 2),
+                credit_per_contract=round(selected_credit_per_contract, 2),
+                credit_per_contract_quote=round(selected_credit_per_contract / 100.0, 4),
                 simulated=trade.simulated,
                 bias=bias,
             )
@@ -447,6 +533,149 @@ class OptionsPremiumStrategy(StrategyBase):
             ))
 
         return signals
+
+    @staticmethod
+    def _as_float(value: Any) -> float | None:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not np.isfinite(parsed):
+            return None
+        return parsed
+
+    def _passes_credit_quality_gate(
+        self,
+        *,
+        credit_per_contract: float,
+        max_loss_per_contract: float,
+    ) -> tuple[bool, float, str]:
+        ratio = (credit_per_contract / max_loss_per_contract) if max_loss_per_contract > 0 else 0.0
+        if credit_per_contract < self._min_credit_per_contract:
+            return False, ratio, "min_credit_per_contract"
+        if ratio < self._min_credit_to_max_loss_ratio:
+            return False, ratio, "min_credit_to_max_loss_ratio"
+        return True, ratio, ""
+
+    def _estimate_live_credit_per_contract(
+        self,
+        *,
+        underlying: str,
+        short_strike: float,
+        long_strike: float,
+        structure: str,
+        expiration: date,
+        call_short_strike: float | None = None,
+        call_long_strike: float | None = None,
+    ) -> float | None:
+        try:
+            chain = self.data_provider.get_option_chain(underlying, expiration=expiration)
+        except Exception:
+            self._log.debug(
+                "options_live_credit_estimate_failed",
+                underlying=underlying,
+                structure=structure,
+                reason="option_chain_fetch_failed",
+            )
+            return None
+        if chain is None or chain.empty:
+            return None
+
+        primary_option_type = "put" if structure in {"put_spread", "iron_condor"} else "call"
+        base_credit_quote = self._estimate_vertical_credit_quote(
+            chain=chain,
+            option_type=primary_option_type,
+            short_strike=short_strike,
+            long_strike=long_strike,
+        )
+        if base_credit_quote is None:
+            return None
+
+        total_quote_credit = base_credit_quote
+        if structure == "iron_condor":
+            if call_short_strike is None or call_long_strike is None:
+                return None
+            call_credit_quote = self._estimate_vertical_credit_quote(
+                chain=chain,
+                option_type="call",
+                short_strike=call_short_strike,
+                long_strike=call_long_strike,
+            )
+            if call_credit_quote is None:
+                return None
+            total_quote_credit += call_credit_quote
+
+        return max(0.0, total_quote_credit * 100.0)
+
+    def _estimate_vertical_credit_quote(
+        self,
+        *,
+        chain: Any,
+        option_type: str,
+        short_strike: float,
+        long_strike: float,
+    ) -> float | None:
+        short_row = self._find_chain_row(chain, option_type, short_strike)
+        long_row = self._find_chain_row(chain, option_type, long_strike)
+        if short_row is None or long_row is None:
+            return None
+
+        short_sell = self._estimate_leg_fill_quote(short_row, opening_side="sell")
+        long_buy = self._estimate_leg_fill_quote(long_row, opening_side="buy")
+        if short_sell is None or long_buy is None:
+            return None
+
+        return max(0.0, short_sell - long_buy)
+
+    def _find_chain_row(self, chain: Any, option_type: str, target_strike: float) -> Any | None:
+        normalized_type = option_type.lower()
+        best_row: Any | None = None
+        best_diff = float("inf")
+
+        for _, row in chain.iterrows():
+            row_type = str(row.get("type", "")).lower()
+            if row_type != normalized_type:
+                continue
+            strike = self._as_float(row.get("strike"))
+            if strike is None:
+                continue
+            diff = abs(strike - target_strike)
+            if diff < best_diff:
+                best_diff = diff
+                best_row = row
+
+        if best_row is None:
+            return None
+        # ETF strikes are typically in 0.50 increments. Reject mismatched rows.
+        if best_diff > 0.51:
+            return None
+        return best_row
+
+    def _estimate_leg_fill_quote(self, row: Any, *, opening_side: str) -> float | None:
+        bid = self._as_float(row.get("bid"))
+        ask = self._as_float(row.get("ask"))
+        last = self._as_float(row.get("last"))
+
+        midpoint = None
+        if bid is not None and ask is not None and bid > 0 and ask > 0:
+            midpoint = (bid + ask) / 2.0
+
+        if opening_side == "sell":
+            if bid is not None and bid > 0:
+                return bid
+            if midpoint is not None:
+                return midpoint
+            if last is not None and last > 0:
+                return last
+            return None
+
+        if ask is not None and ask > 0:
+            return ask
+        if midpoint is not None:
+            return midpoint
+        if last is not None and last > 0:
+            return last
+        return None
 
     def _get_sma5_bias(self, underlying: str, current_price: float) -> str:
         """Determine directional bias using SMA5 contrarian filter."""
@@ -1127,6 +1356,7 @@ class OptionsPremiumStrategy(StrategyBase):
                 "entry_window_closed": 0,
                 "vix_below_min": 0,
                 "missing_atr_or_price": 0,
+                "credit_quality_rejected": 0,
                 "candidate_built": 0,
             }
             if et_now > window_end:
@@ -1227,10 +1457,31 @@ class OptionsPremiumStrategy(StrategyBase):
                     credit_single = spread_width * self._credit_estimate_pct
                     if structure == "iron_condor":
                         credit_per_contract = credit_single * 2.0
-                        max_loss_per_contract = spread_width
                     else:
                         credit_per_contract = credit_single
-                        max_loss_per_contract = max(1.0, spread_width - credit_single)
+                    max_loss_per_contract = max(1.0, spread_width - credit_per_contract)
+
+                    quality_ok, ratio, quality_reason = self._passes_credit_quality_gate(
+                        credit_per_contract=credit_per_contract,
+                        max_loss_per_contract=max_loss_per_contract,
+                    )
+                    if not quality_ok:
+                        filter_counts["credit_quality_rejected"] += 1
+                        self._log.info(
+                            "options_credit_quality_filtered",
+                            stage="assessment_model",
+                            reason=quality_reason,
+                            underlying=underlying,
+                            structure=structure,
+                            credit_per_contract=round(credit_per_contract, 2),
+                            credit_per_contract_quote=round(credit_per_contract / 100.0, 4),
+                            max_loss_per_contract=round(max_loss_per_contract, 2),
+                            credit_to_max_loss_ratio=round(ratio, 4),
+                            min_credit_per_contract=round(self._min_credit_per_contract, 2),
+                            min_credit_per_contract_quote=round(self._min_credit_per_contract / 100.0, 4),
+                            min_credit_to_max_loss_ratio=round(self._min_credit_to_max_loss_ratio, 4),
+                        )
+                        continue
 
                     contracts = self._size_contracts_for_structure(
                         structure=structure,

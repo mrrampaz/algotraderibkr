@@ -34,6 +34,7 @@ class StubDataProvider:
         self.bars: dict[tuple[str, str], pd.DataFrame] = {}
         self.prices: dict[str, float] = {}
         self.news: dict[str, list] = {}
+        self.option_chains: dict[str, pd.DataFrame] = {}
 
     def set_bars(self, symbol: str, timeframe: str, df: pd.DataFrame) -> None:
         self.bars[(symbol, timeframe)] = df
@@ -43,6 +44,9 @@ class StubDataProvider:
 
     def set_news(self, symbol: str, items: list) -> None:
         self.news[symbol] = items
+
+    def set_option_chain(self, symbol: str, chain: pd.DataFrame) -> None:
+        self.option_chains[symbol] = chain.copy()
 
     def get_bars(self, symbol, timeframe, limit=100, start=None, end=None):
         df = self.bars.get((symbol, timeframe))
@@ -71,7 +75,15 @@ class StubDataProvider:
         return {s: self.get_snapshot(s) for s in symbols}
 
     def get_option_chain(self, underlying, expiration=None):
-        return pd.DataFrame()
+        chain = self.option_chains.get(underlying)
+        if chain is None:
+            return pd.DataFrame()
+        if expiration is None:
+            return chain.copy()
+        if "expiration" not in chain.columns:
+            return chain.copy()
+        filtered = chain[chain["expiration"] == expiration]
+        return filtered.copy()
 
     def get_news(self, symbols=None, limit=50):
         if not symbols:
@@ -140,6 +152,11 @@ class OptionsMarkExecutor(StubExecutor):
     def submit_mleg_order(self, legs, qty=1, tif="DAY", client_order_id=None):
         self.mleg_submissions += 1
         return f"ibkr_test_{self.mleg_submissions}"
+
+    def lookup_option_contract(self, underlying, put_or_call, strike, expiration):
+        right = "P" if str(put_or_call).lower() == "put" else "C"
+        strike_code = f"{int(round(float(strike) * 1000)):08d}"
+        return f"{underlying}   {expiration.strftime('%y%m%d')}{right}{strike_code}"
 
 
 def _regime(regime_type: RegimeType, vix: float = 18.0) -> MarketRegime:
@@ -236,6 +253,138 @@ def test_options_premium_max_loss_sizing_caps_credit_spread_contracts() -> None:
     assert candidate.candidate_type == CandidateType.CREDIT_SPREAD
     assert candidate.contracts == 3
     assert candidate.suggested_qty == 3
+
+
+def test_options_premium_assess_filters_low_modeled_credit_per_contract() -> None:
+    provider = StubDataProvider()
+    executor = StubExecutor()
+    provider.set_price("SPY", 500.0)
+    provider.set_bars("SPY", "1Day", _bars_from_closes([490 + i for i in range(20)], 2_000_000))
+
+    strategy = OptionsPremiumStrategy(
+        name="options_premium",
+        config=StrategyConfig(
+            params={
+                "underlyings": ["SPY"],
+                "entry_start_hour": 0,
+                "entry_start_minute": 0,
+                "entry_end_hour": 23,
+                "entry_end_minute": 59,
+                "min_vix_proxy": 10.0,
+                "credit_estimate_pct": 0.01,  # $5 per contract on a $5-wide spread
+                "min_credit_per_contract": 10.0,
+                "min_credit_to_max_loss_ratio": 0.0,
+            }
+        ),
+        data_provider=provider,
+        executor=executor,
+        event_bus=EventBus(),
+    )
+    strategy.set_capital(100000.0)
+
+    assessment = strategy.assess_opportunities(_regime(RegimeType.HIGH_VOL, vix=24.0))
+    assert not assessment.candidates
+
+
+def test_options_premium_assess_filters_poor_credit_to_max_loss_ratio() -> None:
+    provider = StubDataProvider()
+    executor = StubExecutor()
+    provider.set_price("SPY", 500.0)
+    provider.set_bars("SPY", "1Day", _bars_from_closes([490 + i for i in range(20)], 2_000_000))
+
+    strategy = OptionsPremiumStrategy(
+        name="options_premium",
+        config=StrategyConfig(
+            params={
+                "underlyings": ["SPY"],
+                "entry_start_hour": 0,
+                "entry_start_minute": 0,
+                "entry_end_hour": 23,
+                "entry_end_minute": 59,
+                "min_vix_proxy": 10.0,
+                "credit_estimate_pct": 0.03,  # $15 credit vs ~$485 max loss => ~3.1%
+                "min_credit_per_contract": 1.0,
+                "min_credit_to_max_loss_ratio": 0.05,
+            }
+        ),
+        data_provider=provider,
+        executor=executor,
+        event_bus=EventBus(),
+    )
+    strategy.set_capital(100000.0)
+
+    assessment = strategy.assess_opportunities(_regime(RegimeType.HIGH_VOL, vix=24.0))
+    assert not assessment.candidates
+
+
+def test_options_premium_entry_filters_low_live_credit_before_submit() -> None:
+    provider = StubDataProvider()
+    executor = OptionsMarkExecutor()
+    provider.set_price("SPY", 500.0)
+    provider.set_bars("SPY", "1Day", _bars_from_closes([490 + i for i in range(20)], 2_000_000))
+
+    strategy = OptionsPremiumStrategy(
+        name="options_premium",
+        config=StrategyConfig(
+            params={
+                "underlyings": ["SPY"],
+                "entry_start_hour": 0,
+                "entry_start_minute": 0,
+                "entry_end_hour": 23,
+                "entry_end_minute": 59,
+                "min_vix_proxy": 10.0,
+                "min_credit_per_contract": 10.0,
+                "min_credit_to_max_loss_ratio": 0.05,
+                "require_live_credit_estimate": True,
+            }
+        ),
+        data_provider=provider,
+        executor=executor,
+        event_bus=EventBus(),
+    )
+    strategy.set_capital(100000.0)
+
+    # Keep strike selection deterministic: put spread 499/494.
+    strategy._get_current_price = lambda symbol: 500.0
+    strategy._get_atr = lambda symbol: 1.0
+    strategy._get_sma5_bias = lambda symbol, current_price: "bullish"
+
+    et_now = datetime.now(pytz.timezone("America/New_York")).replace(
+        hour=11,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    provider.set_option_chain(
+        "SPY",
+        pd.DataFrame(
+            [
+                {
+                    "symbol": "SPY_test_short",
+                    "expiration": et_now.date(),
+                    "strike": 499.0,
+                    "type": "put",
+                    "bid": 0.15,
+                    "ask": 0.20,
+                    "last": 0.17,
+                },
+                {
+                    "symbol": "SPY_test_long",
+                    "expiration": et_now.date(),
+                    "strike": 494.0,
+                    "type": "put",
+                    "bid": 0.10,
+                    "ask": 0.10,
+                    "last": 0.10,
+                },
+            ]
+        ),
+    )
+
+    signals = strategy._scan_entries(et_now, _regime(RegimeType.HIGH_VOL, vix=24.0))
+    assert not signals
+    assert not strategy._trades
+    assert executor.mleg_submissions == 0
 
 
 def test_options_premium_brain_contract_cap_override_applies_at_entry() -> None:
