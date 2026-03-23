@@ -10,6 +10,7 @@ Trades may be flagged as "simulated" if options orders aren't supported.
 
 from __future__ import annotations
 
+import math
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -33,6 +34,11 @@ from algotrader.strategies.registry import register_strategy
 logger = structlog.get_logger()
 
 ET = pytz.timezone("America/New_York")
+STRIKE_INCREMENTS: dict[str, float] = {
+    "SPY": 1.0,
+    "QQQ": 1.0,
+    "IWM": 1.0,
+}
 
 
 @dataclass
@@ -323,32 +329,38 @@ class OptionsPremiumStrategy(StrategyBase):
             sigma = atr * 0.6
             # For target delta ~14: ~1.1 sigma from current price
             strike_distance = sigma * 1.1
+            strike_increment = self._get_strike_increment(underlying)
+            wing_width = self._normalize_wing_width(self._wing_width, strike_increment)
 
             # Determine structure based on bias
             if bias == "bullish" or (bias == "neutral" and self._structure == "credit_spread"):
                 structure = "put_spread"
-                short_strike = round(current_price - strike_distance)
-                long_strike = short_strike - self._wing_width
+                raw_short_strike = current_price - strike_distance
+                short_strike = self._round_strike(raw_short_strike, strike_increment, mode="down")
+                long_strike = short_strike - wing_width
             elif bias == "bearish":
                 structure = "call_spread"
-                short_strike = round(current_price + strike_distance)
-                long_strike = short_strike + self._wing_width
+                raw_short_strike = current_price + strike_distance
+                short_strike = self._round_strike(raw_short_strike, strike_increment, mode="up")
+                long_strike = short_strike + wing_width
             elif bias == "neutral":
                 structure = "iron_condor"
-                short_strike = round(current_price - strike_distance)  # Put side
-                long_strike = short_strike - self._wing_width
+                raw_put_short_strike = current_price - strike_distance
+                short_strike = self._round_strike(raw_put_short_strike, strike_increment, mode="down")
+                long_strike = short_strike - wing_width
             else:
                 continue
 
             # Calculate contracts and risk
-            spread_width = self._wing_width * 100  # Per contract in dollars
+            spread_width = wing_width * 100  # Per contract in dollars
             estimated_credit_per_contract = spread_width * self._credit_estimate_pct
             # For iron condor, double the credit (two sides)
             call_short = None
             call_long = None
             if structure == "iron_condor":
-                call_short = round(current_price + strike_distance)
-                call_long = call_short + self._wing_width
+                raw_call_short_strike = current_price + strike_distance
+                call_short = self._round_strike(raw_call_short_strike, strike_increment, mode="up")
+                call_long = call_short + wing_width
                 estimated_credit_per_contract *= 2
             max_loss_per_contract = max(1.0, spread_width - estimated_credit_per_contract)
 
@@ -395,7 +407,16 @@ class OptionsPremiumStrategy(StrategyBase):
                 call_long_strike=call_long,
             )
             selected_credit_per_contract = estimated_credit_per_contract
-            if live_credit_per_contract is not None:
+            if live_credit_per_contract is None:
+                log_fn = self._log.warning if self._require_live_credit_estimate else self._log.info
+                log_fn(
+                    "options_live_credit_unavailable",
+                    underlying=underlying,
+                    structure=structure,
+                    contracts=contracts,
+                    reason="falling_back_to_modeled_credit_estimate",
+                )
+            else:
                 live_max_loss_per_contract = max(1.0, spread_width - live_credit_per_contract)
                 live_ok, live_ratio, live_reason = self._passes_credit_quality_gate(
                     credit_per_contract=live_credit_per_contract,
@@ -432,16 +453,6 @@ class OptionsPremiumStrategy(StrategyBase):
                     continue
                 selected_credit_per_contract = live_credit_per_contract
                 max_loss_per_contract = live_max_loss_per_contract
-            elif self._require_live_credit_estimate:
-                self._log.info(
-                    "options_credit_quality_filtered",
-                    stage="entry_live",
-                    reason="missing_live_credit_estimate",
-                    underlying=underlying,
-                    structure=structure,
-                    contracts=contracts,
-                )
-                continue
 
             total_risk = contracts * max_loss_per_contract
             total_credit = contracts * selected_credit_per_contract
@@ -533,6 +544,33 @@ class OptionsPremiumStrategy(StrategyBase):
             ))
 
         return signals
+
+    def _get_strike_increment(self, underlying: str) -> float:
+        increment = STRIKE_INCREMENTS.get(underlying.upper(), 1.0)
+        if increment <= 0:
+            return 1.0
+        return float(increment)
+
+    @staticmethod
+    def _normalize_wing_width(wing_width: float, increment: float) -> float:
+        if increment <= 0:
+            increment = 1.0
+        units = int(math.floor((float(wing_width) / increment) + 0.5))
+        units = max(1, units)
+        return round(units * increment, 6)
+
+    @staticmethod
+    def _round_strike(strike: float, increment: float, *, mode: str) -> float:
+        if increment <= 0:
+            increment = 1.0
+        scaled = strike / increment
+        if mode == "down":
+            rounded = math.floor(scaled + 1e-9)
+        elif mode == "up":
+            rounded = math.ceil(scaled - 1e-9)
+        else:
+            rounded = round(scaled)
+        return round(rounded * increment, 6)
 
     @staticmethod
     def _as_float(value: Any) -> float | None:
@@ -1426,34 +1464,40 @@ class OptionsPremiumStrategy(StrategyBase):
                     bias = self._get_sma5_bias(underlying, current_price)
                     sigma = atr * 0.6
                     strike_distance = max(0.5, sigma * 1.1)
+                    strike_increment = self._get_strike_increment(underlying)
+                    wing_width = self._normalize_wing_width(self._wing_width, strike_increment)
 
                     # Reuse the same structure logic as _scan_entries.
                     if bias == "bullish" or (bias == "neutral" and self._structure == "credit_spread"):
                         structure = "put_spread"
-                        short_strike = round(current_price - strike_distance)
-                        long_strike = short_strike - self._wing_width
+                        raw_short_strike = current_price - strike_distance
+                        short_strike = self._round_strike(raw_short_strike, strike_increment, mode="down")
+                        long_strike = short_strike - wing_width
                         call_short = 0.0
                         call_long = 0.0
                         direction = "short"
                         candidate_type = CandidateType.CREDIT_SPREAD
                     elif bias == "bearish":
                         structure = "call_spread"
-                        short_strike = round(current_price + strike_distance)
-                        long_strike = short_strike + self._wing_width
+                        raw_short_strike = current_price + strike_distance
+                        short_strike = self._round_strike(raw_short_strike, strike_increment, mode="up")
+                        long_strike = short_strike + wing_width
                         call_short = 0.0
                         call_long = 0.0
                         direction = "short"
                         candidate_type = CandidateType.CREDIT_SPREAD
                     else:
                         structure = "iron_condor"
-                        short_strike = round(current_price - strike_distance)  # put short
-                        long_strike = short_strike - self._wing_width          # put long
-                        call_short = round(current_price + strike_distance)     # call short
-                        call_long = call_short + self._wing_width               # call long
+                        raw_put_short_strike = current_price - strike_distance
+                        short_strike = self._round_strike(raw_put_short_strike, strike_increment, mode="down")
+                        long_strike = short_strike - wing_width
+                        raw_call_short_strike = current_price + strike_distance
+                        call_short = self._round_strike(raw_call_short_strike, strike_increment, mode="up")
+                        call_long = call_short + wing_width
                         direction = "neutral"
                         candidate_type = CandidateType.IRON_CONDOR
 
-                    spread_width = max(1.0, self._wing_width * 100.0)
+                    spread_width = max(1.0, wing_width * 100.0)
                     credit_single = spread_width * self._credit_estimate_pct
                     if structure == "iron_condor":
                         credit_per_contract = credit_single * 2.0
