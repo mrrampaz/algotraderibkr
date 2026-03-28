@@ -117,15 +117,18 @@ class PairsTradingStrategy(StrategyBase):
         # Strategy parameters from config
         params = config.params
         self._lookback = params.get("lookback_bars", 252)
-        self._z_entry = params.get("z_entry_threshold", 1.2)
-        self._z_exit = params.get("z_exit_threshold", 0.2)
-        self._z_stop = params.get("z_stop_threshold", 2.8)
+        self._z_entry = params.get("entry_z_threshold", params.get("z_entry_threshold", 2.0))
+        self._z_exit = params.get("exit_z_threshold", params.get("z_exit_threshold", 0.5))
+        self._z_stop = params.get("stop_z_threshold", params.get("z_stop_threshold", 3.0))
         self._max_bars = params.get("max_bars_in_position", 80)
+        self._max_hold_days = int(params.get("max_hold_days", 7))
         self._min_correlation = params.get("min_correlation", 0.7)
         self._coint_pvalue = params.get("cointegration_pvalue", 0.05)
         self._per_pair_capital_pct = params.get("per_pair_capital_pct", 2.0)
         self._max_pairs = params.get("max_simultaneous_pairs", 5)
-        self._bar_timeframe = params.get("bar_timeframe", "5Min")
+        self._use_daily_bars = bool(params.get("use_daily_bars", False))
+        default_timeframe = "1Day" if self._use_daily_bars else "5Min"
+        self._bar_timeframe = params.get("bar_timeframe", default_timeframe)
 
         # Load pairs from config or use defaults
         pairs_config = params.get("pairs", None)
@@ -382,20 +385,19 @@ class PairsTradingStrategy(StrategyBase):
         z = state.z_score
 
         reason = ""
+        days_held = 0
+        if state.entry_time is not None:
+            days_held = max(0, (datetime.now(pytz.UTC).date() - state.entry_time.date()).days)
 
         # Mean reversion profit target
-        if state.position_side == "long_spread" and z >= -self._z_exit:
-            reason = f"profit_target: z={z:.2f} reverted above -{self._z_exit}"
-        elif state.position_side == "short_spread" and z <= self._z_exit:
-            reason = f"profit_target: z={z:.2f} reverted below {self._z_exit}"
+        if abs(z) <= self._z_exit:
+            reason = f"convergence: |z|={abs(z):.2f} <= {self._z_exit}"
         # Stop loss
-        elif state.position_side == "long_spread" and z < -self._z_stop:
-            reason = f"stop_loss: z={z:.2f} < -{self._z_stop}"
-        elif state.position_side == "short_spread" and z > self._z_stop:
-            reason = f"stop_loss: z={z:.2f} > {self._z_stop}"
+        elif abs(z) >= self._z_stop:
+            reason = f"divergence_stop: |z|={abs(z):.2f} >= {self._z_stop}"
         # Time stop
-        elif state.bars_in_position >= self._max_bars:
-            reason = f"time_stop: {state.bars_in_position} bars >= {self._max_bars}"
+        elif days_held >= self._max_hold_days:
+            reason = f"max_hold_{self._max_hold_days}_days"
 
         if not reason:
             return None
@@ -409,6 +411,7 @@ class PairsTradingStrategy(StrategyBase):
                 "pair_id": pair.pair_id,
                 "z_score": z,
                 "bars_in_position": state.bars_in_position,
+                "days_held": days_held,
                 "position_side": state.position_side,
             },
             timestamp=datetime.now(pytz.UTC),
@@ -785,6 +788,9 @@ class PairsTradingStrategy(StrategyBase):
                         "cointegration_pvalue": round(state.cointegration_pvalue, 4),
                         "estimated_profit": round(estimated_profit, 2),
                         "estimated_cost": round(estimated_cost, 2),
+                        "max_hold_days": self._max_hold_days,
+                        "use_daily_bars": self._use_daily_bars,
+                        "swing_trade": True,
                     },
                 ))
                 details.append(
@@ -905,3 +911,36 @@ class PairsTradingStrategy(StrategyBase):
                 ps.spread_mean = saved["spread_mean"]
                 ps.spread_std = saved["spread_std"]
                 ps.trade_id = saved.get("trade_id", "")
+
+    def close_all_positions(self, reason: str = "") -> int:
+        """Force-close all open pair positions."""
+        closed = 0
+        for state in list(self._pair_states.values()):
+            if not state.is_positioned:
+                continue
+            synthetic_signal = Signal(
+                strategy_name=self.name,
+                symbol=f"{state.config.symbol_a}/{state.config.symbol_b}",
+                direction=SignalDirection.CLOSE,
+                reason=reason or "forced_close",
+                timestamp=datetime.now(pytz.UTC),
+            )
+            self._execute_exit(state, synthetic_signal)
+            if not state.is_positioned:
+                closed += 1
+        return closed
+
+    def close_positions_for_eod(self, et_now: datetime) -> int:
+        """Run one explicit EOD management pass."""
+        closed = 0
+        for state in list(self._pair_states.values()):
+            if not state.is_positioned:
+                continue
+            self._update_z_score(state)
+            exit_signal = self._check_exit(state)
+            if not exit_signal:
+                continue
+            self._execute_exit(state, exit_signal)
+            if not state.is_positioned:
+                closed += 1
+        return closed

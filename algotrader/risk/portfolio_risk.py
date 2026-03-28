@@ -183,6 +183,27 @@ class PortfolioRiskManager:
 
         return True
 
+    def compute_overnight_risk(self, positions: list) -> dict:
+        """Estimate overnight gap risk for currently open positions."""
+        total_exposure = sum(abs(float(getattr(p, "market_value", 0.0) or 0.0)) for p in positions)
+
+        gap_risk = 0.0
+        index_like = {"SPY", "QQQ", "IWM", "DIA"}
+        for pos in positions:
+            symbol = str(getattr(pos, "symbol", "") or "").upper()
+            market_value = abs(float(getattr(pos, "market_value", 0.0) or 0.0))
+            if market_value <= 0:
+                continue
+            assumed_gap_pct = 0.02 if symbol in index_like else 0.05
+            gap_risk += market_value * assumed_gap_pct
+
+        exposure_pct = (total_exposure / self._day_start_equity * 100.0) if self._day_start_equity > 0 else 0.0
+        return {
+            "total_exposure": total_exposure,
+            "overnight_gap_risk": gap_risk,
+            "exposure_pct": exposure_pct,
+        }
+
     def _trigger_kill_switch(self, reason: str) -> None:
         """Emergency shutdown — close all positions, cancel all orders."""
         self._killed = True

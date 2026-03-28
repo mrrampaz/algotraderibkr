@@ -115,8 +115,10 @@ class SectorRotationStrategy(StrategyBase):
 
         # Position management
         self._rebalance_interval_hours = params.get("rebalance_interval_hours", 4)
+        self._rebalance_check = str(params.get("rebalance_check", "intraday")).lower()
         self._stop_pct = params.get("stop_pct", 2.0)
         self._min_notional_per_leg = float(params.get("min_notional_per_leg", 2000.0))
+        self._max_hold_days = int(params.get("max_hold_days", 5))
 
         # Regime filter
         self._allowed_regimes = params.get(
@@ -166,6 +168,14 @@ class SectorRotationStrategy(StrategyBase):
 
     def _should_rebalance(self) -> bool:
         """Check if enough time has passed since last rebalance."""
+        if self._rebalance_check == "daily":
+            et_now = datetime.now(ET)
+            if et_now.hour < 9 or (et_now.hour == 9 and et_now.minute < 35):
+                return False
+            if self._last_rebalance is None:
+                return True
+            return self._last_rebalance.astimezone(ET).date() < et_now.date()
+
         if self._last_rebalance is None:
             return True
         elapsed = (datetime.now(pytz.UTC) - self._last_rebalance).total_seconds() / 3600
@@ -217,6 +227,7 @@ class SectorRotationStrategy(StrategyBase):
                 continue
 
             current_rs = self._rs_scores.get(symbol, 0.0)
+            days_held = max(0, (datetime.now(ET).date() - trade.entry_time.astimezone(ET).date()).days)
 
             # 1. Stop loss
             if trade.direction == "long" and current_price <= trade.stop_price:
@@ -231,6 +242,10 @@ class SectorRotationStrategy(StrategyBase):
             # 3. RS reversal: short position gained relative strength
             elif trade.direction == "short" and current_rs > 0:
                 close_reason = f"rs_reversal: RS={current_rs:+.2f}% rose above 0"
+
+            # 4. Max swing hold
+            elif days_held >= self._max_hold_days:
+                close_reason = f"max_hold_{self._max_hold_days}_days"
 
             if close_reason:
                 self._close_trade(symbol, trade, close_reason)
@@ -672,6 +687,8 @@ class SectorRotationStrategy(StrategyBase):
                     "short_price": round(short_price, 2),
                     "min_notional_per_leg": round(self._min_notional_per_leg, 2),
                     "required_capital_for_min_notional": round(required_capital, 2),
+                    "hold_days": self._max_hold_days,
+                    "swing_trade": True,
                 },
             )
             filter_counts["candidate_built"] += 1
@@ -750,3 +767,18 @@ class SectorRotationStrategy(StrategyBase):
                 bracket_stop_order_id=saved.get("bracket_stop_order_id", ""),
                 is_bracket=saved.get("is_bracket", False),
             )
+
+    def close_all_positions(self, reason: str = "") -> int:
+        """Force-close all sector positions."""
+        closed = 0
+        for symbol, trade in list(self._trades.items()):
+            self._close_trade(symbol, trade, reason or "forced_close")
+            if symbol not in self._trades:
+                closed += 1
+        return closed
+
+    def close_positions_for_eod(self, et_now: datetime) -> int:
+        """Run one explicit EOD management pass."""
+        before = len(self._trades)
+        self._manage_positions()
+        return max(0, before - len(self._trades))

@@ -161,6 +161,11 @@ class Orchestrator:
         self._last_brain_midday_review: date | None = None
         self._expiry_guard_date: date | None = None
         self._expiry_guard_attempted_conids: set[int] = set()
+        self._last_morning_position_review: date | None = None
+        self._eod_handled_date: date | None = None
+        self._max_overnight_exposure_pct = float(
+            getattr(settings.risk, "max_overnight_exposure_pct", 40.0),
+        )
 
         if settings.strategy_selector.enabled:
             try:
@@ -478,49 +483,58 @@ class Orchestrator:
         # Check pending orders
         self._order_manager.check_orders()
 
+        if self._needs_morning_position_review():
+            self._morning_position_review()
+
         # Daily Brain: open decision + mid-day review
         if self._use_brain and self._brain and self._current_regime:
             try:
                 if self._needs_brain_open_decision():
-                    assessments = self._assess_all_strategies(self._current_regime)
-                    decision = self._brain.decide(
-                        regime=self._current_regime,
-                        assessments=assessments,
-                        current_positions=self._executor.get_positions(),
-                        daily_pnl=self._get_daily_pnl(),
-                        vix_level=self._current_regime.vix_level,
-                    )
-                    self._apply_brain_decision(decision, context="market_open")
+                    if self._is_overnight_exposure_limited():
+                        self._block_new_entries_for_exposure_limit(context="market_open")
+                    else:
+                        assessments = self._assess_all_strategies(self._current_regime)
+                        decision = self._brain.decide(
+                            regime=self._current_regime,
+                            assessments=assessments,
+                            current_positions=self._executor.get_positions(),
+                            daily_pnl=self._get_daily_pnl(),
+                            vix_level=self._current_regime.vix_level,
+                        )
+                        self._apply_brain_decision(decision, context="market_open")
                     self._last_brain_open_decision = datetime.now(
                         pytz.timezone("America/New_York"),
                     ).date()
 
                 if self._needs_brain_midday_review():
-                    assessments = self._assess_all_strategies(self._current_regime)
-                    decision = self._brain.review_midday(
-                        regime=self._current_regime,
-                        assessments=assessments,
-                        current_positions=self._executor.get_positions(),
-                        daily_pnl=self._get_daily_pnl(),
-                        vix_level=self._current_regime.vix_level,
-                    )
-                    self._apply_brain_decision(decision, context="midday")
+                    if self._is_overnight_exposure_limited():
+                        self._block_new_entries_for_exposure_limit(context="midday")
+                    else:
+                        assessments = self._assess_all_strategies(self._current_regime)
+                        decision = self._brain.review_midday(
+                            regime=self._current_regime,
+                            assessments=assessments,
+                            current_positions=self._executor.get_positions(),
+                            daily_pnl=self._get_daily_pnl(),
+                            vix_level=self._current_regime.vix_level,
+                        )
+                        self._apply_brain_decision(decision, context="midday")
 
-                    # Handle explicit close recommendations from the brain.
-                    for rejection in decision.rejected_trades:
-                        if not rejection.reason.startswith("close_early:"):
-                            continue
-                        symbol = rejection.candidate.symbol
-                        try:
-                            closed = self._executor.close_position(symbol)
-                            if closed:
-                                self._log.info(
-                                    "brain_close_early_executed",
-                                    symbol=symbol,
-                                    reason=rejection.reason,
-                                )
-                        except Exception:
-                            self._log.exception("brain_close_early_failed", symbol=symbol)
+                        # Handle explicit close recommendations from the brain.
+                        for rejection in decision.rejected_trades:
+                            if not rejection.reason.startswith("close_early:"):
+                                continue
+                            symbol = rejection.candidate.symbol
+                            try:
+                                closed = self._executor.close_position(symbol)
+                                if closed:
+                                    self._log.info(
+                                        "brain_close_early_executed",
+                                        symbol=symbol,
+                                        reason=rejection.reason,
+                                    )
+                            except Exception:
+                                self._log.exception("brain_close_early_failed", symbol=symbol)
 
                     self._last_brain_midday_review = datetime.now(
                         pytz.timezone("America/New_York"),
@@ -578,6 +592,11 @@ class Orchestrator:
                     self._log.info("signals_generated", strategy=name, count=len(signals))
             except Exception:
                 self._log.exception("strategy_cycle_error", strategy=name)
+
+        try:
+            self._handle_market_close()
+        except Exception:
+            self._log.exception("market_close_handler_failed")
 
         # Evict expired cache entries periodically
         self._data_cache.evict_expired()
@@ -1018,6 +1037,144 @@ class Orchestrator:
             return float(snapshot.get("daily_pnl", 0.0))
         except Exception:
             return 0.0
+
+    def _needs_morning_position_review(self) -> bool:
+        """Run one morning review shortly after regular-session open."""
+        et_now = datetime.now(pytz.timezone("America/New_York"))
+        today = et_now.date()
+        if self._last_morning_position_review == today:
+            return False
+        open_minutes = et_now.hour * 60 + et_now.minute
+        return (9 * 60 + 30) <= open_minutes <= (11 * 60)
+
+    def _morning_position_review(self) -> None:
+        """Review overnight positions after market open."""
+        try:
+            positions = self._executor.get_positions()
+        except Exception:
+            self._log.exception("morning_position_review_failed_fetch_positions")
+            return
+
+        reviewed = 0
+        for pos in positions:
+            qty = float(getattr(pos, "qty", 0.0) or 0.0)
+            if qty == 0:
+                continue
+            symbol = str(getattr(pos, "symbol", "") or "")
+            entry_price = float(getattr(pos, "avg_entry_price", 0.0) or 0.0)
+            current_price = float(getattr(pos, "current_price", 0.0) or 0.0)
+            unrealized_pnl = float(getattr(pos, "unrealized_pnl", 0.0) or 0.0)
+            overnight_change_pct = 0.0
+            if entry_price > 0:
+                overnight_change_pct = (current_price - entry_price) / entry_price * 100.0
+
+            self._log.info(
+                "overnight_position_review",
+                symbol=symbol,
+                qty=qty,
+                entry=round(entry_price, 4),
+                current=round(current_price, 4),
+                overnight_change_pct=round(overnight_change_pct, 2),
+                unrealized_pnl=round(unrealized_pnl, 2),
+            )
+            reviewed += 1
+
+        try:
+            overnight = self._risk_manager.compute_overnight_risk(positions)
+            self._log.info(
+                "overnight_risk_summary",
+                positions=reviewed,
+                total_exposure=round(float(overnight.get("total_exposure", 0.0)), 2),
+                overnight_gap_risk=round(float(overnight.get("overnight_gap_risk", 0.0)), 2),
+                exposure_pct=round(float(overnight.get("exposure_pct", 0.0)), 2),
+            )
+        except Exception:
+            self._log.debug("overnight_risk_summary_failed")
+
+        self._last_morning_position_review = datetime.now(
+            pytz.timezone("America/New_York"),
+        ).date()
+
+    def _is_overnight_exposure_limited(self) -> bool:
+        """Return True when existing deployed capital breaches overnight limit."""
+        if self._max_overnight_exposure_pct <= 0:
+            return False
+
+        try:
+            account = self._executor.get_account()
+            total_capital = float(getattr(account, "equity", 0.0) or 0.0)
+            if total_capital <= 0:
+                return False
+
+            positions = self._executor.get_positions()
+            deployed_capital = sum(abs(float(getattr(p, "market_value", 0.0) or 0.0)) for p in positions)
+            deployed_pct = (deployed_capital / total_capital) * 100.0
+            if deployed_pct > self._max_overnight_exposure_pct:
+                self._log.info(
+                    "overnight_exposure_limit",
+                    deployed_pct=round(deployed_pct, 2),
+                    max_pct=round(self._max_overnight_exposure_pct, 2),
+                    deployed_capital=round(deployed_capital, 2),
+                    total_capital=round(total_capital, 2),
+                )
+                return True
+        except Exception:
+            self._log.debug("overnight_exposure_check_failed")
+        return False
+
+    def _block_new_entries_for_exposure_limit(self, context: str) -> None:
+        """Zero strategy entry capital while still allowing position management."""
+        for strategy_name, strategy in self._strategies.items():
+            strategy.set_capital(0.0)
+            if hasattr(strategy, "set_brain_contract_cap"):
+                try:
+                    strategy.set_brain_contract_cap(None)
+                except Exception:
+                    self._log.debug(
+                        "brain_contract_cap_clear_failed",
+                        strategy=strategy_name,
+                    )
+        self._log.warning(
+            "overnight_exposure_entry_blocked",
+            context=context,
+            max_overnight_exposure_pct=round(self._max_overnight_exposure_pct, 2),
+        )
+
+    def _handle_market_close(self) -> None:
+        """Close only intraday positions near close; keep swing positions open."""
+        et_now = datetime.now(pytz.timezone("America/New_York"))
+        if et_now.hour < 15 or (et_now.hour == 15 and et_now.minute < 55) or et_now.hour >= 16:
+            return
+
+        today = et_now.date()
+        if self._eod_handled_date == today:
+            return
+        self._eod_handled_date = today
+
+        for strategy_name, strategy in self._strategies.items():
+            intraday_only = bool(getattr(strategy.config, "params", {}).get("intraday_only", False))
+            if strategy_name == "gap_reversal" or intraday_only:
+                close_all = getattr(strategy, "close_all_positions", None)
+                if callable(close_all):
+                    closed_count = int(close_all(reason="eod_intraday_close"))
+                    self._log.info(
+                        "eod_intraday_positions_closed",
+                        strategy=strategy_name,
+                        closed=closed_count,
+                    )
+                continue
+
+            close_for_eod = getattr(strategy, "close_positions_for_eod", None)
+            if callable(close_for_eod):
+                closed_count = int(close_for_eod(et_now=et_now))
+                self._log.info(
+                    "eod_positions_reviewed",
+                    strategy=strategy_name,
+                    closed=closed_count,
+                )
+
+        # Keep explicit expiry guard in place for expiring options.
+        self._check_expiry_risk()
 
     def _morning_reconciliation(self) -> None:
         """Check startup broker positions against strategy-restored state."""

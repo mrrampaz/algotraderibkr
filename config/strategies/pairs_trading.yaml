@@ -6,12 +6,12 @@ params:
   lookback_bars: 252
 
   # Z-score thresholds
-  z_entry_threshold: 2.0     # Enter when |z| > this
-  z_exit_threshold: 0.2      # Exit when |z| < this (profit target)
-  z_stop_threshold: 2.8      # Exit when |z| > this (stop loss)
+  entry_z_threshold: 2.0     # Enter when |z| > this
+  exit_z_threshold: 0.5      # Exit when |z| < this (profit target)
+  stop_z_threshold: 3.0      # Exit when |z| > this (stop loss)
 
   # Position management
-  max_bars_in_position: 80   # Time-based exit
+  max_hold_days: 7           # Time-based swing exit
   max_simultaneous_pairs: 5  # Max concurrent pair positions
 
   # Statistical requirements
@@ -22,7 +22,8 @@ params:
   per_pair_capital_pct: 2.0  # % of total capital per pair
 
   # Data
-  bar_timeframe: "5Min"      # Intraday bar interval
+  use_daily_bars: true
+  bar_timeframe: "1Day"
 
   # Pairs universe — override default pairs here
   # pairs:

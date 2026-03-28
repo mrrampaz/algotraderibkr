@@ -88,13 +88,15 @@ class MomentumStrategy(StrategyBase):
 
         # Trailing
         self._use_trailing = params.get("use_trailing_stop", True)
-        self._trail_atr_mult = params.get("trail_atr_mult", 2.0)
-        self._trail_activation_rr = params.get("trail_activation_rr", 1.0)
+        self._trail_atr_mult = params.get(
+            "trailing_stop_atr_multiple",
+            params.get("trail_atr_mult", 1.5),
+        )
+        self._trail_activation_rr = params.get("trail_activation_rr", 0.0)
         self._fixed_target_rr = params.get("fixed_target_rr", 3.0)
+        self._max_hold_days = int(params.get("max_hold_days", 3))
 
         # Time
-        self._close_by_hour = params.get("close_by_hour", 15)
-        self._close_by_minute = params.get("close_by_minute", 30)
         self._scan_interval_minutes = params.get("scan_interval_minutes", 15)
         self._bar_timeframe = params.get("bar_timeframe", "5Min")
         self._scanner_max_range_pct = float(params.get("scanner_max_range_pct", 5.0))
@@ -160,11 +162,14 @@ class MomentumStrategy(StrategyBase):
                 continue
 
             close_reason = ""
+            atr = self._get_daily_atr(symbol) or trade.atr
 
-            # 1. Time limit
-            if (et_now.hour > self._close_by_hour or
-                    (et_now.hour == self._close_by_hour and et_now.minute >= self._close_by_minute)):
-                close_reason = "time_limit"
+            # 1. Max hold in days for swing momentum
+            days_held = 0
+            if trade.entry_time:
+                days_held = max(0, (et_now.date() - trade.entry_time.astimezone(ET).date()).days)
+            if days_held >= self._max_hold_days:
+                close_reason = f"max_hold_{self._max_hold_days}_days"
 
             # 2. Initial stop check
             elif not trade.trailing_active:
@@ -182,7 +187,7 @@ class MomentumStrategy(StrategyBase):
 
             # 4. Trailing stop management
             if not close_reason and self._use_trailing:
-                close_reason = self._update_trailing(trade, current_price)
+                close_reason = self._update_trailing(trade, current_price, atr)
 
             if close_reason:
                 self._close_trade(symbol, trade, close_reason)
@@ -197,8 +202,9 @@ class MomentumStrategy(StrategyBase):
 
         return signals
 
-    def _update_trailing(self, trade: MomentumTrade, current_price: float) -> str:
+    def _update_trailing(self, trade: MomentumTrade, current_price: float, atr: float) -> str:
         """Update trailing stop. Returns close reason if trail hit, else empty."""
+        atr_value = max(0.01, float(atr))
         risk_amount = abs(trade.entry_price - trade.initial_stop)
         if risk_amount <= 0:
             return ""
@@ -207,15 +213,15 @@ class MomentumStrategy(StrategyBase):
             profit = current_price - trade.entry_price
             trade.highest_price = max(trade.highest_price, current_price)
 
-            # Activate trailing after 1R profit
+            # Swing mode: allow immediate trailing logic (activation threshold configurable).
             if not trade.trailing_active and profit >= risk_amount * self._trail_activation_rr:
                 trade.trailing_active = True
-                trade.trail_stop = current_price - trade.atr * self._trail_atr_mult
+                trade.trail_stop = current_price - atr_value * self._trail_atr_mult
                 self._log.info("trail_activated", symbol=trade.symbol, trail=trade.trail_stop)
 
             if trade.trailing_active:
                 # Only move trail UP for longs
-                new_trail = trade.highest_price - trade.atr * self._trail_atr_mult
+                new_trail = trade.highest_price - atr_value * self._trail_atr_mult
                 if new_trail > trade.trail_stop:
                     trade.trail_stop = new_trail
                     self._update_bracket_stop(trade, new_trail)
@@ -228,12 +234,12 @@ class MomentumStrategy(StrategyBase):
 
             if not trade.trailing_active and profit >= risk_amount * self._trail_activation_rr:
                 trade.trailing_active = True
-                trade.trail_stop = current_price + trade.atr * self._trail_atr_mult
+                trade.trail_stop = current_price + atr_value * self._trail_atr_mult
                 self._log.info("trail_activated", symbol=trade.symbol, trail=trade.trail_stop)
 
             if trade.trailing_active:
                 # Only move trail DOWN for shorts
-                new_trail = trade.lowest_price + trade.atr * self._trail_atr_mult
+                new_trail = trade.lowest_price + atr_value * self._trail_atr_mult
                 if new_trail < trade.trail_stop:
                     trade.trail_stop = new_trail
                     self._update_bracket_stop(trade, new_trail)
@@ -434,6 +440,29 @@ class MomentumStrategy(StrategyBase):
             pass
         return None
 
+    def _get_daily_atr(self, symbol: str, period: int = 14) -> float | None:
+        """Compute ATR from daily bars for swing trailing stops."""
+        try:
+            bars = self.data_provider.get_bars(symbol, "1Day", period + 6)
+            if bars.empty or len(bars) < period + 1:
+                return None
+
+            highs = bars["high"].values
+            lows = bars["low"].values
+            closes = bars["close"].values
+            tr_values: list[float] = []
+            for i in range(1, len(bars)):
+                tr_values.append(max(
+                    highs[i] - lows[i],
+                    abs(highs[i] - closes[i - 1]),
+                    abs(lows[i] - closes[i - 1]),
+                ))
+            if len(tr_values) < period:
+                return None
+            return float(sum(tr_values[-period:]) / period)
+        except Exception:
+            return None
+
     def assess_opportunities(self, regime: MarketRegime | None = None) -> OpportunityAssessment:
         """Assess breakout opportunities and emit concrete TradeCandidates."""
         self._log.info("assess_start", strategy=self.name)
@@ -503,7 +532,6 @@ class MomentumStrategy(StrategyBase):
             rr_values: list[float] = []
             confidence_values: list[float] = []
             edge_values: list[float] = []
-            expiry_time = et_now.replace(hour=15, minute=0, second=0, microsecond=0).astimezone(pytz.UTC)
 
             for bo in breakouts:
                 if bo.symbol in self._trades:
@@ -601,14 +629,17 @@ class MomentumStrategy(StrategyBase):
                     edge_estimate_pct=round(edge_pct, 2),
                     regime_fit=round(regime_fit, 2),
                     catalyst=f"breakout_vol_{bo.volume_ratio:.1f}x",
-                    time_horizon_minutes=180,
-                    expiry_time=expiry_time,
+                    time_horizon_minutes=0,
+                    expiry_time=None,
                     metadata={
                         "breakout_level": round(float(bo.breakout_price), 4),
                         "breakout_type": bo.breakout_type,
                         "volume_ratio": round(float(bo.volume_ratio), 2),
                         "atr": round(float(bo.atr), 4),
                         "consolidation_days": int(bo.consolidation_days),
+                        "hold_days": self._max_hold_days,
+                        "trailing_stop_atr_multiple": self._trail_atr_mult,
+                        "swing_trade": True,
                     },
                 )
 
@@ -727,3 +758,18 @@ class MomentumStrategy(StrategyBase):
                 bracket_tp_order_id=saved.get("bracket_tp_order_id", ""),
                 is_bracket=saved.get("is_bracket", False),
             )
+
+    def close_all_positions(self, reason: str = "") -> int:
+        """Force-close all open momentum trades."""
+        closed = 0
+        for symbol, trade in list(self._trades.items()):
+            self._close_trade(symbol, trade, reason or "forced_close")
+            if symbol not in self._trades:
+                closed += 1
+        return closed
+
+    def close_positions_for_eod(self, et_now: datetime) -> int:
+        """Run one explicit EOD management pass."""
+        before = len(self._trades)
+        self._manage_positions(et_now)
+        return max(0, before - len(self._trades))

@@ -2,6 +2,8 @@ enabled: true
 capital_allocation_pct: 12.0
 max_positions: 3
 params:
+  intraday_only: true
+  max_hold_days: 0
   min_gap_pct: 2.0              # Minimum gap to consider
   max_gap_pct: 8.0              # Gaps > 8% are too risky to fade
   min_volume: 500000            # Pre-market volume filter

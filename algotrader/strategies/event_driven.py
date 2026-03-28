@@ -59,6 +59,9 @@ class EventTrade:
     post_event_move_pct: float = 0.0
     entry_time: datetime | None = None
     capital_used: float = 0.0
+    atr: float = 0.0
+    highest_price: float = 0.0
+    lowest_price: float = 0.0
     trade_id: str = ""
     bracket_stop_order_id: str = ""
     bracket_tp_order_id: str = ""
@@ -103,7 +106,8 @@ class EventDrivenStrategy(StrategyBase):
 
         # Targets
         self._target_rr = params.get("target_rr", 2.0)
-        self._time_limit_hours = params.get("time_limit_hours", 2)
+        self._max_hold_days = int(params.get("max_hold_days", 2))
+        self._trailing_stop_atr = float(params.get("trailing_stop_atr", 1.0))
 
         # Instruments
         self._instruments = params.get("instruments", ["SPY", "QQQ"])
@@ -256,7 +260,8 @@ class EventDrivenStrategy(StrategyBase):
             side = OrderSide.SELL
 
         # Calculate stop and target
-        stop_distance = current_price * (self._max_loss_pct / 100)
+        atr = self._get_daily_atr(symbol) or (current_price * (self._max_loss_pct / 100))
+        stop_distance = max(0.01, atr)
         if direction == "long":
             # Use post-event low as potential stop reference
             stop_price = current_price - stop_distance
@@ -305,6 +310,9 @@ class EventDrivenStrategy(StrategyBase):
             post_event_move_pct=move_pct,
             entry_time=datetime.now(pytz.UTC),
             capital_used=capital_needed,
+            atr=atr,
+            highest_price=current_price,
+            lowest_price=current_price,
             trade_id=str(uuid.uuid4()),
             bracket_stop_order_id=order.stop_order_id,
             bracket_tp_order_id=order.tp_order_id,
@@ -352,20 +360,40 @@ class EventDrivenStrategy(StrategyBase):
 
             close_reason = ""
 
-            # 1. Time limit
+            # 1. Max hold in days for post-event drift.
+            days_held = 0
             if trade.entry_time:
-                hours_held = (datetime.now(pytz.UTC) - trade.entry_time).total_seconds() / 3600
-                if hours_held >= self._time_limit_hours:
-                    close_reason = f"time_limit: held {hours_held:.1f}h"
+                days_held = max(0, (et_now.date() - trade.entry_time.astimezone(ET).date()).days)
+                if days_held >= self._max_hold_days:
+                    close_reason = f"max_hold_{self._max_hold_days}_days"
 
-            # 2. Stop loss
+            # 2. ATR trailing stop.
+            if not close_reason:
+                atr = trade.atr if trade.atr > 0 else (self._get_daily_atr(trade.symbol) or 0.0)
+                if atr > 0:
+                    if trade.direction == "long":
+                        trade.highest_price = max(trade.highest_price, current_price)
+                        trail = trade.highest_price - (atr * self._trailing_stop_atr)
+                        trade.stop_price = max(trade.stop_price, trail)
+                    else:
+                        trade.lowest_price = min(
+                            trade.lowest_price if trade.lowest_price > 0 else current_price,
+                            current_price,
+                        )
+                        trail = trade.lowest_price + (atr * self._trailing_stop_atr)
+                        if trade.stop_price <= 0:
+                            trade.stop_price = trail
+                        else:
+                            trade.stop_price = min(trade.stop_price, trail)
+
+            # 3. Stop loss
             if not close_reason:
                 if trade.direction == "long" and current_price <= trade.stop_price:
                     close_reason = f"stop_hit: {current_price:.2f} <= {trade.stop_price:.2f}"
                 elif trade.direction == "short" and current_price >= trade.stop_price:
                     close_reason = f"stop_hit: {current_price:.2f} >= {trade.stop_price:.2f}"
 
-            # 3. Target hit
+            # 4. Target hit
             if not close_reason:
                 if trade.direction == "long" and current_price >= trade.target_price:
                     close_reason = f"target_hit: {current_price:.2f} >= {trade.target_price:.2f}"
@@ -470,6 +498,28 @@ class EventDrivenStrategy(StrategyBase):
         except Exception:
             pass
         return None
+
+    def _get_daily_atr(self, symbol: str, period: int = 14) -> float | None:
+        """Compute ATR from daily bars for post-event trailing stops."""
+        try:
+            bars = self.data_provider.get_bars(symbol, "1Day", period + 6)
+            if bars.empty or len(bars) < period + 1:
+                return None
+            highs = bars["high"].values
+            lows = bars["low"].values
+            closes = bars["close"].values
+            tr_values: list[float] = []
+            for i in range(1, len(bars)):
+                tr_values.append(max(
+                    highs[i] - lows[i],
+                    abs(highs[i] - closes[i - 1]),
+                    abs(lows[i] - closes[i - 1]),
+                ))
+            if len(tr_values) < period:
+                return None
+            return float(sum(tr_values[-period:]) / period)
+        except Exception:
+            return None
 
     def assess_opportunities(self, regime: MarketRegime | None = None) -> OpportunityAssessment:
         """Assess event-driven opportunities from today's calendar."""
@@ -597,7 +647,6 @@ class EventDrivenStrategy(StrategyBase):
                         direction = "long" if move_pct >= 0 else "short"
                         base_conf = 0.35 if event_type in {"fomc", "cpi", "ppi", "jobs", "gdp", "retail_sales", "pce"} else 0.30
                         confidence = base_conf + (0.25 if abs(move_pct) >= self._post_event_move_threshold * 1.5 else 0.05)
-                        expiry_time = (event_time + timedelta(hours=4)).astimezone(pytz.UTC)
                         catalyst = f"post_{event_type}_{direction}"
                         win_rate = 0.52
                     else:
@@ -608,7 +657,6 @@ class EventDrivenStrategy(StrategyBase):
                             direction = "short"
                         base_conf = 0.35 if event_type in {"fomc", "cpi", "ppi", "jobs", "gdp", "retail_sales", "pce"} else 0.30
                         confidence = min(0.40, base_conf + 0.05)
-                        expiry_time = event_time.astimezone(pytz.UTC)
                         catalyst = f"pre_{event_type}_{direction}"
                         win_rate = 0.45
 
@@ -650,12 +698,15 @@ class EventDrivenStrategy(StrategyBase):
                         edge_estimate_pct=round(edge_pct, 2),
                         regime_fit=round(regime_fit, 2),
                         catalyst=catalyst,
-                        time_horizon_minutes=240 if is_post_event else int(max(30, hours_to_event * 60)),
-                        expiry_time=expiry_time,
+                        time_horizon_minutes=0,
+                        expiry_time=None,
                         metadata={
                             "event_type": event_type,
                             "is_post_event": is_post_event,
                             "event_time": event_time.isoformat(),
+                            "max_hold_days": self._max_hold_days,
+                            "trailing_stop_atr": self._trailing_stop_atr,
+                            "swing_trade": True,
                         },
                     ))
                     details.append(
@@ -724,6 +775,9 @@ class EventDrivenStrategy(StrategyBase):
                 "post_event_move_pct": trade.post_event_move_pct,
                 "entry_time": trade.entry_time.isoformat() if trade.entry_time else None,
                 "capital_used": trade.capital_used,
+                "atr": trade.atr,
+                "highest_price": trade.highest_price,
+                "lowest_price": trade.lowest_price,
                 "trade_id": trade.trade_id,
                 "bracket_stop_order_id": trade.bracket_stop_order_id,
                 "bracket_tp_order_id": trade.bracket_tp_order_id,
@@ -750,8 +804,26 @@ class EventDrivenStrategy(StrategyBase):
                 post_event_move_pct=saved.get("post_event_move_pct", 0.0),
                 entry_time=datetime.fromisoformat(saved["entry_time"]) if saved.get("entry_time") else None,
                 capital_used=saved.get("capital_used", 0.0),
+                atr=saved.get("atr", 0.0),
+                highest_price=saved.get("highest_price", 0.0),
+                lowest_price=saved.get("lowest_price", 0.0),
                 trade_id=saved.get("trade_id", ""),
                 bracket_stop_order_id=saved.get("bracket_stop_order_id", ""),
                 bracket_tp_order_id=saved.get("bracket_tp_order_id", ""),
                 is_bracket=saved.get("is_bracket", False),
             )
+
+    def close_all_positions(self, reason: str = "") -> int:
+        """Force-close all open event trades."""
+        closed = 0
+        for trade_key, trade in list(self._trades.items()):
+            self._close_trade(trade_key, trade, reason or "forced_close")
+            if trade_key not in self._trades:
+                closed += 1
+        return closed
+
+    def close_positions_for_eod(self, et_now: datetime) -> int:
+        """Run one explicit EOD management pass."""
+        before = len(self._trades)
+        self._manage_positions(et_now)
+        return max(0, before - len(self._trades))

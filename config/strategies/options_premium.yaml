@@ -14,20 +14,22 @@ params:
 
   # Entry window
   entry_start_hour: 10
-  entry_start_minute: 15
-  entry_end_hour: 10
-  entry_end_minute: 45
+  entry_start_minute: 0
+  entry_end_hour: 11
+  entry_end_minute: 30
 
   # DTE
-  target_dte: 0                   # 0DTE (same day expiry)
-  max_dte: 2                      # Fallback if 0DTE not available
+  min_dte: 2                      # Swing expiry floor
+  max_dte: 5                      # Swing expiry ceiling
+  max_hold_days: 5                # Hold 1-5 days max
 
   # Filters
   min_vix_proxy: 15.0             # Only sell when vol is elevated enough
   use_sma5_filter: true           # Contrarian SMA5 filter
   credit_estimate_pct: 0.30       # Rough credit estimate as % of spread width
+  strike_atr_distance: 1.0        # Short strike distance in ATR units
   min_credit_per_spread: 50.0     # Skip low-credit setups (pre-commission)
-  min_credit_per_contract: 10.0   # Hard floor: $10 credit minimum per contract (0.10 option price)
+  min_credit_per_contract: 30.0   # Hard floor: $30 credit minimum per contract (0.30 option price)
   min_credit_to_max_loss_ratio: 0.05  # Credit must be at least 5% of max loss per contract
   require_live_credit_estimate: true  # Skip entries when live option-chain credit cannot be estimated
   max_commission_per_spread: 4.0  # Est. round-trip commission per 1-lot spread
@@ -37,9 +39,10 @@ params:
 
   # Exit
   profit_target_pct: 50.0         # Close at 50% of max profit
-  stop_loss_pct: 200.0            # Close at 200% of credit received (loss)
-  min_hold_minutes_for_profit_target: 60  # Avoid premature profit exits in first hour
-  close_before_minutes: 15        # Close 15 min before market close
+  stop_loss_multiple: 3.0         # Stop when spread value reaches 3x entry credit
+  close_before_expiry_days: 1     # Close one day before expiry
+  min_hold_minutes_for_profit_target: 0
+  close_before_minutes: 15        # Legacy safety near close
   expiry_risk_close_minutes: 15   # Force-close expiring options by 3:45 PM ET
 
   # Sizing

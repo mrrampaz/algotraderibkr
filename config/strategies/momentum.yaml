@@ -19,13 +19,12 @@ params:
 
   # Target & trailing
   use_trailing_stop: true
-  trail_atr_mult: 2.0            # Trail stop distance = 2.0 * ATR
-  trail_activation_rr: 1.0       # Activate trail after 1R profit
+  trailing_stop_atr_multiple: 1.5 # Trail stop distance = 1.5 * ATR
+  trail_activation_rr: 0.0       # Swing trailing starts immediately
   fixed_target_rr: 3.0           # If not trailing, fixed 3R target
 
-  # Time
-  close_by_hour: 15              # Close by 3:30 PM unless swing criteria met
-  close_by_minute: 30
+  # Swing hold
+  max_hold_days: 3               # Hold breakouts 1-3 days
 
   # Scan interval
   scan_interval_minutes: 15      # Run breakout scan every 15 min

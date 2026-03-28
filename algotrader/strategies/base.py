@@ -245,6 +245,14 @@ class StrategyBase(ABC):
         """Assess tradeable opportunities right now. Override in each strategy."""
         return OpportunityAssessment()
 
+    def close_all_positions(self, reason: str = "") -> int:
+        """Optional orchestrator hook to force-close all strategy positions."""
+        return 0
+
+    def close_positions_for_eod(self, et_now: datetime) -> int:
+        """Optional orchestrator hook for selective end-of-day closes."""
+        return 0
+
     # ── Status ────────────────────────────────────────────────────────
 
     def get_status(self) -> StrategyStatus:

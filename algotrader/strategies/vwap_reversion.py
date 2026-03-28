@@ -1,8 +1,7 @@
-"""VWAP Mean Reversion strategy.
+"""Mean reversion strategy (legacy name: vwap_reversion).
 
-Trades large-cap stocks that deviate significantly from VWAP back toward
-VWAP. Only active in ranging/low-vol regimes where mean reversion is
-most reliable.
+Trades large-cap stocks that deviate significantly from their 20-day
+mean and reverts toward that mean over a multi-day horizon.
 """
 
 from __future__ import annotations
@@ -12,7 +11,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-import numpy as np
 import pandas as pd
 import pytz
 import structlog
@@ -33,42 +31,45 @@ logger = structlog.get_logger()
 ET = pytz.timezone("America/New_York")
 
 
-def calculate_vwap_zscore(bars: pd.DataFrame) -> tuple[float, float]:
-    """Calculate VWAP and z-score from intraday bars.
+def calculate_mean_reversion_zscore(bars: pd.DataFrame, lookback: int = 20) -> tuple[float, float, float]:
+    """Calculate MA20 and z-score from daily closes."""
+    if bars.empty or len(bars) < max(lookback + 1, 25):
+        return 0.0, 0.0, 0.0
 
-    VWAP = cumsum(typical_price * volume) / cumsum(volume)
-    Z-score = (current_price - VWAP) / std(price - VWAP)
-    """
+    closes = pd.to_numeric(bars["close"], errors="coerce").dropna()
+    if len(closes) < lookback:
+        return 0.0, 0.0, 0.0
+
+    window = closes.iloc[-lookback:]
+    ma_20 = float(window.mean())
+    std_20 = float(window.std())
+    if std_20 <= 0:
+        return ma_20, 0.0, 0.0
+
+    current_price = float(closes.iloc[-1])
+    z_score = (current_price - ma_20) / std_20
+    return ma_20, std_20, float(z_score)
+
+
+def calculate_vwap_zscore(bars: pd.DataFrame) -> tuple[float, float]:
+    """Backward-compatible shim kept for existing imports/tests."""
     if bars.empty or len(bars) < 5:
         return 0.0, 0.0
 
-    typical_price = (bars["high"] + bars["low"] + bars["close"]) / 3
-    cum_vol = bars["volume"].cumsum()
-    cum_pv = (typical_price * bars["volume"]).cumsum()
-
-    # Avoid division by zero
-    vwap = cum_pv / cum_vol.replace(0, np.nan)
-    vwap = vwap.ffill()
-
-    deviation = bars["close"] - vwap
-    std_dev = deviation.rolling(20, min_periods=5).std()
-
-    current_vwap = float(vwap.iloc[-1]) if not pd.isna(vwap.iloc[-1]) else 0.0
-    if pd.isna(std_dev.iloc[-1]) or std_dev.iloc[-1] <= 0:
-        return current_vwap, 0.0
-
-    current_z = float(deviation.iloc[-1] / std_dev.iloc[-1])
-    return current_vwap, current_z
+    ma_20, std_20, z_score = calculate_mean_reversion_zscore(bars, lookback=20)
+    _ = std_20
+    return ma_20, z_score
 
 
 @dataclass
 class VWAPTrade:
-    """Internal state for a single VWAP reversion trade."""
+    """Internal state for a single mean reversion trade."""
 
     symbol: str
     direction: str  # "long" or "short"
     entry_price: float
-    entry_vwap: float
+    entry_mean: float
+    entry_std: float
     entry_z_score: float
     stop_price: float
     target_price: float
@@ -82,12 +83,7 @@ class VWAPTrade:
 
 @register_strategy("vwap_reversion")
 class VWAPReversionStrategy(StrategyBase):
-    """VWAP mean reversion for large-cap stocks.
-
-    Entry: when z-score from VWAP exceeds threshold (price far from VWAP).
-    Exit: when z-score reverts, stop loss, profit target, or time limit.
-    Only active in ranging/low-vol regimes.
-    """
+    """Daily MA20 mean reversion for large-cap stocks."""
 
     def __init__(
         self,
@@ -100,30 +96,35 @@ class VWAPReversionStrategy(StrategyBase):
         super().__init__(name, config, data_provider, executor, event_bus)
 
         params = config.params
+        self._mode = str(params.get("mode", "daily_ma")).lower()
         self._universe = params.get("universe", [
             "SPY", "QQQ", "AAPL", "MSFT", "AMZN", "GOOG", "META", "NVDA", "JPM", "V",
         ])
 
         # Entry
         self._min_z_score = params.get("min_z_score", 2.0)
+        self._trending_min_z_score = float(
+            params.get("trending_min_z_score", max(2.5, self._min_z_score)),
+        )
         self._min_volume_ratio = params.get("min_volume_ratio", 1.0)
         self._max_spread_pct = params.get("max_spread_pct", 0.15)
+        self._lookback_days = int(params.get("lookback_days", 20))
 
         # Exit
         self._exit_z_score = params.get("exit_z_score", 0.5)
         self._stop_pct = params.get("stop_pct", 0.5)
         self._target_pct = params.get("target_pct", 1.0)
+        self._max_hold_days = int(params.get("max_hold_days", 3))
 
-        # Time
-        self._earliest_entry_hour = params.get("earliest_entry_hour", 10)
-        self._earliest_entry_minute = params.get("earliest_entry_minute", 0)
-        self._close_by_hour = params.get("close_by_hour", 15)
-        self._close_by_minute = params.get("close_by_minute", 30)
-        self._bar_timeframe = params.get("bar_timeframe", "5Min")
+        # Data
+        self._bar_timeframe = params.get("bar_timeframe", "1Day")
         self._vwap_lookback_bars = params.get("vwap_lookback_bars", 78)
 
         # Regime filter — ONLY ranging/low_vol
-        self._allowed_regimes = params.get("allowed_regimes", ["ranging", "low_vol"])
+        self._allowed_regimes = params.get(
+            "allowed_regimes",
+            ["ranging", "low_vol"],
+        )
         self._allow_high_vol = bool(params.get("allow_high_vol", False))
         self._high_vol_min_z_score = float(
             params.get("high_vol_min_z_score", max(2.5, self._min_z_score)),
@@ -133,7 +134,7 @@ class VWAPReversionStrategy(StrategyBase):
         self._trades: dict[str, VWAPTrade] = {}
 
     def warm_up(self) -> None:
-        """No heavy warm-up needed; VWAP calculated from intraday bars."""
+        """No heavy warm-up needed; signals derive from daily bars."""
         self._log.info("warming_up", universe_size=len(self._universe))
         self._warmed_up = True
 
@@ -146,10 +147,12 @@ class VWAPReversionStrategy(StrategyBase):
     def _effective_min_z_score(self, regime: MarketRegime | None) -> float:
         if regime and regime.regime_type.value == "high_vol" and self._allow_high_vol:
             return max(self._min_z_score, self._high_vol_min_z_score)
+        if regime and regime.regime_type.value in {"trending_up", "trending_down"}:
+            return max(self._min_z_score, self._trending_min_z_score)
         return float(self._min_z_score)
 
     def run_cycle(self, regime: MarketRegime | None = None) -> list[Signal]:
-        """Run one cycle: manage positions, scan for VWAP deviations."""
+        """Run one cycle: manage positions, scan for mean-reversion setups."""
         self._check_day_reset()
         self._last_cycle_time = datetime.now(pytz.UTC)
         signals: list[Signal] = []
@@ -164,52 +167,38 @@ class VWAPReversionStrategy(StrategyBase):
         if regime and regime.regime_type.value not in allowed_regimes:
             return signals
 
-        # 3. Check time window for new entries
-        if (et_now.hour < self._earliest_entry_hour or
-                (et_now.hour == self._earliest_entry_hour and et_now.minute < self._earliest_entry_minute)):
-            return signals
-
-        # 4. Scan for new entries
+        # 3. Scan for new entries
         if len(self._trades) < self.config.max_positions:
             signals.extend(self._scan_entries(et_now, regime))
 
         return signals
 
     def _manage_positions(self, et_now: datetime) -> list[Signal]:
-        """Manage open VWAP reversion trades."""
+        """Manage open mean-reversion trades."""
         signals: list[Signal] = []
 
         for symbol, trade in list(self._trades.items()):
             close_reason = ""
-
-            # Get current price and VWAP z-score
-            current_price = self._get_current_price(symbol)
-            if current_price is None:
+            stats = self._daily_reversion_stats(symbol)
+            if stats is None:
                 continue
+            current_price = stats["current_price"]
+            current_z = stats["z_score"]
+            current_mean = stats["mean_price"]
+            days_held = max(0, (et_now.date() - trade.entry_time.astimezone(ET).date()).days)
 
-            bars = self.data_provider.get_bars(symbol, self._bar_timeframe, self._vwap_lookback_bars)
-            _, current_z = calculate_vwap_zscore(bars) if not bars.empty else (0.0, 0.0)
-
-            # 1. Z-score reverted — profit target
             if abs(current_z) <= self._exit_z_score:
                 close_reason = f"z_reverted: |{current_z:.2f}| <= {self._exit_z_score}"
-
-            # 2. Stop loss
             elif trade.direction == "long" and current_price <= trade.stop_price:
                 close_reason = f"stop_hit: {current_price:.2f} <= {trade.stop_price:.2f}"
             elif trade.direction == "short" and current_price >= trade.stop_price:
                 close_reason = f"stop_hit: {current_price:.2f} >= {trade.stop_price:.2f}"
-
-            # 3. Profit target by percentage
             elif trade.direction == "long" and current_price >= trade.target_price:
                 close_reason = f"target_hit: {current_price:.2f} >= {trade.target_price:.2f}"
             elif trade.direction == "short" and current_price <= trade.target_price:
                 close_reason = f"target_hit: {current_price:.2f} <= {trade.target_price:.2f}"
-
-            # 4. Time limit
-            elif (et_now.hour > self._close_by_hour or
-                    (et_now.hour == self._close_by_hour and et_now.minute >= self._close_by_minute)):
-                close_reason = "time_limit"
+            elif days_held >= self._max_hold_days:
+                close_reason = f"max_hold_{self._max_hold_days}_days"
 
             if close_reason:
                 self._close_trade(symbol, trade, close_reason)
@@ -218,14 +207,19 @@ class VWAPReversionStrategy(StrategyBase):
                     symbol=symbol,
                     direction=SignalDirection.CLOSE,
                     reason=close_reason,
-                    metadata={"entry_z": trade.entry_z_score, "current_z": current_z},
+                    metadata={
+                        "entry_z": trade.entry_z_score,
+                        "current_z": current_z,
+                        "ma_20": current_mean,
+                        "days_held": days_held,
+                    },
                     timestamp=datetime.now(pytz.UTC),
                 ))
 
         return signals
 
     def _scan_entries(self, et_now: datetime, regime: MarketRegime | None = None) -> list[Signal]:
-        """Scan universe for VWAP deviation entries."""
+        """Scan universe for daily MA mean-reversion entries."""
         signals: list[Signal] = []
         effective_min_z_score = self._effective_min_z_score(regime)
 
@@ -235,46 +229,33 @@ class VWAPReversionStrategy(StrategyBase):
             if len(self._trades) >= self.config.max_positions:
                 break
 
-            # Get intraday bars for VWAP calculation
-            bars = self.data_provider.get_bars(symbol, self._bar_timeframe, self._vwap_lookback_bars)
-            if bars.empty or len(bars) < 10:
+            stats = self._daily_reversion_stats(symbol)
+            if stats is None:
                 continue
 
-            current_vwap, z_score = calculate_vwap_zscore(bars)
-            if current_vwap <= 0:
-                continue
+            current_price = stats["current_price"]
+            mean_price = stats["mean_price"]
+            std_20 = stats["std_20"]
+            z_score = stats["z_score"]
 
-            # Check z-score threshold
             if abs(z_score) < effective_min_z_score:
                 continue
 
-            # Get current price
-            current_price = float(bars["close"].iloc[-1])
-            if current_price <= 0:
-                continue
-
-            # Validate spread
             quote = self.data_provider.get_quote(symbol)
             if quote and quote.is_valid() and quote.spread_pct * 100 > self._max_spread_pct:
                 continue
 
-            # Determine direction
-            if z_score > self._min_z_score:
-                # Price far above VWAP → SHORT (expect reversion down)
+            if z_score > 0:
                 direction = "short"
                 side = OrderSide.SELL
-                stop_price = current_price * (1 + self._stop_pct / 100)
-                target_price = current_price * (1 - self._target_pct / 100)
-            elif z_score < -self._min_z_score:
-                # Price far below VWAP → LONG (expect reversion up)
+                stop_price = current_price + std_20
+                target_price = mean_price
+            else:
                 direction = "long"
                 side = OrderSide.BUY
-                stop_price = current_price * (1 - self._stop_pct / 100)
-                target_price = current_price * (1 + self._target_pct / 100)
-            else:
-                continue
+                stop_price = current_price - std_20
+                target_price = mean_price
 
-            # Size position
             stop_distance = abs(current_price - stop_price)
             if stop_distance <= 0:
                 continue
@@ -284,7 +265,6 @@ class VWAPReversionStrategy(StrategyBase):
             max_value = self._total_capital * 0.05
             max_shares = int(max_value / current_price) if current_price > 0 else 0
             shares = min(shares, max_shares)
-
             if shares <= 0:
                 continue
 
@@ -312,7 +292,8 @@ class VWAPReversionStrategy(StrategyBase):
                 symbol=symbol,
                 direction=direction,
                 entry_price=current_price,
-                entry_vwap=current_vwap,
+                entry_mean=mean_price,
+                entry_std=std_20,
                 entry_z_score=z_score,
                 stop_price=stop_price,
                 target_price=target_price,
@@ -330,7 +311,7 @@ class VWAPReversionStrategy(StrategyBase):
                 symbol=symbol,
                 direction=direction,
                 z_score=round(z_score, 2),
-                vwap=round(current_vwap, 2),
+                ma_20=round(mean_price, 2),
                 price=current_price,
                 stop=stop_price,
                 target=target_price,
@@ -341,12 +322,47 @@ class VWAPReversionStrategy(StrategyBase):
                 strategy_name=self.name,
                 symbol=symbol,
                 direction=SignalDirection.LONG if direction == "long" else SignalDirection.SHORT,
-                reason=f"vwap_deviation: z={z_score:.2f}",
-                metadata={"z_score": z_score, "vwap": current_vwap},
+                reason=f"mean_reversion_ma20: z={z_score:.2f}",
+                metadata={"z_score": z_score, "ma_20": mean_price, "std_20": std_20},
                 timestamp=datetime.now(pytz.UTC),
             ))
 
         return signals
+
+    def _daily_reversion_stats(self, symbol: str) -> dict[str, float] | None:
+        """Return daily MA20/std/z-score stats for a symbol."""
+        min_required = max(25, self._lookback_days + 1)
+        bars = self.data_provider.get_bars(symbol, "1Day", max(30, self._lookback_days + 10))
+        if bars.empty or len(bars) < min_required:
+            # Backward-compatible fallback for test stubs and non-daily feeds.
+            for timeframe in (self._bar_timeframe, "5Min"):
+                bars = self.data_provider.get_bars(
+                    symbol,
+                    timeframe,
+                    max(30, self._lookback_days + 10),
+                )
+                if not bars.empty and len(bars) >= min_required:
+                    break
+        if bars.empty or len(bars) < max(25, self._lookback_days + 1):
+            return None
+
+        mean_price, std_20, z_score = calculate_mean_reversion_zscore(
+            bars,
+            lookback=self._lookback_days,
+        )
+        if mean_price <= 0 or std_20 <= 0:
+            return None
+
+        current_price = float(bars["close"].iloc[-1])
+        if current_price <= 0:
+            return None
+
+        return {
+            "current_price": current_price,
+            "mean_price": mean_price,
+            "std_20": std_20,
+            "z_score": z_score,
+        }
 
     def _close_trade(self, symbol: str, trade: VWAPTrade, reason: str) -> None:
         """Close a VWAP trade with position exit safety."""
@@ -372,9 +388,13 @@ class VWAPReversionStrategy(StrategyBase):
             entry_price=trade.entry_price,
             exit_price=exit_price,
             entry_time=trade.entry_time,
-            entry_reason=f"vwap_deviation: z={trade.entry_z_score:.2f}",
+            entry_reason=f"mean_reversion_ma20: z={trade.entry_z_score:.2f}",
             exit_reason=reason,
-            metadata={"entry_vwap": trade.entry_vwap, "entry_z": trade.entry_z_score},
+            metadata={
+                "entry_mean": trade.entry_mean,
+                "entry_std": trade.entry_std,
+                "entry_z": trade.entry_z_score,
+            },
         )
 
         self._log.info(
@@ -397,7 +417,7 @@ class VWAPReversionStrategy(StrategyBase):
         return None
 
     def assess_opportunities(self, regime: MarketRegime | None = None) -> OpportunityAssessment:
-        """Assess VWAP deviation opportunities across universe."""
+        """Assess daily mean-reversion opportunities across the configured universe."""
         self._log.info("assess_start", strategy=self.name)
         raw_scanned = len(self._universe)
         regime_type = regime.regime_type.value if regime else "none"
@@ -414,18 +434,9 @@ class VWAPReversionStrategy(StrategyBase):
         try:
             from algotrader.strategy_selector.candidate import CandidateType, TradeCandidate
 
-            # Regime gate - only active in ranging/low_vol
             allowed_regimes = self._effective_allowed_regimes()
             effective_min_z_score = self._effective_min_z_score(regime)
-            regime_allowed = regime is None or regime.regime_type.value in allowed_regimes
-            self._log.info(
-                "vwap_regime_check",
-                regime=regime_type,
-                allowed=regime_allowed,
-                allowed_regimes=allowed_regimes,
-                effective_min_z_score=round(effective_min_z_score, 2),
-            )
-            if not regime_allowed:
+            if regime and regime.regime_type.value not in allowed_regimes:
                 self._log.warning(
                     "vwap_regime_rejected",
                     regime=regime_type,
@@ -433,192 +444,113 @@ class VWAPReversionStrategy(StrategyBase):
                 )
                 return _complete(OpportunityAssessment())
 
-            et_now = datetime.now(ET)
-            if et_now.hour >= 15:
-                return _complete(OpportunityAssessment(
-                    num_candidates=0,
-                    confidence=0.0,
-                    details=[{"reason": "entry_window_closed_after_1500"}],
-                    candidates=[],
-                ))
-
-            self._log.info(
-                "vwap_universe",
-                regime=regime_type,
-                count=len(self._universe),
-                symbols=self._universe[:10],
-            )
-
-            filter_counts = {
-                "already_tracking_trade": 0,
-                "insufficient_bar_data": 0,
-                "below_z_threshold": 0,
-                "invalid_price_or_vwap": 0,
-                "candidate_built": 0,
-            }
-            candidates: list[dict] = []
-            trade_candidates: list[TradeCandidate] = []
-
+            candidates: list[TradeCandidate] = []
+            details: list[dict] = []
             for symbol in self._universe:
                 if symbol in self._trades:
-                    filter_counts["already_tracking_trade"] += 1
                     continue
-                try:
-                    bars = self.data_provider.get_bars(
-                        symbol, self._bar_timeframe, self._vwap_lookback_bars,
-                    )
-                    self._log.debug(
-                        "vwap_bars",
-                        symbol=symbol,
-                        bars=len(bars) if bars is not None else 0,
-                        timeframe=self._bar_timeframe,
-                    )
-                    if bars.empty or len(bars) < 10:
-                        filter_counts["insufficient_bar_data"] += 1
-                        continue
 
-                    vwap_price, z_score = calculate_vwap_zscore(bars)
-                    self._log.debug(
-                        "vwap_zscore",
-                        symbol=symbol,
-                        z_score=round(z_score, 3),
-                        threshold=round(effective_min_z_score, 2),
-                    )
-                    if abs(z_score) < effective_min_z_score:
-                        filter_counts["below_z_threshold"] += 1
-                        continue
+                stats = self._daily_reversion_stats(symbol)
+                if stats is None:
+                    continue
 
-                    current_price = float(bars["close"].iloc[-1])
-                    if current_price <= 0 or vwap_price <= 0:
-                        filter_counts["invalid_price_or_vwap"] += 1
-                        continue
+                current_price = stats["current_price"]
+                mean_price = stats["mean_price"]
+                std_20 = stats["std_20"]
+                z_score = stats["z_score"]
+                abs_z = abs(z_score)
 
-                    if z_score < 0:
-                        direction = "long"
-                        stop_price = current_price * (1 - self._stop_pct / 100)
-                        candidate_type = CandidateType.LONG_EQUITY
-                    else:
-                        direction = "short"
-                        stop_price = current_price * (1 + self._stop_pct / 100)
-                        candidate_type = CandidateType.SHORT_EQUITY
+                if abs_z < effective_min_z_score:
+                    continue
 
-                    target_price = float(vwap_price)
-                    risk_per_share = abs(current_price - stop_price)
-                    reward_per_share = abs(target_price - current_price)
-                    if risk_per_share <= 0:
-                        continue
-                    rr_ratio = reward_per_share / risk_per_share if risk_per_share > 0 else 0.0
+                direction = "long" if z_score < 0 else "short"
+                candidate_type = CandidateType.LONG_EQUITY if direction == "long" else CandidateType.SHORT_EQUITY
+                stop_price = current_price - std_20 if direction == "long" else current_price + std_20
+                target_price = mean_price
 
-                    vol_ratio = 1.0
-                    if len(bars) >= 6:
-                        avg_recent_vol = float(bars["volume"].iloc[-6:-1].mean())
-                        if avg_recent_vol > 0:
-                            vol_ratio = float(bars["volume"].iloc[-1]) / avg_recent_vol
+                risk_per_share = abs(current_price - stop_price)
+                reward_per_share = abs(target_price - current_price)
+                if risk_per_share <= 0:
+                    continue
+                rr_ratio = reward_per_share / risk_per_share
 
-                    abs_z = abs(z_score)
-                    confidence = 0.10
-                    if abs_z > 2.5:
-                        confidence += 0.30
-                    else:
-                        confidence += 0.20
+                confidence = 0.20
+                if abs_z >= (effective_min_z_score + 1.0):
+                    confidence += 0.30
+                elif abs_z >= (effective_min_z_score + 0.5):
+                    confidence += 0.20
+                else:
+                    confidence += 0.10
 
-                    if vol_ratio >= 1.2:
+                regime_fit = 0.55
+                if regime:
+                    if regime.regime_type.value in {"ranging", "low_vol"}:
+                        regime_fit = 0.85
                         confidence += 0.15
-
-                    regime_fit = 0.5
-                    if regime:
-                        regime_type = regime.regime_type.value
-                        if regime_type == "ranging":
-                            regime_fit = 0.9
-                            confidence += 0.20
-                        elif regime_type == "low_vol":
-                            regime_fit = 0.8
-                            confidence += 0.15
-                        elif regime_type in ("trending_up", "trending_down"):
-                            regime_fit = 0.2
-                            confidence += 0.05
-                        elif regime_type == "high_vol":
-                            regime_fit = 0.1
-                        else:
-                            regime_fit = 0.5
-
-                    if symbol in {"SPY", "QQQ", "AAPL", "MSFT", "AMZN", "GOOG", "META", "NVDA"}:
+                    elif regime.regime_type.value == "high_vol":
+                        regime_fit = 0.70
                         confidence += 0.10
+                    elif regime.regime_type.value in {"trending_up", "trending_down"}:
+                        regime_fit = 0.45
 
-                    confidence = min(1.0, max(0.0, confidence))
+                confidence = min(1.0, max(0.0, confidence))
+                risk_pct = (risk_per_share / current_price) * 100.0 if current_price > 0 else 0.0
+                edge_pct = max(0.0, (0.54 * rr_ratio - 0.46) * risk_pct)
+                risk_budget = self.available_capital * 0.005
+                suggested_qty = int(risk_budget / risk_per_share) if risk_per_share > 0 else 0
 
-                    risk_pct = (risk_per_share / current_price) * 100.0
-                    edge_pct = max(0.0, (0.55 * rr_ratio - 0.45) * risk_pct)
-                    risk_budget = self.available_capital * 0.005
-                    suggested_qty = int(risk_budget / risk_per_share) if risk_per_share > 0 else 0
-                    expiry_time = et_now.replace(hour=15, minute=0, second=0, microsecond=0).astimezone(pytz.UTC)
-
-                    trade_candidates.append(TradeCandidate(
-                        strategy_name=self.name,
-                        candidate_type=candidate_type,
-                        symbol=symbol,
-                        direction=direction,
-                        entry_price=round(current_price, 2),
-                        stop_price=round(stop_price, 2),
-                        target_price=round(target_price, 2),
-                        risk_dollars=round(risk_per_share * max(1, suggested_qty), 2),
-                        suggested_qty=suggested_qty,
-                        risk_reward_ratio=round(rr_ratio, 2),
-                        confidence=round(confidence, 2),
-                        edge_estimate_pct=round(edge_pct, 2),
-                        regime_fit=round(regime_fit, 2),
-                        catalyst=f"vwap_z_{abs_z:.1f}_{direction}_revert",
-                        time_horizon_minutes=240,
-                        expiry_time=expiry_time,
-                        metadata={
-                            "z_score": round(z_score, 2),
-                            "vwap": round(vwap_price, 2),
-                            "volume_ratio": round(vol_ratio, 2),
-                        },
-                    ))
-                    filter_counts["candidate_built"] += 1
-                    candidates.append({
+                candidates.append(TradeCandidate(
+                    strategy_name=self.name,
+                    candidate_type=candidate_type,
+                    symbol=symbol,
+                    direction=direction,
+                    entry_price=round(current_price, 2),
+                    stop_price=round(stop_price, 2),
+                    target_price=round(target_price, 2),
+                    risk_dollars=round(risk_per_share * max(1, suggested_qty), 2),
+                    suggested_qty=suggested_qty,
+                    risk_reward_ratio=round(rr_ratio, 2),
+                    confidence=round(confidence, 2),
+                    edge_estimate_pct=round(edge_pct, 2),
+                    regime_fit=round(regime_fit, 2),
+                    catalyst=f"mean_reversion_z_{z_score:.1f}_ma20",
+                    time_horizon_minutes=0,
+                    expiry_time=None,
+                    metadata={
+                        "z_score": round(z_score, 2),
+                        "ma_20": round(mean_price, 2),
+                        "vwap": round(mean_price, 2),
+                        "std_20": round(std_20, 4),
+                        "hold_days": self._max_hold_days,
+                        "swing_trade": True,
+                    },
+                ))
+                details.append(
+                    {
                         "symbol": symbol,
                         "z_score": round(z_score, 2),
-                        "vwap": round(vwap_price, 2),
-                        "volume_ratio": round(vol_ratio, 2),
+                        "ma_20": round(mean_price, 2),
+                        "std_20": round(std_20, 2),
                         "direction": direction,
-                    })
-                except Exception:
-                    continue
-
-            if not trade_candidates:
-                self._log.info(
-                    "vwap_scan_result",
-                    regime=regime_type,
-                    universe_size=len(self._universe),
-                    final_candidates=0,
-                    filter_counts=filter_counts,
-                    effective_min_z_score=round(effective_min_z_score, 2),
+                    }
                 )
+
+            if not candidates:
                 return _complete(OpportunityAssessment())
 
-            trade_candidates.sort(key=lambda c: c.expected_value, reverse=True)
-            top_candidates = trade_candidates[:3]
-            avg_rr = sum(c.risk_reward_ratio for c in trade_candidates) / len(trade_candidates)
-            avg_conf = sum(c.confidence for c in trade_candidates) / len(trade_candidates)
-            avg_edge = sum(c.edge_estimate_pct for c in trade_candidates) / len(trade_candidates)
-            self._log.info(
-                "vwap_scan_result",
-                regime=regime_type,
-                universe_size=len(self._universe),
-                final_candidates=len(top_candidates),
-                filter_counts=filter_counts,
-                effective_min_z_score=round(effective_min_z_score, 2),
-            )
+            candidates.sort(key=lambda c: c.expected_value, reverse=True)
+            top_candidates = candidates[:3]
+            avg_rr = sum(c.risk_reward_ratio for c in candidates) / len(candidates)
+            avg_conf = sum(c.confidence for c in candidates) / len(candidates)
+            avg_edge = sum(c.edge_estimate_pct for c in candidates) / len(candidates)
 
             return _complete(OpportunityAssessment(
-                num_candidates=len(trade_candidates),
+                num_candidates=len(candidates),
                 avg_risk_reward=round(max(0.0, avg_rr), 2),
                 confidence=round(max(0.0, min(1.0, avg_conf)), 2),
-                estimated_daily_trades=min(len(trade_candidates), self.config.max_positions),
+                estimated_daily_trades=min(len(candidates), self.config.max_positions),
                 estimated_edge_pct=round(max(0.0, avg_edge), 2),
-                details=candidates[:5],
+                details=details[:5],
                 candidates=top_candidates,
             ))
         except Exception as exc:
@@ -634,7 +566,9 @@ class VWAPReversionStrategy(StrategyBase):
                 "symbol": trade.symbol,
                 "direction": trade.direction,
                 "entry_price": trade.entry_price,
-                "entry_vwap": trade.entry_vwap,
+                "entry_mean": trade.entry_mean,
+                "entry_vwap": trade.entry_mean,
+                "entry_std": trade.entry_std,
                 "entry_z_score": trade.entry_z_score,
                 "stop_price": trade.stop_price,
                 "target_price": trade.target_price,
@@ -655,7 +589,8 @@ class VWAPReversionStrategy(StrategyBase):
                 symbol=saved["symbol"],
                 direction=saved["direction"],
                 entry_price=saved["entry_price"],
-                entry_vwap=saved["entry_vwap"],
+                entry_mean=saved.get("entry_mean", saved.get("entry_vwap", saved["entry_price"])),
+                entry_std=saved.get("entry_std", 0.0),
                 entry_z_score=saved["entry_z_score"],
                 stop_price=saved["stop_price"],
                 target_price=saved["target_price"],
@@ -666,3 +601,21 @@ class VWAPReversionStrategy(StrategyBase):
                 bracket_tp_order_id=saved.get("bracket_tp_order_id", ""),
                 is_bracket=saved.get("is_bracket", False),
             )
+
+    def close_all_positions(self, reason: str = "") -> int:
+        """Force-close all open mean-reversion trades."""
+        closed = 0
+        for symbol, trade in list(self._trades.items()):
+            self._close_trade(symbol, trade, reason or "forced_close")
+            if symbol not in self._trades:
+                closed += 1
+        return closed
+
+    def close_positions_for_eod(self, et_now: datetime) -> int:
+        """Run one explicit EOD management pass."""
+        before = len(self._trades)
+        self._manage_positions(et_now)
+        return max(0, before - len(self._trades))
+
+
+

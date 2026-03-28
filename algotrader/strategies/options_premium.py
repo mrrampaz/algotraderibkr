@@ -96,18 +96,20 @@ class OptionsPremiumStrategy(StrategyBase):
 
         # Entry window
         self._entry_start_hour = params.get("entry_start_hour", 10)
-        self._entry_start_minute = params.get("entry_start_minute", 15)
-        self._entry_end_hour = params.get("entry_end_hour", 10)
-        self._entry_end_minute = params.get("entry_end_minute", 45)
+        self._entry_start_minute = params.get("entry_start_minute", 0)
+        self._entry_end_hour = params.get("entry_end_hour", 11)
+        self._entry_end_minute = params.get("entry_end_minute", 30)
 
         # DTE
-        self._target_dte = params.get("target_dte", 0)
-        self._max_dte = params.get("max_dte", 2)
+        self._min_dte = int(params.get("min_dte", params.get("target_dte", 2)))
+        self._max_dte = int(params.get("max_dte", 5))
+        self._max_hold_days = int(params.get("max_hold_days", 5))
 
         # Filters
         self._min_vix_proxy = params.get("min_vix_proxy", 15.0)
         self._use_sma5_filter = params.get("use_sma5_filter", True)
         self._credit_estimate_pct = params.get("credit_estimate_pct", 0.30)
+        self._strike_atr_distance = float(params.get("strike_atr_distance", 1.0))
         self._win_rate_credit_spread = params.get("win_rate_credit_spread", 0.70)
         self._win_rate_iron_condor = params.get("win_rate_iron_condor", 0.72)
         self._event_day_confidence_penalty = params.get("event_day_confidence_penalty", 0.25)
@@ -122,9 +124,9 @@ class OptionsPremiumStrategy(StrategyBase):
         # Exit
         self._profit_target_pct = params.get("profit_target_pct", 50.0)
         self._stop_loss_pct = params.get("stop_loss_pct", 200.0)
-        self._min_hold_minutes_for_profit_target = int(
-            params.get("min_hold_minutes_for_profit_target", 60),
-        )
+        self._stop_loss_multiple = float(params.get("stop_loss_multiple", 3.0))
+        self._close_before_expiry_days = int(params.get("close_before_expiry_days", 1))
+        self._min_hold_minutes_for_profit_target = int(params.get("min_hold_minutes_for_profit_target", 0))
         self._close_before_minutes = params.get("close_before_minutes", 15)
         self._expiry_risk_close_minutes = int(
             params.get("expiry_risk_close_minutes", max(15, self._close_before_minutes)),
@@ -221,17 +223,21 @@ class OptionsPremiumStrategy(StrategyBase):
         """Manage open premium trades."""
         signals: list[Signal] = []
         utc_now = datetime.now(pytz.UTC)
-        market_close = et_now.replace(hour=16, minute=0, second=0, microsecond=0)
-        minutes_to_close = (market_close - et_now).total_seconds() / 60
 
         for trade_key, trade in list(self._trades.items()):
             close_reason = ""
+            days_held = 0
+            if trade.entry_time is not None:
+                days_held = max(0, (et_now.date() - trade.entry_time.astimezone(ET).date()).days)
+            days_to_expiry = None
+            if trade.expiration is not None:
+                days_to_expiry = (trade.expiration - et_now.date()).days
 
-            # Force-close expiring options to prevent exercise/assignment risk.
+            # Force-close same-day expiry options near the close to prevent exercise.
             if (
                 trade.expiration is not None
                 and trade.expiration <= et_now.date()
-                and minutes_to_close <= self._expiry_risk_close_minutes
+                and (et_now.hour > 15 or (et_now.hour == 15 and et_now.minute >= 45))
             ):
                 close_reason = f"prevent_exercise_{self._expiry_risk_close_minutes}m"
 
@@ -245,9 +251,12 @@ class OptionsPremiumStrategy(StrategyBase):
             if live_pnl is not None:
                 estimated_pnl_pct = live_pnl["pnl_pct"]
                 pnl_source = "options_mark"
+                current_spread_value = max(0.0, float(live_pnl.get("close_debit", 0.0)))
             else:
                 estimated_pnl_pct = self._estimate_pnl_pct(trade, current_price)
                 pnl_source = "underlying_proxy"
+                modeled_pnl = trade.max_profit * (estimated_pnl_pct / 100.0)
+                current_spread_value = max(0.0, trade.credit_received - modeled_pnl)
 
             held_minutes = 0.0
             if trade.entry_time is not None:
@@ -256,7 +265,7 @@ class OptionsPremiumStrategy(StrategyBase):
                     (utc_now - trade.entry_time).total_seconds() / 60.0,
                 )
 
-            # 1. Profit target (close at 50% of max profit)
+            # 1. Profit target (close at configured % of max profit).
             if not close_reason and estimated_pnl_pct >= self._profit_target_pct:
                 if held_minutes >= self._min_hold_minutes_for_profit_target:
                     close_reason = f"profit_target: est {estimated_pnl_pct:.0f}% of max"
@@ -271,13 +280,25 @@ class OptionsPremiumStrategy(StrategyBase):
                         pnl_source=pnl_source,
                     )
 
-            # 2. Stop loss (close at 200% of credit = net 100% loss)
-            elif not close_reason and estimated_pnl_pct <= -self._stop_loss_pct:
-                close_reason = f"stop_loss: est {estimated_pnl_pct:.0f}% of max"
+            # 2. Stop loss based on spread repricing vs entry credit.
+            elif not close_reason and current_spread_value >= (trade.credit_received * self._stop_loss_multiple):
+                close_reason = (
+                    f"stop_loss: spread_value={current_spread_value:.2f} "
+                    f">= {self._stop_loss_multiple:.1f}x_credit"
+                )
 
-            # 3. Close before market close
-            if not close_reason and minutes_to_close <= self._close_before_minutes:
-                close_reason = "close_before_eod"
+            # 3. Exit before expiry week/day gamma acceleration.
+            if (
+                not close_reason
+                and days_to_expiry is not None
+                and days_to_expiry > 0
+                and days_to_expiry <= self._close_before_expiry_days
+            ):
+                close_reason = f"pre_expiry_{self._close_before_expiry_days}d"
+
+            # 4. Max hold as swing position.
+            if not close_reason and days_held >= self._max_hold_days:
+                close_reason = f"max_hold_{self._max_hold_days}_days"
 
             if close_reason:
                 self._close_trade(trade_key, trade, close_reason)
@@ -291,6 +312,8 @@ class OptionsPremiumStrategy(StrategyBase):
                         "simulated": trade.simulated,
                         "pnl_source": pnl_source,
                         "held_minutes": round(held_minutes, 1),
+                        "days_held": days_held,
+                        "days_to_expiry": days_to_expiry,
                     },
                     timestamp=datetime.now(pytz.UTC),
                 ))
@@ -325,10 +348,8 @@ class OptionsPremiumStrategy(StrategyBase):
             if atr is None or atr <= 0:
                 continue
 
-            # Estimate 1-sigma intraday move
-            sigma = atr * 0.6
-            # For target delta ~14: ~1.1 sigma from current price
-            strike_distance = sigma * 1.1
+            # Swing strikes: target roughly 15-25 delta using ATR distance.
+            strike_distance = max(0.5, atr * self._strike_atr_distance)
             strike_increment = self._get_strike_increment(underlying)
             wing_width = self._normalize_wing_width(self._wing_width, strike_increment)
 
@@ -396,7 +417,19 @@ class OptionsPremiumStrategy(StrategyBase):
             if contracts <= 0:
                 continue
 
-            entry_expiration = et_now.date()
+            entry_expiration = self._find_expiry(
+                underlying,
+                min_dte=self._min_dte,
+                max_dte=self._max_dte,
+            )
+            if entry_expiration is None:
+                self._log.info(
+                    "options_no_valid_expiry",
+                    underlying=underlying,
+                    min_dte=self._min_dte,
+                    max_dte=self._max_dte,
+                )
+                continue
             live_credit_per_contract = self._estimate_live_credit_per_contract(
                 underlying=underlying,
                 short_strike=short_strike,
@@ -499,7 +532,7 @@ class OptionsPremiumStrategy(StrategyBase):
                 max_profit=total_credit,
                 max_loss=total_risk,
                 entry_time=datetime.now(pytz.UTC),
-                expiration=et_now.date() + timedelta(days=self._target_dte),
+                expiration=entry_expiration,
                 simulated=order_result is None,
                 capital_used=capital_needed,
                 trade_id=str(uuid.uuid4()),
@@ -515,6 +548,7 @@ class OptionsPremiumStrategy(StrategyBase):
                 "premium_entry",
                 underlying=underlying,
                 structure=structure,
+                expiration=entry_expiration.isoformat(),
                 short_strike=short_strike,
                 long_strike=long_strike,
                 call_short=call_short,
@@ -594,6 +628,45 @@ class OptionsPremiumStrategy(StrategyBase):
         if ratio < self._min_credit_to_max_loss_ratio:
             return False, ratio, "min_credit_to_max_loss_ratio"
         return True, ratio, ""
+
+    def _find_expiry(self, underlying: str, *, min_dte: int, max_dte: int) -> date | None:
+        """Find the best available expiry between min_dte and max_dte days out."""
+        today = date.today()
+        try:
+            chain = self.data_provider.get_option_chain(underlying)
+        except Exception:
+            return today + timedelta(days=max(1, min_dte))
+        if chain is None or chain.empty or "expiration" not in chain.columns:
+            return today + timedelta(days=max(1, min_dte))
+
+        expiries: list[date] = []
+        for raw in sorted(chain["expiration"].dropna().unique()):
+            parsed: date | None = None
+            if isinstance(raw, date):
+                parsed = raw
+            else:
+                raw_str = str(raw).strip()
+                for fmt in ("%Y-%m-%d", "%Y%m%d"):
+                    try:
+                        parsed = datetime.strptime(raw_str, fmt).date()
+                        break
+                    except ValueError:
+                        continue
+            if parsed is not None and parsed >= today:
+                expiries.append(parsed)
+
+        if not expiries:
+            return None
+
+        for exp in expiries:
+            dte = (exp - today).days
+            if min_dte <= dte <= max_dte:
+                return exp
+
+        for exp in expiries:
+            if (exp - today).days >= min_dte:
+                return exp
+        return None
 
     def _estimate_live_credit_per_contract(
         self,
@@ -1411,7 +1484,6 @@ class OptionsPremiumStrategy(StrategyBase):
                     details=[{"reason": "entry_window_closed"}],
                     candidates=[],
                 ))
-            expiry_time = window_end.astimezone(pytz.UTC)
 
             # VIX proxy check
             vix_level = regime.vix_level if regime and regime.vix_level else None
@@ -1462,10 +1534,17 @@ class OptionsPremiumStrategy(StrategyBase):
                         continue
 
                     bias = self._get_sma5_bias(underlying, current_price)
-                    sigma = atr * 0.6
-                    strike_distance = max(0.5, sigma * 1.1)
+                    strike_distance = max(0.5, atr * self._strike_atr_distance)
                     strike_increment = self._get_strike_increment(underlying)
                     wing_width = self._normalize_wing_width(self._wing_width, strike_increment)
+                    expiry = self._find_expiry(
+                        underlying,
+                        min_dte=self._min_dte,
+                        max_dte=self._max_dte,
+                    )
+                    if expiry is None:
+                        filter_counts["missing_atr_or_price"] += 1
+                        continue
 
                     # Reuse the same structure logic as _scan_entries.
                     if bias == "bullish" or (bias == "neutral" and self._structure == "credit_spread"):
@@ -1641,8 +1720,8 @@ class OptionsPremiumStrategy(StrategyBase):
                         edge_estimate_pct=round(edge_pct, 2),
                         regime_fit=round(regime_fit, 2),
                         catalyst=f"vix_{int(round(vix_level)) if vix_level is not None else 'na'}_{bias}_premium",
-                        time_horizon_minutes=45,
-                        expiry_time=expiry_time,
+                        time_horizon_minutes=0,
+                        expiry_time=None,
                         options_structure=structure,
                         short_strike=round(short_strike, 2),
                         long_strike=round(long_strike, 2),
@@ -1659,6 +1738,9 @@ class OptionsPremiumStrategy(StrategyBase):
                             "adjusted_rr": round(adjusted_rr, 4),
                             "event_day": is_event_day,
                             "has_earnings_today": has_earnings_today,
+                            "expiry": expiry.isoformat(),
+                            "hold_days": self._max_hold_days,
+                            "swing_trade": True,
                         },
                     ))
                     filter_counts["candidate_built"] += 1
@@ -1771,3 +1853,18 @@ class OptionsPremiumStrategy(StrategyBase):
                 call_short_occ_symbol=saved.get("call_short_occ_symbol", ""),
                 call_long_occ_symbol=saved.get("call_long_occ_symbol", ""),
             )
+
+    def close_all_positions(self, reason: str = "") -> int:
+        """Force-close all open premium trades."""
+        closed = 0
+        for trade_key, trade in list(self._trades.items()):
+            self._close_trade(trade_key, trade, reason or "forced_close")
+            if trade_key not in self._trades:
+                closed += 1
+        return closed
+
+    def close_positions_for_eod(self, et_now: datetime) -> int:
+        """Run one explicit EOD management pass."""
+        before = len(self._trades)
+        self._manage_positions(et_now, regime=None)
+        return max(0, before - len(self._trades))

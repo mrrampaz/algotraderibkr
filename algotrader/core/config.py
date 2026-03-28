@@ -35,6 +35,8 @@ class RiskConfig(BaseModel):
     max_drawdown_pct: float = 8.0
     max_gross_exposure_pct: float = 80.0
     max_single_position_pct: float = 5.0
+    max_overnight_exposure_pct: float = 40.0
+    overnight_gap_buffer_pct: float = 5.0
     max_correlated_positions: int = 3
     strategy_daily_loss_limit_pct: float = 1.0
 

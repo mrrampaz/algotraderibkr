@@ -22,7 +22,8 @@ params:
 
   # Targets
   target_rr: 2.0                   # 2:1 reward/risk
-  time_limit_hours: 2              # Close within 2 hours of entry
+  max_hold_days: 2                 # Hold 1-2 days for post-event drift
+  trailing_stop_atr: 1.0
 
   # Instruments
   instruments:

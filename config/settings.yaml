@@ -24,7 +24,9 @@ risk:
   max_daily_loss_pct: 2.0
   max_drawdown_pct: 8.0
   max_gross_exposure_pct: 80.0
-  max_single_position_pct: 5.0
+  max_single_position_pct: 10.0
+  max_overnight_exposure_pct: 40.0
+  overnight_gap_buffer_pct: 5.0
   max_correlated_positions: 3
   strategy_daily_loss_limit_pct: 1.0
 

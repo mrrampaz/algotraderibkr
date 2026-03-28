@@ -25,7 +25,9 @@ params:
   min_divergence_pct: 2.0         # Min spread between best and worst
 
   # Position management
-  rebalance_interval_hours: 4     # Recheck every 4 hours
+  rebalance_check: "daily"        # Recheck at market open each day
+  rebalance_interval_hours: 4     # Legacy fallback if rebalance_check != daily
+  max_hold_days: 5
   stop_pct: 2.0                   # Stop loss per position
   min_notional_per_leg: 2000      # Minimum dollar value per leg to justify commissions
 

@@ -496,6 +496,15 @@ class GapReversalStrategy(StrategyBase):
             gap_pct=trade.gap_pct,
         )
 
+    def close_all_positions(self, reason: str = "") -> int:
+        """Force-close all open gap positions (intraday strategy)."""
+        closed = 0
+        for symbol, trade in list(self._trades.items()):
+            self._close_trade(symbol, trade, reason or "forced_close")
+            if symbol not in self._trades:
+                closed += 1
+        return closed
+
     def _update_trailing_stop(self, trade: GapTrade, current_price: float) -> None:
         """Move stop to breakeven once 50% to target."""
         if trade.direction == "long":
