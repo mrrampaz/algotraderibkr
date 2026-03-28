@@ -492,6 +492,12 @@ class VWAPReversionStrategy(StrategyBase):
                         confidence += 0.10
                     elif regime.regime_type.value in {"trending_up", "trending_down"}:
                         regime_fit = 0.45
+                        # Keep trending mean-reversion selective, but allow only the
+                        # strongest stretches to clear Brain confidence thresholds.
+                        if abs_z >= (effective_min_z_score + 1.0):
+                            confidence += 0.12
+                        elif abs_z >= (effective_min_z_score + 0.5):
+                            confidence += 0.06
 
                 confidence = min(1.0, max(0.0, confidence))
                 risk_pct = (risk_per_share / current_price) * 100.0 if current_price > 0 else 0.0
