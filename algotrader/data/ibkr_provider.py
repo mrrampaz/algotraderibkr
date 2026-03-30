@@ -45,6 +45,14 @@ OPTION_CHAIN_COLUMNS = [
     "vega",
 ]
 
+OPTION_STRIKE_INCREMENTS = {
+    # Snap known ETF option ladders to valid exchange increments when secdef
+    # metadata returns malformed offsets (for example strikes ending in .78).
+    "SPY": 0.5,
+    "QQQ": 0.5,
+    "IWM": 0.5,
+}
+
 
 class IBKRDataProvider:
     """Data provider backed by IBKR via ib_async."""
@@ -87,6 +95,27 @@ class IBKRDataProvider:
         if math.isnan(as_float) or math.isinf(as_float) or as_float == -1:
             return None
         return as_float
+
+    @staticmethod
+    def _snap_to_increment(strike: float, increment: float) -> float:
+        if increment <= 0:
+            increment = 0.5
+        snapped = round(round(strike / increment) * increment, 6)
+        return round(snapped, 2)
+
+    @classmethod
+    def _normalize_option_strikes(cls, underlying: str, strikes: list[float]) -> list[float]:
+        clean = sorted(set(float(s) for s in strikes if s and s > 0))
+        increment = OPTION_STRIKE_INCREMENTS.get(underlying.upper())
+        if increment is None:
+            return clean
+
+        normalized = [
+            cls._snap_to_increment(strike, increment)
+            for strike in clean
+            if strike > 0
+        ]
+        return sorted(set(s for s in normalized if s > 0))
 
     @staticmethod
     def _is_retryable_historical_error(exc: Exception) -> bool:
@@ -767,6 +796,20 @@ class IBKRDataProvider:
         strikes = _parse_strikes(chain)
         if not strikes:
             return empty
+
+        raw_strikes = list(strikes)
+        strikes = self._normalize_option_strikes(underlying, strikes)
+        if not strikes:
+            return empty
+        if strikes != raw_strikes:
+            self._log.info(
+                "ibkr_option_strikes_normalized",
+                underlying=underlying,
+                raw_count=len(raw_strikes),
+                normalized_count=len(strikes),
+                raw_preview=raw_strikes[:4],
+                normalized_preview=strikes[:4],
+            )
 
         # Guard against malformed chain metadata (e.g. 10.01 / 10010.0 strikes for SPY).
         if spot is not None and spot > 0:

@@ -43,6 +43,21 @@ class _DummyLog:
         return None
 
 
+class _NearestExpiryOnlyProvider(StubDataProvider):
+    """Mimic providers that return only the nearest expiry for expiration=None."""
+
+    def get_option_chain(self, underlying, expiration=None):
+        chain = self.option_chains.get(underlying)
+        if chain is None or chain.empty:
+            return pd.DataFrame()
+
+        normalized_dates = pd.to_datetime(chain["expiration"], errors="coerce").dt.date
+        if expiration is None:
+            nearest = min(d for d in normalized_dates.dropna().unique())
+            return chain[normalized_dates == nearest].copy()
+        return chain[normalized_dates == expiration].copy()
+
+
 def test_options_selects_2_5_dte_expiry() -> None:
     provider = StubDataProvider()
     executor = StubExecutor()
@@ -67,6 +82,57 @@ def test_options_selects_2_5_dte_expiry() -> None:
     )
     expiry = strategy._find_expiry("SPY", min_dte=2, max_dte=5)
     assert expiry == today + timedelta(days=3)
+
+
+def test_options_find_expiry_probes_window_when_default_chain_is_nearest_only() -> None:
+    provider = _NearestExpiryOnlyProvider()
+    executor = StubExecutor()
+    today = date.today()
+    provider.set_option_chain(
+        "SPY",
+        pd.DataFrame(
+            [
+                {"expiration": today, "strike": 500, "type": "put"},
+                {"expiration": today + timedelta(days=3), "strike": 500, "type": "put"},
+            ]
+        ),
+    )
+
+    strategy = OptionsPremiumStrategy(
+        name="options_premium",
+        config=StrategyConfig(params={"min_dte": 2, "max_dte": 5}),
+        data_provider=provider,
+        executor=executor,
+        event_bus=EventBus(),
+    )
+
+    expiry = strategy._find_expiry("SPY", min_dte=2, max_dte=5)
+    assert expiry == today + timedelta(days=3)
+
+
+def test_options_find_expiry_falls_back_to_nearest_when_window_unavailable() -> None:
+    provider = _NearestExpiryOnlyProvider()
+    executor = StubExecutor()
+    today = date.today()
+    provider.set_option_chain(
+        "SPY",
+        pd.DataFrame(
+            [
+                {"expiration": today, "strike": 500, "type": "put"},
+            ]
+        ),
+    )
+
+    strategy = OptionsPremiumStrategy(
+        name="options_premium",
+        config=StrategyConfig(params={"min_dte": 2, "max_dte": 5}),
+        data_provider=provider,
+        executor=executor,
+        event_bus=EventBus(),
+    )
+
+    expiry = strategy._find_expiry("SPY", min_dte=2, max_dte=5)
+    assert expiry == today
 
 
 def test_options_closes_1_day_before_expiry() -> None:

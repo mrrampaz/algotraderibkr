@@ -632,31 +632,38 @@ class OptionsPremiumStrategy(StrategyBase):
     def _find_expiry(self, underlying: str, *, min_dte: int, max_dte: int) -> date | None:
         """Find the best available expiry between min_dte and max_dte days out."""
         today = date.today()
+        min_dte = max(1, int(min_dte))
+        max_dte = max(min_dte, int(max_dte))
+
+        def _parse_expiries(chain_df: Any) -> list[date]:
+            if chain_df is None or chain_df.empty or "expiration" not in chain_df.columns:
+                return []
+
+            expiries: list[date] = []
+            for raw in sorted(chain_df["expiration"].dropna().unique()):
+                parsed: date | None = None
+                if isinstance(raw, datetime):
+                    parsed = raw.date()
+                elif isinstance(raw, date):
+                    parsed = raw
+                else:
+                    raw_str = str(raw).strip()
+                    for fmt in ("%Y-%m-%d", "%Y%m%d"):
+                        try:
+                            parsed = datetime.strptime(raw_str, fmt).date()
+                            break
+                        except ValueError:
+                            continue
+                if parsed is not None and parsed >= today:
+                    expiries.append(parsed)
+            return sorted(set(expiries))
+
         try:
             chain = self.data_provider.get_option_chain(underlying)
         except Exception:
-            return today + timedelta(days=max(1, min_dte))
-        if chain is None or chain.empty or "expiration" not in chain.columns:
-            return today + timedelta(days=max(1, min_dte))
+            chain = None
 
-        expiries: list[date] = []
-        for raw in sorted(chain["expiration"].dropna().unique()):
-            parsed: date | None = None
-            if isinstance(raw, date):
-                parsed = raw
-            else:
-                raw_str = str(raw).strip()
-                for fmt in ("%Y-%m-%d", "%Y%m%d"):
-                    try:
-                        parsed = datetime.strptime(raw_str, fmt).date()
-                        break
-                    except ValueError:
-                        continue
-            if parsed is not None and parsed >= today:
-                expiries.append(parsed)
-
-        if not expiries:
-            return None
+        expiries = _parse_expiries(chain)
 
         for exp in expiries:
             dte = (exp - today).days
@@ -666,7 +673,21 @@ class OptionsPremiumStrategy(StrategyBase):
         for exp in expiries:
             if (exp - today).days >= min_dte:
                 return exp
-        return None
+
+        for dte in range(min_dte, max_dte + 1):
+            candidate = today + timedelta(days=dte)
+            if candidate.weekday() >= 5:
+                continue
+            try:
+                probe = self.data_provider.get_option_chain(underlying, expiration=candidate)
+            except Exception:
+                continue
+            if probe is not None and not probe.empty:
+                return candidate
+
+        if expiries:
+            return expiries[0]
+        return today + timedelta(days=min_dte)
 
     def _estimate_live_credit_per_contract(
         self,
@@ -960,7 +981,7 @@ class OptionsPremiumStrategy(StrategyBase):
         either because the executor doesn't support MLEG or the lookup failed.
         """
         if not hasattr(self.executor, "submit_mleg_order"):
-            # Executor (e.g. IBKR stub) doesn't implement MLEG yet — simulate
+            # Executor (e.g. IBKR stub) doesn't implement MLEG yet - simulate
             self._log.info("options_executor_no_mleg", underlying=underlying)
             return None
 
@@ -1029,7 +1050,7 @@ class OptionsPremiumStrategy(StrategyBase):
                     {"symbol": call_long_occ,  "ratio_qty": 1, "side": OrderSide.BUY,  "position_intent": "buy_to_open"},
                 ])
             else:
-                # Can't complete iron condor — fall back to the put spread only
+                # Can't complete iron condor - fall back to the put spread only
                 self._log.warning(
                     "iron_condor_call_lookup_failed",
                     underlying=underlying,
@@ -1087,8 +1108,8 @@ class OptionsPremiumStrategy(StrategyBase):
         """Submit a closing MLEG order to buy back an open credit spread.
 
         Reverses each opening leg:
-          sell-to-open short → buy-to-close
-          buy-to-open long   → sell-to-close
+          sell-to-open short -> buy-to-close
+          buy-to-open long   -> sell-to-close
 
         Returns True if the closing order was submitted, False otherwise.
         """

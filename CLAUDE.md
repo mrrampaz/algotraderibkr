@@ -88,6 +88,17 @@ Cash is the default when no candidate clears thresholds.
    - `options_premium` enforces a hard contract cap using `exercise_exposure_cap_pct` (default 20%).
    - Formula: `floor(equity * cap_pct / (strike * 100))`, minimum 1 contract.
 
+#### 2026-03-30 (Options chain + expiry hardening)
+1. IBKR option strike normalization:
+   - Root cause: malformed secdef strikes for ETF chains (for example `559.78`) generated repeated `Error 200` / `Unknown contract` failures.
+   - Fix: `IBKRDataProvider` now snaps SPY/QQQ/IWM strikes to valid ladder increments before contract qualification and logs `ibkr_option_strikes_normalized`.
+2. Expiry selection robustness in options strategy:
+   - Root cause: some providers return only nearest expiry when `expiration=None`, which could bypass configured `min_dte` / `max_dte` intent.
+   - Fix: `_find_expiry()` now probes explicit dates across the configured DTE window, then falls back safely to nearest known expiry (or `today + min_dte` if none known).
+3. Regression tests added:
+   - `tests/unit/test_ibkr_provider.py` validates ETF strike normalization behavior.
+   - `tests/unit/test_swing_trading.py` adds nearest-expiry provider scenarios to verify `_find_expiry()` probing and fallback behavior.
+
 ### Strategy Toolbox
 All 7 strategies emit concrete `TradeCandidate` objects (top-ranked, max 3 per strategy).
 
