@@ -474,6 +474,9 @@ class Orchestrator:
             self._log.warning("risk_killed_skipping_cycle")
             return
 
+        if self._needs_morning_position_review():
+            self._morning_position_review()
+
         # Update regime detection
         try:
             self._current_regime = self._regime_detector.detect()
@@ -482,9 +485,6 @@ class Orchestrator:
 
         # Check pending orders
         self._order_manager.check_orders()
-
-        if self._needs_morning_position_review():
-            self._morning_position_review()
 
         # Daily Brain: open decision + mid-day review
         if self._use_brain and self._brain and self._current_regime:
@@ -1049,6 +1049,32 @@ class Orchestrator:
 
     def _morning_position_review(self) -> None:
         """Review overnight positions after market open."""
+        et_now = datetime.now(pytz.timezone("America/New_York"))
+
+        # Critical first step: close any strategy positions already through stop levels.
+        gap_stop_closed = 0
+        for strategy_name, strategy in self._strategies.items():
+            review_hook = getattr(strategy, "review_positions_at_open", None)
+            if not callable(review_hook):
+                continue
+
+            try:
+                closed = review_hook(et_now=et_now)
+            except TypeError:
+                closed = review_hook()
+            except Exception:
+                self._log.exception("morning_gap_stop_review_failed", strategy=strategy_name)
+                continue
+
+            closed_count = int(closed or 0)
+            if closed_count > 0:
+                self._log.warning(
+                    "morning_gap_stop_positions_closed",
+                    strategy=strategy_name,
+                    closed=closed_count,
+                )
+            gap_stop_closed += max(0, closed_count)
+
         try:
             positions = self._executor.get_positions()
         except Exception:
@@ -1084,6 +1110,7 @@ class Orchestrator:
             self._log.info(
                 "overnight_risk_summary",
                 positions=reviewed,
+                gap_stop_closed=gap_stop_closed,
                 total_exposure=round(float(overnight.get("total_exposure", 0.0)), 2),
                 overnight_gap_risk=round(float(overnight.get("overnight_gap_risk", 0.0)), 2),
                 exposure_pct=round(float(overnight.get("exposure_pct", 0.0)), 2),
@@ -1091,9 +1118,7 @@ class Orchestrator:
         except Exception:
             self._log.debug("overnight_risk_summary_failed")
 
-        self._last_morning_position_review = datetime.now(
-            pytz.timezone("America/New_York"),
-        ).date()
+        self._last_morning_position_review = et_now.date()
 
     def _is_overnight_exposure_limited(self) -> bool:
         """Return True when existing deployed capital breaches overnight limit."""

@@ -175,6 +175,162 @@ def test_options_closes_1_day_before_expiry() -> None:
     assert "pre_expiry_1d" in signals[0].reason
 
 
+def test_qqq_strike_rounding_all_paths() -> None:
+    provider = StubDataProvider()
+    executor = StubExecutor()
+    provider.set_price("QQQ", 575.22)
+    provider.set_bars("QQQ", "1Day", _bars_from_closes([560 + i for i in range(25)], 2_000_000))
+
+    base_params = {
+        "underlyings": ["QQQ"],
+        "entry_start_hour": 0,
+        "entry_start_minute": 0,
+        "entry_end_hour": 23,
+        "entry_end_minute": 59,
+        "min_vix_proxy": 0.0,
+        "strike_atr_distance": 1.0,
+    }
+
+    entry_strategy = OptionsPremiumStrategy(
+        name="options_premium",
+        config=StrategyConfig(params=base_params),
+        data_provider=provider,
+        executor=executor,
+        event_bus=EventBus(),
+    )
+    entry_strategy.set_capital(100000.0)
+    entry_strategy._get_atr = lambda _symbol: 14.44
+    entry_strategy._get_sma5_bias = lambda _symbol, _price: "bullish"
+
+    entry_signals = entry_strategy._scan_entries(
+        datetime.now(pytz.timezone("America/New_York")),
+        _regime(RegimeType.HIGH_VOL, vix=24.0),
+    )
+    assert entry_signals
+    entry_trade = entry_strategy._trades["QQQ"]
+    assert entry_trade.short_strike == 560.0
+    assert float(entry_trade.short_strike).is_integer()
+
+    assess_strategy = OptionsPremiumStrategy(
+        name="options_premium",
+        config=StrategyConfig(params=base_params),
+        data_provider=provider,
+        executor=executor,
+        event_bus=EventBus(),
+    )
+    assess_strategy.set_capital(100000.0)
+    assess_strategy._get_atr = lambda _symbol: 14.44
+    assess_strategy._get_sma5_bias = lambda _symbol, _price: "bearish"
+
+    assessment = assess_strategy.assess_opportunities(_regime(RegimeType.HIGH_VOL, vix=24.0))
+    assert assessment.candidates
+    candidate = assessment.candidates[0]
+    assert candidate.short_strike == 590.0
+    assert float(candidate.short_strike).is_integer()
+
+    condor_strategy = OptionsPremiumStrategy(
+        name="options_premium",
+        config=StrategyConfig(params={**base_params, "structure": "iron_condor"}),
+        data_provider=provider,
+        executor=executor,
+        event_bus=EventBus(),
+    )
+    condor_strategy.set_capital(100000.0)
+    condor_strategy._get_atr = lambda _symbol: 14.44
+    condor_strategy._get_sma5_bias = lambda _symbol, _price: "neutral"
+
+    condor_signals = condor_strategy._scan_entries(
+        datetime.now(pytz.timezone("America/New_York")),
+        _regime(RegimeType.HIGH_VOL, vix=24.0),
+    )
+    assert condor_signals
+    condor_trade = condor_strategy._trades["QQQ"]
+    assert condor_trade.short_strike == 560.0
+    assert condor_trade.call_short_strike == 590.0
+    assert float(condor_trade.short_strike).is_integer()
+    assert float(condor_trade.call_short_strike).is_integer()
+
+
+def test_morning_gap_stop_closes_breached_position() -> None:
+    provider = StubDataProvider()
+    provider.set_price("QQQ", 600.0)
+    strategy = OptionsPremiumStrategy(
+        name="options_premium",
+        config=StrategyConfig(params={"stop_loss_multiple": 3.0}),
+        data_provider=provider,
+        executor=StubExecutor(),
+        event_bus=EventBus(),
+    )
+    strategy.set_capital(100000.0)
+    strategy._trades["QQQ"] = PremiumTrade(
+        underlying="QQQ",
+        structure="call_spread",
+        short_strike=579.0,
+        long_strike=584.0,
+        contracts=1,
+        credit_received=66.0,
+        max_profit=66.0,
+        max_loss=434.0,
+        entry_time=datetime.now(pytz.UTC) - timedelta(days=1),
+        expiration=date.today() + timedelta(days=1),
+        simulated=True,
+        capital_used=434.0,
+        trade_id="qqq_gap_stop",
+    )
+
+    class _ReviewExecutor:
+        def get_positions(self):
+            return []
+
+    class _RiskManager:
+        @staticmethod
+        def compute_overnight_risk(_positions):
+            return {
+                "total_exposure": 0.0,
+                "overnight_gap_risk": 0.0,
+                "exposure_pct": 0.0,
+            }
+
+    orch = Orchestrator.__new__(Orchestrator)
+    orch._executor = _ReviewExecutor()
+    orch._risk_manager = _RiskManager()
+    orch._strategies = {"options_premium": strategy}
+    orch._log = _DummyLog()
+    orch._last_morning_position_review = None
+
+    orch._morning_position_review()
+
+    assert "QQQ" not in strategy._trades
+
+
+def test_options_atr_uses_daily_bars() -> None:
+    class _AtrTrackingProvider(StubDataProvider):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls: list[tuple[str, str, int]] = []
+
+        def get_bars(self, symbol, timeframe, limit=100, start=None, end=None):
+            self.calls.append((symbol, timeframe, limit))
+            return super().get_bars(symbol, timeframe, limit=limit, start=start, end=end)
+
+    provider = _AtrTrackingProvider()
+    provider.set_bars("QQQ", "1Day", _bars_from_closes([560 + i for i in range(25)], 2_000_000))
+
+    strategy = OptionsPremiumStrategy(
+        name="options_premium",
+        config=StrategyConfig(params={}),
+        data_provider=provider,
+        executor=StubExecutor(),
+        event_bus=EventBus(),
+    )
+
+    atr = strategy._get_atr("QQQ")
+    assert atr is not None
+    assert provider.calls
+    assert provider.calls[0][1] == "1Day"
+    assert all(call[1] not in {"1Min", "5Min", "15Min", "30Min", "1Hour"} for call in provider.calls)
+
+
 def test_momentum_trailing_stop() -> None:
     provider = StubDataProvider()
     executor = StubExecutor()

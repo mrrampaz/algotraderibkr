@@ -241,22 +241,25 @@ class OptionsPremiumStrategy(StrategyBase):
             ):
                 close_reason = f"prevent_exercise_{self._expiry_risk_close_minutes}m"
 
-            # Get current underlying price
             current_price = self._get_current_price(trade.underlying)
-            if current_price is None:
-                continue
 
             # Prefer live options marks when available; fallback to an underlying proxy.
             live_pnl = self._estimate_live_option_pnl(trade)
             if live_pnl is not None:
                 estimated_pnl_pct = live_pnl["pnl_pct"]
                 pnl_source = "options_mark"
-                current_spread_value = max(0.0, float(live_pnl.get("close_debit", 0.0)))
-            else:
+            elif current_price is not None and current_price > 0:
                 estimated_pnl_pct = self._estimate_pnl_pct(trade, current_price)
                 pnl_source = "underlying_proxy"
-                modeled_pnl = trade.max_profit * (estimated_pnl_pct / 100.0)
-                current_spread_value = max(0.0, trade.credit_received - modeled_pnl)
+            else:
+                estimated_pnl_pct = 0.0
+                pnl_source = "no_mark"
+
+            current_spread_value = self._get_current_spread_value(
+                trade,
+                live_pnl=live_pnl,
+                current_price=current_price,
+            )
 
             held_minutes = 0.0
             if trade.entry_time is not None:
@@ -281,11 +284,13 @@ class OptionsPremiumStrategy(StrategyBase):
                     )
 
             # 2. Stop loss based on spread repricing vs entry credit.
-            elif not close_reason and current_spread_value >= (trade.credit_received * self._stop_loss_multiple):
-                close_reason = (
-                    f"stop_loss: spread_value={current_spread_value:.2f} "
-                    f">= {self._stop_loss_multiple:.1f}x_credit"
+            if not close_reason:
+                stop_hit, stop_reason, _, _ = self._check_stop_loss(
+                    trade,
+                    current_spread_value=current_spread_value,
                 )
+                if stop_hit:
+                    close_reason = stop_reason
 
             # 3. Exit before expiry week/day gamma acceleration.
             if (
@@ -357,17 +362,17 @@ class OptionsPremiumStrategy(StrategyBase):
             if bias == "bullish" or (bias == "neutral" and self._structure == "credit_spread"):
                 structure = "put_spread"
                 raw_short_strike = current_price - strike_distance
-                short_strike = self._round_strike(raw_short_strike, strike_increment, mode="down")
+                short_strike = self._round_strike(raw_short_strike, underlying, direction="down")
                 long_strike = short_strike - wing_width
             elif bias == "bearish":
                 structure = "call_spread"
                 raw_short_strike = current_price + strike_distance
-                short_strike = self._round_strike(raw_short_strike, strike_increment, mode="up")
+                short_strike = self._round_strike(raw_short_strike, underlying, direction="up")
                 long_strike = short_strike + wing_width
             elif bias == "neutral":
                 structure = "iron_condor"
                 raw_put_short_strike = current_price - strike_distance
-                short_strike = self._round_strike(raw_put_short_strike, strike_increment, mode="down")
+                short_strike = self._round_strike(raw_put_short_strike, underlying, direction="down")
                 long_strike = short_strike - wing_width
             else:
                 continue
@@ -380,7 +385,7 @@ class OptionsPremiumStrategy(StrategyBase):
             call_long = None
             if structure == "iron_condor":
                 raw_call_short_strike = current_price + strike_distance
-                call_short = self._round_strike(raw_call_short_strike, strike_increment, mode="up")
+                call_short = self._round_strike(raw_call_short_strike, underlying, direction="up")
                 call_long = call_short + wing_width
                 estimated_credit_per_contract *= 2
             max_loss_per_contract = max(1.0, spread_width - estimated_credit_per_contract)
@@ -593,14 +598,14 @@ class OptionsPremiumStrategy(StrategyBase):
         units = max(1, units)
         return round(units * increment, 6)
 
-    @staticmethod
-    def _round_strike(strike: float, increment: float, *, mode: str) -> float:
+    def _round_strike(self, raw_strike: float, underlying: str, *, direction: str = "down") -> float:
+        increment = self._get_strike_increment(underlying)
         if increment <= 0:
             increment = 1.0
-        scaled = strike / increment
-        if mode == "down":
+        scaled = float(raw_strike) / increment
+        if direction == "down":
             rounded = math.floor(scaled + 1e-9)
-        elif mode == "up":
+        elif direction == "up":
             rounded = math.ceil(scaled - 1e-9)
         else:
             rounded = round(scaled)
@@ -809,14 +814,25 @@ class OptionsPremiumStrategy(StrategyBase):
             return last
         return None
 
+    def _get_daily_bars(self, symbol: str, limit: int) -> Any | None:
+        """Fetch daily bars with a fallback timeframe alias for provider quirks."""
+        for timeframe in ("1Day", "1 day"):
+            try:
+                bars = self.data_provider.get_bars(symbol, timeframe, limit)
+            except Exception:
+                continue
+            if bars is not None and not bars.empty:
+                return bars
+        return None
+
     def _get_sma5_bias(self, underlying: str, current_price: float) -> str:
         """Determine directional bias using SMA5 contrarian filter."""
         if not self._use_sma5_filter:
             return "neutral"
 
         try:
-            bars = self.data_provider.get_bars(underlying, "1Day", 10)
-            if bars.empty or len(bars) < 5:
+            bars = self._get_daily_bars(underlying, 10)
+            if bars is None or len(bars) < 5:
                 return "neutral"
 
             sma5 = float(bars["close"].iloc[-5:].mean())
@@ -831,10 +847,10 @@ class OptionsPremiumStrategy(StrategyBase):
             return "neutral"
 
     def _get_atr(self, symbol: str) -> float | None:
-        """Get ATR(14) for a symbol."""
+        """Get ATR(14) from daily bars for swing strike placement."""
         try:
-            bars = self.data_provider.get_bars(symbol, "1Day", 20)
-            if bars.empty or len(bars) < 15:
+            bars = self._get_daily_bars(symbol, 20)
+            if bars is None or len(bars) < 15:
                 return None
 
             highs = bars["high"].values
@@ -956,6 +972,105 @@ class OptionsPremiumStrategy(StrategyBase):
             "entry_credit": entry_credit,
             "close_debit": close_debit,
         }
+
+    def _get_live_close_debit(self, trade: PremiumTrade, *, positions: list[dict] | None = None) -> float | None:
+        if not hasattr(self.executor, "get_option_positions"):
+            return None
+
+        if positions is None:
+            try:
+                positions = self.executor.get_option_positions()
+            except Exception:
+                return None
+
+        if not positions:
+            return None
+
+        leg_symbols = [
+            self._normalize_option_local_symbol(trade.short_occ_symbol),
+            self._normalize_option_local_symbol(trade.long_occ_symbol),
+        ]
+        if trade.call_short_occ_symbol and trade.call_long_occ_symbol:
+            leg_symbols.extend([
+                self._normalize_option_local_symbol(trade.call_short_occ_symbol),
+                self._normalize_option_local_symbol(trade.call_long_occ_symbol),
+            ])
+        if any(not s for s in leg_symbols):
+            return None
+
+        by_symbol = {
+            self._normalize_option_local_symbol(pos.get("local_symbol")): pos
+            for pos in positions
+        }
+
+        close_debit = 0.0
+        for symbol in leg_symbols:
+            pos = by_symbol.get(symbol)
+            if pos is None:
+                return None
+
+            qty = float(pos.get("qty", 0.0))
+            mark_price = float(pos.get("market_price", 0.0))
+            if qty == 0 or mark_price <= 0:
+                return None
+
+            close_debit += (-qty) * (mark_price * 100.0)
+
+        return max(0.0, close_debit)
+
+    def _get_current_spread_value(
+        self,
+        trade: PremiumTrade,
+        *,
+        live_pnl: dict[str, float] | None = None,
+        current_price: float | None = None,
+    ) -> float | None:
+        if live_pnl is not None:
+            return max(0.0, float(live_pnl.get("close_debit", 0.0)))
+
+        live_close_debit = self._get_live_close_debit(trade)
+        if live_close_debit is not None:
+            return live_close_debit
+
+        if current_price is None:
+            current_price = self._get_current_price(trade.underlying)
+        if current_price is None or current_price <= 0:
+            return None
+
+        estimated_pnl_pct = self._estimate_pnl_pct(trade, current_price)
+        modeled_pnl = trade.max_profit * (estimated_pnl_pct / 100.0)
+        return max(0.0, trade.credit_received - modeled_pnl)
+
+    def _check_stop_loss(
+        self,
+        trade: PremiumTrade,
+        *,
+        current_spread_value: float | None = None,
+    ) -> tuple[bool, str, float | None, float]:
+        stop_value = max(0.0, float(trade.credit_received) * self._stop_loss_multiple)
+        if stop_value <= 0:
+            return False, "", current_spread_value, stop_value
+
+        if current_spread_value is None:
+            current_spread_value = self._get_current_spread_value(trade)
+
+        if current_spread_value is None:
+            self._log.warning(
+                "stop_check_no_mark",
+                underlying=trade.underlying,
+                structure=trade.structure,
+                reason="current_spread_value_unavailable",
+            )
+            return False, "", None, stop_value
+
+        if current_spread_value >= stop_value:
+            reason = (
+                f"stop_loss: spread_value={current_spread_value:.2f} "
+                f">= {self._stop_loss_multiple:.1f}x_credit={stop_value:.2f}"
+            )
+            return True, reason, current_spread_value, stop_value
+
+        return False, "", current_spread_value, stop_value
 
     def _submit_credit_spread(
         self,
@@ -1571,7 +1686,7 @@ class OptionsPremiumStrategy(StrategyBase):
                     if bias == "bullish" or (bias == "neutral" and self._structure == "credit_spread"):
                         structure = "put_spread"
                         raw_short_strike = current_price - strike_distance
-                        short_strike = self._round_strike(raw_short_strike, strike_increment, mode="down")
+                        short_strike = self._round_strike(raw_short_strike, underlying, direction="down")
                         long_strike = short_strike - wing_width
                         call_short = 0.0
                         call_long = 0.0
@@ -1580,7 +1695,7 @@ class OptionsPremiumStrategy(StrategyBase):
                     elif bias == "bearish":
                         structure = "call_spread"
                         raw_short_strike = current_price + strike_distance
-                        short_strike = self._round_strike(raw_short_strike, strike_increment, mode="up")
+                        short_strike = self._round_strike(raw_short_strike, underlying, direction="up")
                         long_strike = short_strike + wing_width
                         call_short = 0.0
                         call_long = 0.0
@@ -1589,10 +1704,10 @@ class OptionsPremiumStrategy(StrategyBase):
                     else:
                         structure = "iron_condor"
                         raw_put_short_strike = current_price - strike_distance
-                        short_strike = self._round_strike(raw_put_short_strike, strike_increment, mode="down")
+                        short_strike = self._round_strike(raw_put_short_strike, underlying, direction="down")
                         long_strike = short_strike - wing_width
                         raw_call_short_strike = current_price + strike_distance
-                        call_short = self._round_strike(raw_call_short_strike, strike_increment, mode="up")
+                        call_short = self._round_strike(raw_call_short_strike, underlying, direction="up")
                         call_long = call_short + wing_width
                         direction = "neutral"
                         candidate_type = CandidateType.IRON_CONDOR
@@ -1874,6 +1989,50 @@ class OptionsPremiumStrategy(StrategyBase):
                 call_short_occ_symbol=saved.get("call_short_occ_symbol", ""),
                 call_long_occ_symbol=saved.get("call_long_occ_symbol", ""),
             )
+
+    def review_positions_at_open(self, et_now: datetime | None = None) -> int:
+        """Run an immediate gap-stop review before new assessments begin."""
+        if et_now is None:
+            et_now = datetime.now(ET)
+
+        closed = 0
+        for trade_key, trade in list(self._trades.items()):
+            spread_value = self._get_current_spread_value(trade)
+            stop_hit, stop_reason, current_spread_value, stop_value = self._check_stop_loss(
+                trade,
+                current_spread_value=spread_value,
+            )
+
+            if stop_hit:
+                gap_severity = None
+                if current_spread_value is not None and stop_value > 0:
+                    gap_severity = current_spread_value / stop_value
+                self._log.warning(
+                    "morning_gap_stop_triggered",
+                    underlying=trade.underlying,
+                    structure=trade.structure,
+                    entry_credit=round(trade.credit_received, 2),
+                    stop_value=round(stop_value, 2),
+                    current_spread_value=round(current_spread_value, 2) if current_spread_value is not None else None,
+                    gap_severity=round(gap_severity, 2) if gap_severity is not None else None,
+                )
+                self._close_trade(trade_key, trade, f"morning_gap_stop: {stop_reason}")
+                closed += 1
+                continue
+
+            days_held = 0
+            if trade.entry_time is not None:
+                days_held = max(0, (et_now.date() - trade.entry_time.astimezone(ET).date()).days)
+            self._log.info(
+                "morning_position_ok",
+                underlying=trade.underlying,
+                structure=trade.structure,
+                days_held=days_held,
+                stop_value=round(stop_value, 2),
+                current_spread_value=round(current_spread_value, 2) if current_spread_value is not None else None,
+            )
+
+        return closed
 
     def close_all_positions(self, reason: str = "") -> int:
         """Force-close all open premium trades."""

@@ -253,6 +253,11 @@ class StrategyBase(ABC):
         """Optional orchestrator hook for selective end-of-day closes."""
         return 0
 
+    def review_positions_at_open(self, et_now: datetime | None = None) -> int:
+        """Optional orchestrator hook for immediate post-open overnight risk checks."""
+        return 0
+
+
     # ── Status ────────────────────────────────────────────────────────
 
     def get_status(self) -> StrategyStatus:
