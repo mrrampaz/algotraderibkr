@@ -187,6 +187,10 @@ class Orchestrator:
                         options_min_confidence=brain_cfg.options_min_confidence,
                         options_min_risk_reward=brain_cfg.options_min_risk_reward,
                         options_min_edge_pct=brain_cfg.options_min_edge_pct,
+                        strategy_threshold_overrides={
+                            name: override.model_dump(exclude_none=True)
+                            for name, override in brain_cfg.strategy_overrides.items()
+                        },
                         max_daily_trades=brain_cfg.max_daily_trades,
                         max_capital_per_trade_pct=brain_cfg.max_capital_per_trade_pct,
                         max_daily_risk_pct=brain_cfg.max_daily_risk_pct,

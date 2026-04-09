@@ -151,6 +151,7 @@ class DailyBrain:
         options_min_confidence: float = 0.55,
         options_min_risk_reward: float = 0.3,
         options_min_edge_pct: float = 0.1,
+        strategy_threshold_overrides: dict[str, dict[str, float]] | None = None,
         max_daily_trades: int = 5,
         max_capital_per_trade_pct: float = 20.0,
         max_daily_risk_pct: float = 2.0,
@@ -181,6 +182,9 @@ class DailyBrain:
         self._options_min_confidence = options_min_confidence
         self._options_min_risk_reward = options_min_risk_reward
         self._options_min_edge_pct = options_min_edge_pct
+        self._strategy_threshold_overrides = self._normalize_strategy_threshold_overrides(
+            strategy_threshold_overrides or {},
+        )
         self._max_daily_trades = max_daily_trades
         self._max_capital_per_trade_pct = max_capital_per_trade_pct
         self._absolute_max_daily_risk_pct = 6.0
@@ -229,6 +233,7 @@ class DailyBrain:
             options_min_confidence=options_min_confidence,
             options_min_rr=options_min_risk_reward,
             options_min_edge=options_min_edge_pct,
+            strategy_override_count=len(self._strategy_threshold_overrides),
             max_daily_trades=max_daily_trades,
             max_daily_risk_pct=self._max_daily_risk_pct,
             adaptive_sizing=self._adaptive_sizing,
@@ -652,20 +657,62 @@ class DailyBrain:
 
         return round(max(0.0, min(1.0, base_score)), 4)
 
+    def _normalize_strategy_threshold_overrides(
+        self,
+        overrides: dict[str, dict[str, float]],
+    ) -> dict[str, dict[str, float]]:
+        normalized: dict[str, dict[str, float]] = {}
+        for strategy_name, raw in (overrides or {}).items():
+            if not isinstance(raw, dict):
+                continue
+
+            strategy_key = str(strategy_name or "").strip()
+            if not strategy_key:
+                continue
+
+            parsed: dict[str, float] = {}
+            if "min_confidence" in raw:
+                parsed["min_confidence"] = float(raw["min_confidence"])
+            if "min_rr" in raw:
+                parsed["min_rr"] = float(raw["min_rr"])
+            elif "min_risk_reward" in raw:
+                parsed["min_rr"] = float(raw["min_risk_reward"])
+            if "min_edge" in raw:
+                parsed["min_edge"] = float(raw["min_edge"])
+            elif "min_edge_pct" in raw:
+                parsed["min_edge"] = float(raw["min_edge_pct"])
+
+            if parsed:
+                normalized[strategy_key] = parsed
+        return normalized
+
+    def _scaled_confidence_threshold(self, base: float, min_confidence: float) -> float:
+        if self._min_confidence <= 0:
+            return max(0.0, min(1.0, base))
+        midday_scale = max(0.5, min(2.0, min_confidence / self._min_confidence))
+        return max(0.0, min(1.0, base * midday_scale))
+
     def _required_confidence(self, candidate: TradeCandidate, min_confidence: float) -> float:
+        override = self._strategy_threshold_overrides.get(candidate.strategy_name, {})
+        if "min_confidence" in override:
+            return self._scaled_confidence_threshold(override["min_confidence"], min_confidence)
+
         if not candidate.is_options:
             return min_confidence
-        if self._min_confidence <= 0:
-            return self._options_min_confidence
-        midday_scale = max(0.5, min(2.0, min_confidence / self._min_confidence))
-        return min(1.0, self._options_min_confidence * midday_scale)
+        return self._scaled_confidence_threshold(self._options_min_confidence, min_confidence)
 
     def _required_rr(self, candidate: TradeCandidate) -> float:
+        override = self._strategy_threshold_overrides.get(candidate.strategy_name, {})
+        if "min_rr" in override:
+            return float(override["min_rr"])
         if candidate.is_options:
             return self._options_min_risk_reward
         return self._min_risk_reward
 
     def _required_edge(self, candidate: TradeCandidate) -> float:
+        override = self._strategy_threshold_overrides.get(candidate.strategy_name, {})
+        if "min_edge" in override:
+            return float(override["min_edge"])
         if candidate.is_options:
             return self._options_min_edge_pct
         return self._min_edge_pct

@@ -60,6 +60,35 @@ strategy_selector:
     options_min_confidence: 0.55
     options_min_risk_reward: 0.3
     options_min_edge_pct: 0.1
+    strategy_overrides:
+      options_premium:
+        min_confidence: 0.55
+        min_rr: 0.3
+        min_edge: 0.10
+      momentum:
+        min_confidence: 0.40
+        min_rr: 2.0
+        min_edge: 0.15
+      vwap_reversion:
+        min_confidence: 0.35
+        min_rr: 1.5
+        min_edge: 0.15
+      gap_reversal:
+        min_confidence: 0.45
+        min_rr: 0.5
+        min_edge: 0.10
+      pairs_trading:
+        min_confidence: 0.50
+        min_rr: 1.0
+        min_edge: 0.20
+      sector_rotation:
+        min_confidence: 0.45
+        min_rr: 1.0
+        min_edge: 0.15
+      event_driven:
+        min_confidence: 0.55
+        min_rr: 1.5
+        min_edge: 0.25
     max_daily_trades: 5
     max_capital_per_trade_pct: 25.0
     max_daily_risk_pct: 6.0
@@ -152,3 +181,4 @@ strategies:
     capital_allocation_pct: 8.0
     max_positions: 2
     params: {}
+

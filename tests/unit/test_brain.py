@@ -110,6 +110,7 @@ def _brain(**kwargs) -> DailyBrain:
         min_confidence=kwargs.pop("min_confidence", 0.60),
         min_risk_reward=kwargs.pop("min_risk_reward", 1.5),
         min_edge_pct=kwargs.pop("min_edge_pct", 0.3),
+        strategy_threshold_overrides=kwargs.pop("strategy_threshold_overrides", None),
         max_daily_trades=kwargs.pop("max_daily_trades", 5),
         max_capital_per_trade_pct=kwargs.pop("max_capital_per_trade_pct", 20.0),
         max_daily_risk_pct=kwargs.pop("max_daily_risk_pct", 2.0),
@@ -443,3 +444,49 @@ def test_decide_applies_adaptive_options_contract_override() -> None:
     selected = decision.selected_trades[0]
     assert selected.position_size == 5
     assert selected.risk_amount == 2375.0
+
+def test_brain_strategy_specific_thresholds() -> None:
+    brain = _brain(
+        strategy_threshold_overrides={
+            "momentum": {"min_confidence": 0.40, "min_rr": 2.0, "min_edge": 0.15},
+            "gap_reversal": {"min_confidence": 0.45, "min_rr": 0.5, "min_edge": 0.10},
+        }
+    )
+
+    momentum = _candidate(symbol="MOMO", strategy_name="momentum")
+    gap = _candidate(symbol="GAP", strategy_name="gap_reversal")
+
+    assert brain._required_confidence(momentum, 0.60) == 0.40
+    assert brain._required_rr(momentum) == 2.0
+    assert brain._required_edge(momentum) == 0.15
+
+    assert brain._required_confidence(gap, 0.60) == 0.45
+    assert brain._required_rr(gap) == 0.5
+    assert brain._required_edge(gap) == 0.10
+
+
+def test_momentum_passes_brain_at_lower_threshold() -> None:
+    brain = _brain(
+        min_confidence=0.60,
+        strategy_threshold_overrides={
+            "momentum": {"min_confidence": 0.40, "min_rr": 2.0, "min_edge": 0.15},
+        },
+    )
+    momentum = _candidate(
+        symbol="MOMO",
+        strategy_name="momentum",
+        confidence=0.45,
+        rr=2.1,
+        edge=1.0,
+        risk_dollars=500.0,
+    )
+
+    decision = brain.decide(
+        regime=_regime(),
+        assessments={"momentum": OpportunityAssessment(candidates=[momentum])},
+        current_positions=[],
+        daily_pnl=0.0,
+    )
+
+    assert decision.num_trades == 1
+    assert decision.selected_trades[0].candidate.symbol == "MOMO"

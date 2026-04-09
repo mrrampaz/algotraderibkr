@@ -11,6 +11,7 @@ Trades may be flagged as "simulated" if options orders aren't supported.
 from __future__ import annotations
 
 import math
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -219,6 +220,21 @@ class OptionsPremiumStrategy(StrategyBase):
         end = et_now.replace(hour=self._entry_end_hour, minute=self._entry_end_minute)
         return start <= et_now <= end
 
+    @staticmethod
+    def _trading_days_to_expiry(expiry_date: date, *, from_date: date | None = None) -> int:
+        """Count trading days (Mon-Fri) from from_date to expiry_date."""
+        today = from_date or date.today()
+        if expiry_date <= today:
+            return 0
+
+        trading_days = 0
+        current = today
+        while current < expiry_date:
+            current += timedelta(days=1)
+            if current.weekday() < 5:
+                trading_days += 1
+        return trading_days
+
     def _manage_positions(self, et_now: datetime, regime: MarketRegime | None) -> list[Signal]:
         """Manage open premium trades."""
         signals: list[Signal] = []
@@ -231,7 +247,10 @@ class OptionsPremiumStrategy(StrategyBase):
                 days_held = max(0, (et_now.date() - trade.entry_time.astimezone(ET).date()).days)
             days_to_expiry = None
             if trade.expiration is not None:
-                days_to_expiry = (trade.expiration - et_now.date()).days
+                days_to_expiry = self._trading_days_to_expiry(
+                    trade.expiration,
+                    from_date=et_now.date(),
+                )
 
             # Force-close same-day expiry options near the close to prevent exercise.
             if (
@@ -914,6 +933,177 @@ class OptionsPremiumStrategy(StrategyBase):
     def _normalize_option_local_symbol(symbol: str | None) -> str:
         return str(symbol or "").strip()
 
+    @staticmethod
+    def _parse_expiry_from_local_symbol(symbol: str | None) -> date | None:
+        compact = "".join(str(symbol or "").split())
+        if not compact:
+            return None
+
+        # OCC-style local symbol: SPY260406P00644000 -> YYMMDD in the middle.
+        match = re.search(r"(\d{6})[CP]\d{8}$", compact)
+        if not match:
+            return None
+
+        raw = match.group(1)
+        year = 2000 + int(raw[:2])
+        month = int(raw[2:4])
+        day = int(raw[4:6])
+        try:
+            return date(year, month, day)
+        except ValueError:
+            return None
+
+    def _tracked_leg_symbols(self, trade: PremiumTrade) -> list[str]:
+        symbols = [
+            self._normalize_option_local_symbol(trade.short_occ_symbol),
+            self._normalize_option_local_symbol(trade.long_occ_symbol),
+        ]
+        if trade.call_short_occ_symbol and trade.call_long_occ_symbol:
+            symbols.extend([
+                self._normalize_option_local_symbol(trade.call_short_occ_symbol),
+                self._normalize_option_local_symbol(trade.call_long_occ_symbol),
+            ])
+        return [s for s in symbols if s]
+
+    def _infer_trade_expiry(self, trade: PremiumTrade) -> date | None:
+        if trade.expiration is not None:
+            return trade.expiration
+        for symbol in self._tracked_leg_symbols(trade):
+            parsed = self._parse_expiry_from_local_symbol(symbol)
+            if parsed is not None:
+                return parsed
+        return None
+
+    def _record_expired_position(
+        self,
+        trade: PremiumTrade,
+        *,
+        expiry: date | None,
+        reason: str,
+    ) -> None:
+        current_price = self._get_current_price(trade.underlying) or 0.0
+        pnl = self._estimate_simulated_pnl(trade, current_price)
+        self.record_trade(
+            pnl,
+            symbol=trade.underlying,
+            side=OrderSide.SELL,
+            qty=trade.contracts,
+            entry_price=trade.credit_received,
+            exit_price=max(0.0, trade.credit_received - pnl) if trade.contracts else 0.0,
+            entry_time=trade.entry_time,
+            entry_reason=f"premium_sell: {trade.structure}",
+            exit_reason=reason,
+            metadata={
+                "structure": trade.structure,
+                "short_strike": trade.short_strike,
+                "long_strike": trade.long_strike,
+                "short_occ": trade.short_occ_symbol,
+                "long_occ": trade.long_occ_symbol,
+                "call_short_occ": trade.call_short_occ_symbol,
+                "call_long_occ": trade.call_long_occ_symbol,
+                "expired_purged": True,
+                "expiry": expiry.isoformat() if expiry else None,
+                "simulated": trade.simulated,
+            },
+        )
+
+    def _persist_state_after_position_change(self) -> None:
+        try:
+            self.save_state()
+        except Exception:
+            self._log.exception("options_state_save_failed")
+
+    def _purge_expired_positions(self, *, context: str) -> int:
+        today = datetime.now(ET).date()
+        expired: list[tuple[str, PremiumTrade, date | None]] = []
+
+        for trade_key, trade in list(self._trades.items()):
+            expiry = self._infer_trade_expiry(trade)
+            if expiry is not None and expiry < today:
+                expired.append((trade_key, trade, expiry))
+
+        if not expired:
+            return 0
+
+        for trade_key, trade, expiry in expired:
+            self._log.warning(
+                "expired_position_purged",
+                strategy=self.name,
+                symbol=trade.underlying,
+                expiry=str(expiry) if expiry else None,
+                today=str(today),
+                context=context,
+                reason="Contract expired; purging from state to prevent close retry loops",
+            )
+            self._trades.pop(trade_key, None)
+            self.release_capital(trade.capital_used)
+            self._record_expired_position(
+                trade,
+                expiry=expiry,
+                reason=f"expired_contract_purged:{context}",
+            )
+
+        self._persist_state_after_position_change()
+        self._log.info(
+            "expired_positions_purged_count",
+            strategy=self.name,
+            count=len(expired),
+            context=context,
+        )
+        return len(expired)
+
+    def _reconcile_with_broker_portfolio(self) -> int:
+        get_option_positions = getattr(self.executor, "get_option_positions", None)
+        if not callable(get_option_positions):
+            return 0
+
+        try:
+            positions = get_option_positions()
+        except Exception:
+            self._log.debug("options_reconcile_fetch_failed")
+            return 0
+
+        ib_symbols = {
+            self._normalize_option_local_symbol(pos.get("local_symbol"))
+            for pos in positions or []
+            if self._normalize_option_local_symbol(pos.get("local_symbol"))
+        }
+
+        today = datetime.now(ET).date()
+        orphaned: list[tuple[str, PremiumTrade, date | None]] = []
+        for trade_key, trade in list(self._trades.items()):
+            leg_symbols = self._tracked_leg_symbols(trade)
+            if leg_symbols and any(symbol in ib_symbols for symbol in leg_symbols):
+                continue
+
+            expiry = self._infer_trade_expiry(trade)
+            if expiry is None or expiry >= today:
+                continue
+            orphaned.append((trade_key, trade, expiry))
+
+        if not orphaned:
+            return 0
+
+        for trade_key, trade, expiry in orphaned:
+            self._log.warning(
+                "orphaned_position_purged",
+                symbol=trade.underlying,
+                local_symbol=trade.short_occ_symbol,
+                expiry=str(expiry) if expiry else None,
+                reason="Position in state but missing from broker portfolio and contract is expired",
+            )
+            self._trades.pop(trade_key, None)
+            self.release_capital(trade.capital_used)
+            self._record_expired_position(
+                trade,
+                expiry=expiry,
+                reason="orphaned_expired_purged",
+            )
+
+        self._persist_state_after_position_change()
+        self._log.info("orphaned_positions_purged_count", count=len(orphaned))
+        return len(orphaned)
+
     def _estimate_live_option_pnl(self, trade: PremiumTrade) -> dict[str, float] | None:
         """Estimate spread P&L using broker-reported option leg marks."""
         if not hasattr(self.executor, "get_option_positions"):
@@ -1219,23 +1409,27 @@ class OptionsPremiumStrategy(StrategyBase):
             "call_long_occ": call_long_occ,
         }
 
-    def _close_real_spread(self, trade: PremiumTrade) -> bool:
-        """Submit a closing MLEG order to buy back an open credit spread.
+    def _get_last_mleg_failure_reason(self) -> str | None:
+        getter = getattr(self.executor, "get_last_mleg_failure_reason", None)
+        if not callable(getter):
+            return None
+        try:
+            raw = getter()
+        except Exception:
+            return None
+        reason = str(raw or "").strip().lower()
+        return reason or None
 
-        Reverses each opening leg:
-          sell-to-open short -> buy-to-close
-          buy-to-open long   -> sell-to-close
-
-        Returns True if the closing order was submitted, False otherwise.
-        """
+    def _close_real_spread(self, trade: PremiumTrade) -> tuple[bool, str | None]:
+        """Submit a closing MLEG order to buy back an open credit spread."""
         if not hasattr(self.executor, "submit_mleg_order"):
-            return False
+            return False, "unsupported"
         if not trade.short_occ_symbol or not trade.long_occ_symbol:
             self._log.error(
                 "close_spread_missing_occ_symbols",
                 underlying=trade.underlying,
             )
-            return False
+            return False, "missing_occ_symbols"
 
         legs: list[dict] = [
             {"symbol": trade.short_occ_symbol, "ratio_qty": 1, "side": OrderSide.BUY,  "position_intent": "buy_to_close"},
@@ -1256,7 +1450,14 @@ class OptionsPremiumStrategy(StrategyBase):
                 structure=trade.structure,
                 order_id=order_id,
             )
-        return order_id is not None
+            return True, None
+
+        failure_reason = self._get_last_mleg_failure_reason()
+        if failure_reason is None:
+            expiry = self._infer_trade_expiry(trade)
+            if expiry is not None and expiry < datetime.now(ET).date():
+                failure_reason = "expired"
+        return False, failure_reason
 
     def _close_trade(self, trade_key: str, trade: PremiumTrade, reason: str) -> None:
         """Close a premium trade."""
@@ -1302,9 +1503,30 @@ class OptionsPremiumStrategy(StrategyBase):
             current_price = self._get_current_price(trade.underlying) or 0.0
             pnl = self._estimate_simulated_pnl(trade, current_price)
 
-        close_success = self._close_real_spread(trade)
+        close_success, failure_reason = self._close_real_spread(trade)
         if not close_success:
-            self._log.error("premium_close_failed", underlying=trade.underlying)
+            if failure_reason == "expired":
+                self._log.warning(
+                    "purging_expired_on_close_failure",
+                    underlying=trade.underlying,
+                    reason="Contract expired and cannot be resolved by broker",
+                )
+                self._trades.pop(trade_key, None)
+                self.release_capital(trade.capital_used)
+                expiry = self._infer_trade_expiry(trade)
+                self._record_expired_position(
+                    trade,
+                    expiry=expiry,
+                    reason="close_failed_expired_contract",
+                )
+                self._persist_state_after_position_change()
+                return
+
+            self._log.error(
+                "premium_close_failed",
+                underlying=trade.underlying,
+                failure_reason=failure_reason or "unknown",
+            )
             return
 
         self._trades.pop(trade_key, None)
@@ -1990,10 +2212,15 @@ class OptionsPremiumStrategy(StrategyBase):
                 call_long_occ_symbol=saved.get("call_long_occ_symbol", ""),
             )
 
+        self._purge_expired_positions(context="state_restore")
+
     def review_positions_at_open(self, et_now: datetime | None = None) -> int:
         """Run an immediate gap-stop review before new assessments begin."""
         if et_now is None:
             et_now = datetime.now(ET)
+
+        self._purge_expired_positions(context="morning_review")
+        self._reconcile_with_broker_portfolio()
 
         closed = 0
         for trade_key, trade in list(self._trades.items()):

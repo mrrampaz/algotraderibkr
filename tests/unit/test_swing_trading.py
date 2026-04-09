@@ -88,12 +88,16 @@ def test_options_find_expiry_probes_window_when_default_chain_is_nearest_only() 
     provider = _NearestExpiryOnlyProvider()
     executor = StubExecutor()
     today = date.today()
+    target_expiry = today + timedelta(days=2)
+    while target_expiry.weekday() >= 5:
+        target_expiry += timedelta(days=1)
+
     provider.set_option_chain(
         "SPY",
         pd.DataFrame(
             [
                 {"expiration": today, "strike": 500, "type": "put"},
-                {"expiration": today + timedelta(days=3), "strike": 500, "type": "put"},
+                {"expiration": target_expiry, "strike": 500, "type": "put"},
             ]
         ),
     )
@@ -107,7 +111,7 @@ def test_options_find_expiry_probes_window_when_default_chain_is_nearest_only() 
     )
 
     expiry = strategy._find_expiry("SPY", min_dte=2, max_dte=5)
-    assert expiry == today + timedelta(days=3)
+    assert expiry == target_expiry
 
 
 def test_options_find_expiry_falls_back_to_nearest_when_window_unavailable() -> None:
@@ -529,3 +533,149 @@ def test_position_state_persistence(tmp_path) -> None:
     assert restored.restore_state(state_dir=str(tmp_path)) is True
     assert "XYZ" in restored._trades
     assert restored._trades["XYZ"].direction == "long"
+
+
+def test_expired_position_purged_on_startup() -> None:
+    provider = StubDataProvider()
+    provider.set_price("SPY", 500.0)
+    strategy = OptionsPremiumStrategy(
+        name="options_premium",
+        config=StrategyConfig(params={}),
+        data_provider=provider,
+        executor=StubExecutor(),
+        event_bus=EventBus(),
+    )
+    strategy.set_capital(100000.0)
+    strategy.save_state = lambda state_dir="data/state": None  # type: ignore[method-assign]
+
+    expired_date = date.today() - timedelta(days=1)
+    strategy._restore_state(
+        {
+            "enabled": True,
+            "capital_reserved": 400.0,
+            "daily_pnl": 0.0,
+            "daily_trades": 0,
+            "trades": {
+                "SPY": {
+                    "underlying": "SPY",
+                    "structure": "put_spread",
+                    "short_strike": 500.0,
+                    "long_strike": 495.0,
+                    "contracts": 1,
+                    "credit_received": 100.0,
+                    "max_profit": 100.0,
+                    "max_loss": 400.0,
+                    "entry_time": datetime.now(pytz.UTC).isoformat(),
+                    "expiration": expired_date.isoformat(),
+                    "simulated": False,
+                    "capital_used": 400.0,
+                    "trade_id": "expired_startup",
+                    "open_order_id": "ibkr_test",
+                    "short_occ_symbol": "SPY   260101P00500000",
+                    "long_occ_symbol": "SPY   260101P00495000",
+                    "call_short_occ_symbol": "",
+                    "call_long_occ_symbol": "",
+                }
+            },
+        }
+    )
+
+    assert not strategy._trades
+    assert strategy._capital_reserved == 0.0
+
+
+def test_expired_contract_close_failure_purges() -> None:
+    class _ExpiredCloseExecutor(StubExecutor):
+        def submit_mleg_order(self, legs, qty=1, tif="DAY", client_order_id=None):
+            return None
+
+        def get_last_mleg_failure_reason(self):
+            return "expired"
+
+        def get_option_positions(self):
+            return []
+
+    provider = StubDataProvider()
+    provider.set_price("SPY", 500.0)
+    strategy = OptionsPremiumStrategy(
+        name="options_premium",
+        config=StrategyConfig(params={}),
+        data_provider=provider,
+        executor=_ExpiredCloseExecutor(),
+        event_bus=EventBus(),
+    )
+    strategy.set_capital(100000.0)
+    strategy.save_state = lambda state_dir="data/state": None  # type: ignore[method-assign]
+
+    strategy._trades["SPY"] = PremiumTrade(
+        underlying="SPY",
+        structure="put_spread",
+        short_strike=500.0,
+        long_strike=495.0,
+        contracts=1,
+        credit_received=100.0,
+        max_profit=100.0,
+        max_loss=400.0,
+        entry_time=datetime.now(pytz.UTC) - timedelta(days=2),
+        expiration=date.today() - timedelta(days=1),
+        simulated=False,
+        capital_used=400.0,
+        trade_id="expired_close_failure",
+        short_occ_symbol="SPY   260101P00500000",
+        long_occ_symbol="SPY   260101P00495000",
+    )
+
+    strategy._close_trade("SPY", strategy._trades["SPY"], "pre_expiry_1d")
+
+    assert "SPY" not in strategy._trades
+
+
+def test_pre_expiry_uses_trading_days() -> None:
+    provider = StubDataProvider()
+    executor = StubExecutor()
+    provider.set_price("SPY", 490.0)
+    strategy = OptionsPremiumStrategy(
+        name="options_premium",
+        config=StrategyConfig(params={"close_before_expiry_days": 1, "stop_loss_multiple": 3.0}),
+        data_provider=provider,
+        executor=executor,
+        event_bus=EventBus(),
+    )
+    strategy.set_capital(100000.0)
+
+    today = date.today()
+    days_to_friday = (4 - today.weekday()) % 7
+    if days_to_friday == 0:
+        days_to_friday = 7
+    friday = today + timedelta(days=days_to_friday)
+    monday = friday + timedelta(days=3)
+
+    strategy._trades["SPY"] = PremiumTrade(
+        underlying="SPY",
+        structure="put_spread",
+        short_strike=490.0,
+        long_strike=485.0,
+        contracts=1,
+        credit_received=100.0,
+        max_profit=100.0,
+        max_loss=400.0,
+        entry_time=datetime.now(pytz.UTC) - timedelta(days=1),
+        expiration=monday,
+        simulated=True,
+        capital_used=400.0,
+        trade_id="trading_day_test",
+    )
+
+    et_now = datetime.now(pytz.timezone("America/New_York")).replace(
+        year=friday.year,
+        month=friday.month,
+        day=friday.day,
+        hour=11,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    signals = strategy._manage_positions(et_now, None)
+
+    assert signals
+    assert "pre_expiry_1d" in signals[0].reason

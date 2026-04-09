@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import date, datetime
 from decimal import Decimal, ROUND_HALF_UP
@@ -70,6 +71,7 @@ class IBKRExecutor:
         self._trade_map: dict[int, Any] = {}
         self._stock_contract_cache: dict[str, Any] = {}
         self._option_contract_map: dict[str, Any] = {}
+        self._last_mleg_failure_reason: str | None = None
         self._log = logger.bind(
             component="ibkr_executor",
             host=self._config.host,
@@ -116,6 +118,37 @@ class IBKRExecutor:
             return datetime.strptime(digits[:8], "%Y%m%d").date()
         except ValueError:
             return None
+
+    @staticmethod
+    def _parse_expiry_from_local_symbol(symbol: str) -> date | None:
+        compact = "".join(str(symbol or "").split())
+        match = re.search(r"(\d{6})[CP]\d{8}$", compact)
+        if not match:
+            return None
+
+        raw = match.group(1)
+        year = 2000 + int(raw[:2])
+        month = int(raw[2:4])
+        day = int(raw[4:6])
+        try:
+            return date(year, month, day)
+        except ValueError:
+            return None
+
+    def _classify_unresolved_leg(self, symbol: str) -> str:
+        expiry = self._parse_expiry_from_local_symbol(symbol)
+        if expiry is not None and expiry < date.today():
+            self._log.warning(
+                "contract_expired_unresolvable",
+                symbol=symbol,
+                expiry=str(expiry),
+                reason="Contract expired and cannot be resolved by IBKR",
+            )
+            return "expired"
+        return "unresolved"
+
+    def get_last_mleg_failure_reason(self) -> str | None:
+        return self._last_mleg_failure_reason
 
     def _ib_order_id(self, order_id: str) -> int | None:
         if order_id in self._order_id_map:
@@ -800,6 +833,7 @@ class IBKRExecutor:
         time_in_force: TimeInForce = TimeInForce.DAY,
         client_order_id: str | None = None,
     ) -> str | None:
+        self._last_mleg_failure_reason = None
         if not self._require_writable("submit_mleg_order"):
             return None
         if not legs:
@@ -813,7 +847,13 @@ class IBKRExecutor:
             leg_symbol = str(leg.get("symbol", ""))
             contract = self._resolve_option_contract(leg_symbol)
             if contract is None:
-                self._log.error("ibkr_mleg_leg_unresolved", symbol=leg_symbol)
+                failure_reason = self._classify_unresolved_leg(leg_symbol)
+                self._last_mleg_failure_reason = failure_reason
+                self._log.error(
+                    "ibkr_mleg_leg_unresolved",
+                    symbol=leg_symbol,
+                    failure_reason=failure_reason,
+                )
                 return None
             resolved_contracts.append((leg, contract))
 
@@ -871,6 +911,7 @@ class IBKRExecutor:
             trade = self._connection.execute(lambda ib: ib.placeOrder(bag, order))
             self._register_trade(trade)
             local_id = self._local_order_id(int(trade.order.orderId))
+            self._last_mleg_failure_reason = None
             self._log.info(
                 "ibkr_mleg_order_submitted",
                 order_id=local_id,
@@ -879,6 +920,7 @@ class IBKRExecutor:
             )
             return local_id
         except Exception:
+            self._last_mleg_failure_reason = "submit_failed"
             self._log.exception("ibkr_mleg_submit_failed")
             return None
 

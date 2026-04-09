@@ -533,7 +533,7 @@ class SectorRotationStrategy(StrategyBase):
                         details=[{"divergence": round(divergence, 2), "min": self._min_divergence_pct}],
                     ))
 
-            # Count sectors above long / below short thresholds
+            # Count sectors above long / below short thresholds.
             longs = [s for s, rs in sorted_rs if rs >= self._rs_long_threshold and s not in self._trades]
             shorts = [s for s, rs in sorted_rs if rs <= self._rs_short_threshold and s not in self._trades]
             candidates = longs + shorts
@@ -548,23 +548,33 @@ class SectorRotationStrategy(StrategyBase):
                 return _complete(OpportunityAssessment())
 
             divergence = sorted_rs[0][1] - sorted_rs[-1][1] if len(sorted_rs) >= 2 else 0.0
-            if not longs or not shorts:
-                filter_counts["need_both_long_short_legs"] = 1
-                self._log.info(
-                    "sector_scan_result",
-                    regime=regime_type,
-                    final_candidates=0,
-                    filter_counts=filter_counts,
-                )
-                return _complete(OpportunityAssessment(
-                    num_candidates=0,
-                    confidence=0.0,
-                    details=[{"reason": "need_both_long_and_short_legs", "divergence": round(divergence, 2)}],
-                    candidates=[],
-                ))
+            long_symbol = longs[0] if longs else None
+            short_symbol = shorts[0] if shorts else None
+            leg_selection_mode = "threshold"
 
-            long_symbol = longs[0]
-            short_symbol = shorts[0]
+            if long_symbol is None or short_symbol is None:
+                # Fallback: still build a paired trade from strongest vs weakest when
+                # divergence is adequate, even if absolute +/- RS thresholds don't both fire.
+                strongest = next((s for s, _ in sorted_rs if s not in self._trades), None)
+                weakest = next((s for s, _ in reversed(sorted_rs) if s not in self._trades), None)
+                if strongest and weakest and strongest != weakest:
+                    long_symbol = strongest
+                    short_symbol = weakest
+                    leg_selection_mode = "relative_divergence_fallback"
+                else:
+                    filter_counts["need_both_long_short_legs"] = 1
+                    self._log.info(
+                        "sector_scan_result",
+                        regime=regime_type,
+                        final_candidates=0,
+                        filter_counts=filter_counts,
+                    )
+                    return _complete(OpportunityAssessment(
+                        num_candidates=0,
+                        confidence=0.0,
+                        details=[{"reason": "need_both_long_and_short_legs", "divergence": round(divergence, 2)}],
+                        candidates=[],
+                    ))
             long_rs = self._rs_scores.get(long_symbol, 0.0)
             short_rs = self._rs_scores.get(short_symbol, 0.0)
             long_price = self._get_current_price(long_symbol)
@@ -683,6 +693,7 @@ class SectorRotationStrategy(StrategyBase):
                     "long_rs": round(long_rs, 2),
                     "short_rs": round(short_rs, 2),
                     "divergence": round(divergence, 2),
+                    "leg_selection_mode": leg_selection_mode,
                     "long_price": round(long_price, 2),
                     "short_price": round(short_price, 2),
                     "min_notional_per_leg": round(self._min_notional_per_leg, 2),
