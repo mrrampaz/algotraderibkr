@@ -152,6 +152,10 @@ def test_options_closes_1_day_before_expiry() -> None:
     )
     strategy.set_capital(100000.0)
 
+    expiry = date.today() + timedelta(days=1)
+    while expiry.weekday() >= 5:
+        expiry += timedelta(days=1)
+
     strategy._trades["SPY"] = PremiumTrade(
         underlying="SPY",
         structure="put_spread",
@@ -162,7 +166,7 @@ def test_options_closes_1_day_before_expiry() -> None:
         max_profit=100.0,
         max_loss=400.0,
         entry_time=datetime.now(pytz.UTC) - timedelta(days=1),
-        expiration=date.today() + timedelta(days=1),
+        expiration=expiry,
         simulated=True,
         capital_used=400.0,
         trade_id="swing_test",
@@ -679,3 +683,4 @@ def test_pre_expiry_uses_trading_days() -> None:
 
     assert signals
     assert "pre_expiry_1d" in signals[0].reason
+

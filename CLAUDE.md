@@ -2,35 +2,46 @@
 
 ## What this repo is
 
-Adaptive multi-strategy trading system on Interactive Brokers (or Alpaca fallback) with a Daily Brain decision engine.
+Adaptive multi-strategy swing trading system on Interactive Brokers (or Alpaca fallback) with a Daily Brain decision engine.
 The Brain evaluates concrete `TradeCandidate` objects from 7 strategies and deploys capital only into the best setups.
-Cash is the default when no candidate clears thresholds.
+Cash is the default when no candidate clears thresholds; intraday-only behavior is explicitly scoped (for example, `gap_reversal` EOD flattening and expiry-risk guards).
 
 ## Architecture Overview
 
 ### Decision Flow
 1. Startup initializes broker/data/executor, imports all strategies, and allocates configured capital slices.
 2. Warm-up restores saved strategy state (`strategy.restore_state()`) and then runs strategy warm-up logic.
-3. Startup morning reconciliation runs `_morning_reconciliation()` and compares broker startup positions vs strategy-restored held symbols, logging `unexpected_position_found` when mismatches exist.
-4. Pre-market intelligence refresh runs before regular trading loop.
-5. Each cycle detects market regime and asks all 7 strategies for `OpportunityAssessment` with explicit `TradeCandidate` rows.
-6. In `strategy_selector.mode: brain`, `DailyBrain` filters/scores/ranks candidates across strategies.
-7. Brain selects a concentrated set of trades under confidence/RR/edge/risk/capital limits and applies per-strategy capital (`set_capital`).
-8. Strategies still run cycles and manage existing positions even when new-entry capital is set to `0.0`.
-9. Midday review runs once and can tighten entry standards and emit close recommendations.
-10. At 3:45 PM ET to 4:00 PM ET, orchestrator expiry guard runs `_check_expiry_risk()` and closes same-day option positions to prevent exercise/assignment.
-11. Decisions/state are persisted to `data/state/*.json` (including `brain_decision.json`, `assessments.json`, `broker_snapshot.json`).
+3. `options_premium.restore_state()` purges expired contracts via `_purge_expired_positions(context="state_restore")` to prevent stale close loops.
+4. Startup morning reconciliation runs `_morning_reconciliation()` and compares broker startup positions vs strategy-restored held symbols, logging `unexpected_position_found` when mismatches exist.
+5. Pre-market intelligence refresh runs before regular trading loop.
+6. Each cycle detects market regime and asks all 7 strategies for `OpportunityAssessment` with explicit `TradeCandidate` rows.
+7. In `strategy_selector.mode: brain`, `DailyBrain` filters/scores/ranks candidates across strategies.
+8. Brain selects a concentrated set of trades under confidence/RR/edge/risk/capital limits and applies per-strategy capital (`set_capital`).
+9. Strategies still run cycles and manage existing positions even when new-entry capital is set to `0.0`.
+10. Morning open review (`_morning_position_review()`, ~9:30-11:00 AM ET) can trigger per-strategy `review_positions_at_open()` gap-stop exits.
+11. Midday review runs once and can tighten entry standards and emit close recommendations.
+12. Near close, `_handle_market_close()` flattens intraday-only books, runs per-strategy `close_positions_for_eod()`, and keeps expiry/exercise safeguards active (`_check_expiry_risk()` around 3:45 PM ET).
+13. Decisions/state are persisted to `data/state/*.json` (including `brain_decision.json`, `assessments.json`, `broker_snapshot.json`).
 
 ### Brain Thresholds (from `config/settings.yaml`)
+Global gates:
 - `min_confidence`: 0.60
 - `min_risk_reward`: 1.5
 - `min_edge_pct`: 0.3
-- `options_min_confidence`: 0.55
-- `options_min_risk_reward`: 0.3
-- `options_min_edge_pct`: 0.1
+
+Per-strategy overrides (`strategy_overrides`):
+- `options_premium`: confidence `0.55`, rr `0.3`, edge `0.10`
+- `momentum`: confidence `0.40`, rr `2.0`, edge `0.15`
+- `vwap_reversion`: confidence `0.35`, rr `1.5`, edge `0.15`
+- `gap_reversal`: confidence `0.45`, rr `0.5`, edge `0.10`
+- `pairs_trading`: confidence `0.50`, rr `1.0`, edge `0.20`
+- `sector_rotation`: confidence `0.45`, rr `1.0`, edge `0.15`
+- `event_driven`: confidence `0.55`, rr `1.5`, edge `0.25`
+
+Risk/capital caps:
 - `max_daily_trades`: 5
-- `max_capital_per_trade_pct`: 20.0
-- `max_daily_risk_pct`: 2.0
+- `max_capital_per_trade_pct`: 25.0
+- `max_daily_risk_pct`: 6.0
 - `cash_is_default`: true
 
 ### Known Bugs Fixed (Week 1 Changelog)
@@ -105,7 +116,7 @@ All 7 strategies emit concrete `TradeCandidate` objects (top-ranked, max 3 per s
 | Strategy | CandidateType | Best Regime | Notes |
 |----------|---------------|-------------|-------|
 | Momentum/Breakout | `LONG_EQUITY` / `SHORT_EQUITY` | trending | Breakout scanner + volume confirmation |
-| 0DTE Options Premium | `CREDIT_SPREAD` | ranging/high_vol | Production mode sells OTM put/call credit spreads with explicit per-leg BAG actions. Pre-expiry auto-close at 3:45 PM ET. Policy min credit: $0.10/contract (current config is stricter). Hard exercise-exposure cap enforced at 20% equity by default. |
+| Options Premium (2-5 DTE Swing) | `CREDIT_SPREAD` | ranging/high_vol | Production mode sells OTM put/call credit spreads with explicit per-leg BAG actions. Closes one trading day before expiry plus same-day 3:45 PM ET exercise guard. Policy min credit: $0.10/contract (current config is stricter). Hard exercise-exposure cap enforced at 20% equity by default. |
 | VWAP Mean Reversion | `LONG_EQUITY` / `SHORT_EQUITY` | ranging/low_vol | VWAP z-score mean reversion |
 | Pairs Trading | `PAIRS` | ranging | Includes anti-churn filter (expected profit >= 3x est. cost) |
 | Gap Reversal | `LONG_EQUITY` / `SHORT_EQUITY` | mixed AM regimes | Entry expiry around 11:00 AM ET |
@@ -140,7 +151,7 @@ Return: +$1,670.15 (+1.67%)
 
 Important context:
 - Options strategy P&L over Mar 2-4 was negative (`- $121.45`).
-- Reported account gain was driven by accidental stock positions from 0DTE exercise before the March 5 BAG-direction fix.
+- Reported account gain was driven by accidental stock positions from same-day expiry exercise before the March 5 BAG-direction fix.
 - Treat pre-fix gains as non-representative of intended options premium strategy performance.
 
 ## File Map
@@ -223,7 +234,7 @@ grep "expiry_risk\|pre_expiry_close\|check_expiry\|closing_expiring_option\|expi
    - Set combo parent action to `BUY`.
    - Encode true leg intent on each `ComboLeg.action` (`SELL` short leg, `BUY` long leg).
    - Wrong combo direction can invert credit/debit behavior.
-10. 0DTE exercise behavior.
+10. Same-day expiry exercise behavior.
    - ITM options held past close can auto-exercise/assign into stock.
    - Paper accounts can carry large stock positions overnight without proactive warning and typically without an immediate margin-call workflow.
 11. Option position visibility.
@@ -256,3 +267,4 @@ Do not modify unless explicitly requested:
 - Protocol interfaces (`algotrader/data/provider.py`, `algotrader/execution/executor.py`)
 - Risk management logic (`algotrader/risk/*.py`)
 - Tracking/journal/metrics/attribution logic (`algotrader/tracking/*.py`)
+
