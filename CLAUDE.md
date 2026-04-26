@@ -14,7 +14,7 @@ Cash is the default when no candidate clears thresholds; intraday-only behavior 
 3. `options_premium.restore_state()` purges expired contracts via `_purge_expired_positions(context="state_restore")` to prevent stale close loops.
 4. Startup morning reconciliation runs `_morning_reconciliation()` and compares broker startup positions vs strategy-restored held symbols, logging `unexpected_position_found` when mismatches exist.
 5. Pre-market intelligence refresh runs before regular trading loop.
-6. Each cycle detects market regime and asks all 7 strategies for `OpportunityAssessment` with explicit `TradeCandidate` rows.
+6. Each cycle detects market regime and asks enabled strategies for `OpportunityAssessment` with explicit `TradeCandidate` rows.
 7. In `strategy_selector.mode: brain`, `DailyBrain` filters/scores/ranks candidates across strategies.
 8. Brain selects a concentrated set of trades under confidence/RR/edge/risk/capital limits and applies per-strategy capital (`set_capital`).
 9. Strategies still run cycles and manage existing positions even when new-entry capital is set to `0.0`.
@@ -22,6 +22,23 @@ Cash is the default when no candidate clears thresholds; intraday-only behavior 
 11. Midday review runs once and can tighten entry standards and emit close recommendations.
 12. Near close, `_handle_market_close()` flattens intraday-only books, runs per-strategy `close_positions_for_eod()`, and keeps expiry/exercise safeguards active (`_check_expiry_risk()` around 3:45 PM ET).
 13. Decisions/state are persisted to `data/state/*.json` (including `brain_decision.json`, `assessments.json`, `broker_snapshot.json`).
+
+## Active Strategies
+
+Currently only `options_premium` is enabled. The other 6 strategies are parked
+(`enabled: false` in their config files) because:
+
+- 8 weeks of paper trading showed only options_premium produces real edge
+- Brain's EV-concentration correctly allocates 100% to options
+- Other strategies either don't produce candidates or produce candidates below threshold
+- This is a market regime issue, not a code issue
+
+Parked strategies (still in repo, code intact, tests passing):
+- momentum, vwap_reversion, gap_reversal, pairs_trading, sector_rotation, event_driven
+
+To re-enable any strategy: set `enabled: true` in its config YAML and the matching
+`config/settings.yaml` strategy override if present. The Brain's per-strategy
+threshold overrides remain in settings.yaml for future use.
 
 ### Brain Thresholds (from `config/settings.yaml`)
 Global gates:

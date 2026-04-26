@@ -47,10 +47,12 @@ params:
 
   # Sizing
   max_risk_per_trade: 500         # Legacy fallback for non-spread sizing paths
-  max_contracts: 5                # Absolute safety cap across all sizing modes
-  max_contracts_per_spread: 5     # Brain adaptive sizing can still lower this at runtime
+  base_contracts: 8               # Target per spread when risk budget permits
+  max_contracts: 10               # Absolute safety cap across all sizing modes
+  max_contracts_per_spread: 10    # Brain adaptive sizing can still lower this at runtime
   sizing_method: "max_loss"       # "max_loss" for credit spreads, legacy "exercise_exposure" otherwise
-  max_loss_risk_budget_pct: 2.0   # Size spread risk off 2% of account equity
+  max_position_loss_pct: 5.0      # Per-spread max loss budget as % of account equity
+  max_loss_risk_budget_pct: 5.0   # Backward-compatible alias for max_position_loss_pct
   exercise_exposure_cap_pct: 20.0 # Cap assignment/exercise notional to 20% of equity
 
   # Regime filter

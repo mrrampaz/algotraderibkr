@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pandas as pd
 import pytz
 
-from algotrader.core.config import StrategyConfig
+from algotrader.core.config import Settings, StrategyConfig
 from algotrader.core.events import EventBus
 from algotrader.core.models import AccountInfo, MarketRegime, RegimeType
 from algotrader.orchestrator import Orchestrator
@@ -435,6 +435,32 @@ def test_orchestrator_holds_overnight(monkeypatch) -> None:
     orch._handle_market_close()
     assert swing_state["review_calls"] == 1
     assert swing_state["close_all_calls"] == 0
+
+
+def test_disabled_strategy_not_loaded() -> None:
+    """Strategy with enabled=false is skipped at orchestrator load."""
+    orch = Orchestrator.__new__(Orchestrator)
+    orch._settings = Settings()
+    orch._shutdown_requested = False
+    orch._data_provider = StubDataProvider()
+    orch._executor = StubExecutor()
+    orch._event_bus = EventBus()
+    orch._trade_journal = object()
+    orch._log = _DummyLog()
+    orch._disabled_strategy_names = []
+
+    orch._import_strategies()
+    strategies = orch._load_strategies()
+
+    assert set(strategies) == {"options_premium"}
+    assert set(orch._disabled_strategy_names) == {
+        "momentum",
+        "vwap_reversion",
+        "gap_reversal",
+        "pairs_trading",
+        "sector_rotation",
+        "event_driven",
+    }
 
 
 def test_orchestrator_closes_gap_reversal_at_eod(monkeypatch) -> None:

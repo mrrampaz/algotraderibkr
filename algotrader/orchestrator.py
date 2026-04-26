@@ -204,6 +204,7 @@ class Orchestrator:
                         adaptive_risk_tiers=brain_cfg.adaptive_risk_tiers.model_dump(),
                         drawdown_governor=brain_cfg.drawdown_governor.model_dump(),
                         max_contracts_hard_cap=brain_cfg.max_contracts_hard_cap,
+                        max_overnight_exposure_pct=settings.risk.max_overnight_exposure_pct,
                         recent_win_rate_lookback_trades=brain_cfg.recent_win_rate_lookback_trades,
                         recent_win_rate_fallback=brain_cfg.recent_win_rate_fallback,
                     )
@@ -284,6 +285,7 @@ class Orchestrator:
 
         # Strategies
         self._strategies: dict[str, StrategyBase] = {}
+        self._disabled_strategy_names: list[str] = []
 
         # Event subscriptions
         self._event_bus.subscribe(KILL_SWITCH, self._on_kill_switch)
@@ -318,6 +320,17 @@ class Orchestrator:
         self._import_strategies()
 
         # Create strategies from config
+        self._strategies = self._load_strategies()
+        active = list(self._strategies.keys())
+        disabled = getattr(self, "_disabled_strategy_names", [])
+        self._log.info("strategies_loaded", active=active, disabled=disabled)
+        self._log.info("initialization_complete", strategies=active)
+
+    def _load_strategies(self) -> dict[str, StrategyBase]:
+        """Load only enabled strategies from config."""
+        enabled_strategies: dict[str, StrategyBase] = {}
+        disabled_strategies: list[str] = []
+
         for name in registry.names:
             if self._shutdown_requested:
                 self._log.info("initialize_aborted_shutdown_requested")
@@ -326,7 +339,12 @@ class Orchestrator:
             config = self._resolve_strategy_config(name)
 
             if not config.enabled:
-                self._log.info("strategy_disabled", name=name)
+                disabled_strategies.append(name)
+                self._log.info(
+                    "strategy_disabled_skipped",
+                    strategy=name,
+                    reason="enabled=false in config",
+                )
                 continue
 
             strategy = registry.create(
@@ -342,10 +360,11 @@ class Orchestrator:
                 capital = self._settings.trading.total_capital * (config.capital_allocation_pct / 100)
                 strategy.set_capital(capital)
                 strategy.set_journal(self._trade_journal)
-                self._strategies[name] = strategy
+                enabled_strategies[name] = strategy
                 self._log.info("strategy_initialized", name=name, capital=capital)
 
-        self._log.info("initialization_complete", strategies=list(self._strategies.keys()))
+        self._disabled_strategy_names = disabled_strategies
+        return enabled_strategies
 
     def _resolve_strategy_config(self, name: str) -> StrategyConfig:
         """Resolve strategy config by merging file defaults with inline overrides."""
@@ -357,7 +376,7 @@ class Orchestrator:
         merged_params = dict(file_config.params)
         merged_params.update(inline_config.params or {})
         return StrategyConfig(
-            enabled=inline_config.enabled,
+            enabled=file_config.enabled and inline_config.enabled,
             capital_allocation_pct=inline_config.capital_allocation_pct,
             max_positions=inline_config.max_positions,
             params=merged_params,

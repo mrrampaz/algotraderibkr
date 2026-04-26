@@ -123,7 +123,8 @@ def _brain(**kwargs) -> DailyBrain:
         adaptive_sizing=kwargs.pop("adaptive_sizing", False),
         adaptive_risk_tiers=kwargs.pop("adaptive_risk_tiers", None),
         drawdown_governor=kwargs.pop("drawdown_governor", None),
-        max_contracts_hard_cap=kwargs.pop("max_contracts_hard_cap", 5),
+        max_contracts_hard_cap=kwargs.pop("max_contracts_hard_cap", 10),
+        max_overnight_exposure_pct=kwargs.pop("max_overnight_exposure_pct", 40.0),
         recent_win_rate_lookback_trades=kwargs.pop("recent_win_rate_lookback_trades", 15),
         recent_win_rate_fallback=kwargs.pop("recent_win_rate_fallback", 0.80),
     )
@@ -377,7 +378,7 @@ def test_adaptive_risk_tier_single_strategy_boosts_to_hard_cap() -> None:
     )
 
     assert limits["max_daily_risk_pct"] == 6.0
-    assert limits["max_contracts"] == 5
+    assert limits["max_contracts"] == 10
 
 
 def test_adaptive_risk_tier_moderate_drawdown_reduces_risk_and_contracts() -> None:
@@ -389,7 +390,7 @@ def test_adaptive_risk_tier_moderate_drawdown_reduces_risk_and_contracts() -> No
     )
 
     assert limits["max_daily_risk_pct"] == 4.2
-    assert limits["max_contracts"] == 4
+    assert limits["max_contracts"] == 9
 
 
 def test_adaptive_risk_tier_severe_drawdown_halves_and_clamps() -> None:
@@ -401,7 +402,7 @@ def test_adaptive_risk_tier_severe_drawdown_halves_and_clamps() -> None:
     )
 
     assert limits["max_daily_risk_pct"] == 3.0
-    assert limits["max_contracts"] == 2
+    assert limits["max_contracts"] == 5
 
 
 def test_decide_applies_adaptive_options_contract_override() -> None:
@@ -442,8 +443,128 @@ def test_decide_applies_adaptive_options_contract_override() -> None:
 
     assert decision.num_trades == 1
     selected = decision.selected_trades[0]
-    assert selected.position_size == 5
-    assert selected.risk_amount == 2375.0
+    assert selected.position_size == 10
+    assert selected.risk_amount == 4750.0
+
+
+def test_options_only_brain_decision() -> None:
+    """Brain decision log does not mention disabled strategies."""
+    brain = _brain(
+        adaptive_sizing=True,
+        max_daily_risk_pct=6.0,
+        max_capital_per_trade_pct=25.0,
+    )
+    brain._get_recent_win_rate = lambda lookback_trades=15: 0.85  # type: ignore[method-assign]
+    brain._get_current_drawdown = lambda: 0.0  # type: ignore[method-assign]
+    options = _candidate(
+        symbol="SPY",
+        strategy_name="options_premium",
+        candidate_type=CandidateType.CREDIT_SPREAD,
+        direction="neutral",
+        entry_price=500.0,
+        stop_price=495.0,
+        target_price=500.0,
+        risk_dollars=3200.0,
+        confidence=0.80,
+        rr=0.35,
+        edge=1.0,
+        options_structure="put_spread",
+        contracts=8,
+        suggested_qty=8,
+        credit_received=800.0,
+        max_loss=3200.0,
+        metadata={"win_rate": 0.85},
+    )
+
+    decision = brain.decide(
+        regime=_regime(RegimeType.HIGH_VOL, vix=24.0),
+        assessments={"options_premium": OpportunityAssessment(candidates=[options])},
+        current_positions=[],
+        daily_pnl=0.0,
+    )
+
+    assert decision.num_trades == 1
+    assert decision.selected_trades[0].candidate.strategy_name == "options_premium"
+    parked = [
+        "momentum",
+        "vwap_reversion",
+        "gap_reversal",
+        "pairs_trading",
+        "sector_rotation",
+        "event_driven",
+    ]
+    assert all(name not in decision.reasoning for name in parked)
+
+
+def test_increased_sizing_respects_overnight_cap() -> None:
+    """10-contract spread sizing still respects 40% overnight exposure cap."""
+    brain = _brain(
+        adaptive_sizing=True,
+        max_daily_risk_pct=6.0,
+        max_capital_per_trade_pct=25.0,
+        max_overnight_exposure_pct=40.0,
+    )
+    brain._get_recent_win_rate = lambda lookback_trades=15: 0.85  # type: ignore[method-assign]
+    brain._get_current_drawdown = lambda: 0.0  # type: ignore[method-assign]
+    existing = Position(
+        symbol="AAPL",
+        qty=100.0,
+        side=OrderSide.BUY,
+        avg_entry_price=370.0,
+        market_value=37_000.0,
+    )
+    options = _candidate(
+        symbol="SPY",
+        strategy_name="options_premium",
+        candidate_type=CandidateType.CREDIT_SPREAD,
+        direction="neutral",
+        entry_price=500.0,
+        stop_price=495.0,
+        target_price=500.0,
+        risk_dollars=3200.0,
+        confidence=0.80,
+        rr=0.35,
+        edge=1.0,
+        options_structure="put_spread",
+        contracts=8,
+        suggested_qty=8,
+        credit_received=800.0,
+        max_loss=3200.0,
+        metadata={"win_rate": 0.85},
+    )
+
+    decision = brain.decide(
+        regime=_regime(RegimeType.HIGH_VOL, vix=24.0),
+        assessments={"options_premium": OpportunityAssessment(candidates=[options])},
+        current_positions=[existing],
+        daily_pnl=0.0,
+    )
+
+    assert decision.num_trades == 1
+    selected = decision.selected_trades[0]
+    assert selected.position_size == 7
+    assert selected.allocated_capital == 2800.0
+    assert existing.market_value + selected.allocated_capital <= 40_000.0
+
+
+def test_adaptive_sizing_scales_down_in_drawdown() -> None:
+    """Effective max contracts reduces when drawdown exceeds threshold."""
+    brain = _brain(adaptive_sizing=True, max_daily_risk_pct=6.0)
+    no_drawdown = brain._compute_adaptive_risk_limits(
+        active_strategy_count=1,
+        recent_win_rate=0.85,
+        current_drawdown_pct=0.0,
+    )
+    moderate_drawdown = brain._compute_adaptive_risk_limits(
+        active_strategy_count=1,
+        recent_win_rate=0.85,
+        current_drawdown_pct=2.0,
+    )
+
+    assert no_drawdown["max_contracts"] == 10
+    assert moderate_drawdown["max_contracts"] == 9
+    assert moderate_drawdown["max_daily_risk_pct"] < no_drawdown["max_daily_risk_pct"]
+
 
 def test_brain_strategy_specific_thresholds() -> None:
     brain = _brain(

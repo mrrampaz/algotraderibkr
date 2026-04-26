@@ -98,6 +98,12 @@ class StrategyConfig(BaseModel):
     max_positions: int = 5
     params: dict[str, Any] = Field(default_factory=dict)
 
+    def get(self, key: str, default: Any = None) -> Any:
+        """Dict-like access for small config inspection scripts."""
+        if hasattr(self, key):
+            return getattr(self, key)
+        return self.params.get(key, default)
+
 
 class AlertsConfig(BaseModel):
     """Config for the alerting system."""
@@ -145,7 +151,7 @@ class BrainConfig(BaseModel):
     adaptive_sizing: bool = True
     adaptive_risk_tiers: AdaptiveRiskTiersConfig = Field(default_factory=AdaptiveRiskTiersConfig)
     drawdown_governor: DrawdownGovernorConfig = Field(default_factory=DrawdownGovernorConfig)
-    max_contracts_hard_cap: int = 5
+    max_contracts_hard_cap: int = 10
     recent_win_rate_lookback_trades: int = 15
     recent_win_rate_fallback: float = 0.80
 

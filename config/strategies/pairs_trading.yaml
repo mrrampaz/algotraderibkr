@@ -1,4 +1,4 @@
-enabled: true
+enabled: false  # Parked - no edge in current market regime, see CLAUDE.md
 capital_allocation_pct: 25.0
 max_positions: 5
 params:

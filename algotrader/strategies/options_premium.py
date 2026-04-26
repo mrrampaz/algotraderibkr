@@ -136,7 +136,9 @@ class OptionsPremiumStrategy(StrategyBase):
         # Sizing
         self._max_risk_per_trade = params.get("max_risk_per_trade", 500)
         self._max_contracts = int(params.get("max_contracts", 5))
-        self._max_contracts = max(1, min(self._max_contracts, 5))
+        self._absolute_max_contracts = int(params.get("absolute_max_contracts", 10))
+        self._absolute_max_contracts = max(1, self._absolute_max_contracts)
+        self._max_contracts = max(1, min(self._max_contracts, self._absolute_max_contracts))
         self._max_contracts_per_spread = int(
             params.get("max_contracts_per_spread", self._max_contracts),
         )
@@ -144,8 +146,12 @@ class OptionsPremiumStrategy(StrategyBase):
             1,
             min(self._max_contracts_per_spread, self._max_contracts),
         )
+        self._base_contracts = int(params.get("base_contracts", self._max_contracts_per_spread))
+        self._base_contracts = max(1, min(self._base_contracts, self._max_contracts_per_spread))
         self._sizing_method = str(params.get("sizing_method", "exercise_exposure")).lower()
-        self._max_loss_risk_budget_pct = float(params.get("max_loss_risk_budget_pct", 2.0))
+        self._max_loss_risk_budget_pct = float(
+            params.get("max_position_loss_pct", params.get("max_loss_risk_budget_pct", 2.0)),
+        )
         self._exercise_exposure_cap_pct = float(params.get("exercise_exposure_cap_pct", 20.0))
         self._brain_max_contracts_override: int | None = None
 
@@ -1665,6 +1671,13 @@ class OptionsPremiumStrategy(StrategyBase):
             return configured_cap
         return max(1, min(self._brain_max_contracts_override, self._max_contracts))
 
+    def _target_contracts_for_spread(self) -> int:
+        """Return desired contracts before risk and capital budget clamps."""
+        effective_cap = self._effective_max_contracts_per_spread()
+        if self._brain_max_contracts_override is not None:
+            return effective_cap
+        return max(1, min(self._base_contracts, effective_cap))
+
     def _size_contracts_for_structure(
         self,
         *,
@@ -1679,10 +1692,11 @@ class OptionsPremiumStrategy(StrategyBase):
             return 0 if context == "entry" else 1
 
         effective_contract_cap = self._effective_max_contracts_per_spread()
+        target_contracts = self._target_contracts_for_spread()
         if structure in {"put_spread", "call_spread"} and self._sizing_method == "max_loss":
             risk_budget = self._spread_risk_budget(context=context)
             raw_contracts = int(risk_budget / max_loss_per_contract) if risk_budget > 0 else 0
-            contracts = min(effective_contract_cap, raw_contracts)
+            contracts = min(target_contracts, raw_contracts)
             if context == "assess":
                 contracts = max(contracts, 1)
             self._log.info(
@@ -1693,6 +1707,8 @@ class OptionsPremiumStrategy(StrategyBase):
                 sizing_method="max_loss",
                 contracts=contracts,
                 max_contracts_per_spread=effective_contract_cap,
+                target_contracts=target_contracts,
+                base_contracts=self._base_contracts,
                 configured_max_contracts_per_spread=self._max_contracts_per_spread,
                 brain_max_contracts_override=self._brain_max_contracts_override,
                 max_loss_per_contract=round(max_loss_per_contract, 2),
@@ -1708,6 +1724,7 @@ class OptionsPremiumStrategy(StrategyBase):
                 sizing_method="max_loss",
                 brain_cap=self._brain_max_contracts_override,
                 config_max=self._max_contracts_per_spread,
+                target_contracts=target_contracts,
                 budget_contracts=raw_contracts,
                 final_contracts=contracts,
             )
@@ -1717,7 +1734,7 @@ class OptionsPremiumStrategy(StrategyBase):
             int(self._max_risk_per_trade / max_loss_per_contract) if max_loss_per_contract > 0 else 0
         )
         contracts = min(
-            effective_contract_cap,
+            target_contracts,
             budget_contracts,
         )
         contracts = max(contracts, 1)
@@ -1740,6 +1757,8 @@ class OptionsPremiumStrategy(StrategyBase):
             sizing_method="exercise_exposure",
             contracts=contracts,
             max_contracts_per_spread=effective_contract_cap,
+            target_contracts=target_contracts,
+            base_contracts=self._base_contracts,
             configured_max_contracts_per_spread=self._max_contracts_per_spread,
             brain_max_contracts_override=self._brain_max_contracts_override,
             max_loss_per_contract=round(max_loss_per_contract, 2),
@@ -1754,6 +1773,7 @@ class OptionsPremiumStrategy(StrategyBase):
             sizing_method="exercise_exposure",
             brain_cap=self._brain_max_contracts_override,
             config_max=self._max_contracts_per_spread,
+            target_contracts=target_contracts,
             budget_contracts=budget_contracts,
             pre_exposure_contracts=pre_exposure_contracts,
             final_contracts=contracts,

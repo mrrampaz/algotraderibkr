@@ -164,7 +164,8 @@ class DailyBrain:
         adaptive_sizing: bool = True,
         adaptive_risk_tiers: dict[str, float] | None = None,
         drawdown_governor: dict[str, float] | None = None,
-        max_contracts_hard_cap: int = 5,
+        max_contracts_hard_cap: int = 10,
+        max_overnight_exposure_pct: float = 40.0,
         recent_win_rate_lookback_trades: int = 15,
         recent_win_rate_fallback: float = 0.80,
     ) -> None:
@@ -208,11 +209,12 @@ class DailyBrain:
         self._severe_drawdown_threshold_pct = float(
             drawdown_governor.get("severe_threshold_pct", 3.0),
         )
-        self._absolute_max_contracts = 5
+        self._absolute_max_contracts = 10
         self._max_contracts_hard_cap = max(
             1,
             min(max_contracts_hard_cap, self._absolute_max_contracts),
         )
+        self._max_overnight_exposure_pct = max(0.0, float(max_overnight_exposure_pct))
         self._recent_win_rate_lookback_trades = max(1, int(recent_win_rate_lookback_trades))
         self._recent_win_rate_fallback = min(0.99, max(0.01, float(recent_win_rate_fallback)))
         self._cash_is_default = cash_is_default
@@ -238,6 +240,7 @@ class DailyBrain:
             max_daily_risk_pct=self._max_daily_risk_pct,
             adaptive_sizing=self._adaptive_sizing,
             max_contracts_hard_cap=self._max_contracts_hard_cap,
+            max_overnight_exposure_pct=self._max_overnight_exposure_pct,
         )
 
     def decide(
@@ -405,6 +408,7 @@ class DailyBrain:
         total_risk_dollars = 0.0
         max_daily_risk_dollars = self._total_capital * (effective_max_risk_pct / 100.0)
         max_trade_capital = self._total_capital * (self._max_capital_per_trade_pct / 100.0)
+        remaining_overnight_capital = self._remaining_overnight_capital(current_positions)
 
         for candidate, score in scored:
             if len(selected) >= self._max_daily_trades:
@@ -417,6 +421,21 @@ class DailyBrain:
                 candidate,
                 options_contract_cap=option_contract_cap,
             )
+
+            capped_allocation = self._apply_overnight_exposure_cap(
+                candidate=candidate,
+                risk_amount=risk_amount,
+                position_size=position_size,
+                allocated_capital=allocated_capital,
+                remaining_overnight_capital=remaining_overnight_capital,
+                options_contract_cap=option_contract_cap,
+            )
+            if capped_allocation is None:
+                rejected.append(
+                    TradeRejection(candidate=candidate, reason="overnight_exposure_limit", brain_score=score)
+                )
+                continue
+            risk_amount, position_size, allocated_capital = capped_allocation
 
             if total_risk_dollars + risk_amount > max_daily_risk_dollars:
                 rejected.append(
@@ -453,6 +472,11 @@ class DailyBrain:
                 )
             )
             total_risk_dollars += risk_amount
+            if remaining_overnight_capital is not None:
+                remaining_overnight_capital = max(
+                    0.0,
+                    remaining_overnight_capital - allocated_capital,
+                )
 
         total_allocated = sum(s.allocated_capital for s in selected)
         cash_pct = 100.0
@@ -763,18 +787,88 @@ class DailyBrain:
         else:
             position_size = max(1, candidate.contracts) if candidate.is_options else 1
 
-        if candidate.entry_price > 0:
-            allocated_capital = candidate.entry_price * position_size
-        elif candidate.is_options and candidate.max_loss > 0:
+        if candidate.is_options and candidate.max_loss > 0:
             base_contracts = max(candidate.contracts, candidate.suggested_qty, 1)
             per_contract_max_loss = candidate.max_loss / base_contracts
             allocated_capital = per_contract_max_loss * max(position_size, 1)
+        elif candidate.entry_price > 0:
+            allocated_capital = candidate.entry_price * position_size
         else:
             allocated_capital = max(risk_amount, max_trade_capital * 0.25)
 
         allocated_capital = min(allocated_capital, max_trade_capital)
         risk_amount = min(risk_amount, allocated_capital)
         return float(risk_amount), int(position_size), float(allocated_capital)
+
+    def _remaining_overnight_capital(self, current_positions: list[Position]) -> float | None:
+        """Return remaining overnight exposure budget in dollars, or None if disabled."""
+        if self._max_overnight_exposure_pct <= 0 or self._total_capital <= 0:
+            return None
+        max_overnight_capital = self._total_capital * (self._max_overnight_exposure_pct / 100.0)
+        deployed_capital = sum(
+            abs(float(getattr(position, "market_value", 0.0) or 0.0))
+            for position in current_positions
+        )
+        return max(0.0, max_overnight_capital - deployed_capital)
+
+    def _apply_overnight_exposure_cap(
+        self,
+        *,
+        candidate: TradeCandidate,
+        risk_amount: float,
+        position_size: int,
+        allocated_capital: float,
+        remaining_overnight_capital: float | None,
+        options_contract_cap: int | None,
+    ) -> tuple[float, int, float] | None:
+        """Scale option contract count so selected trades fit the overnight cap."""
+        if remaining_overnight_capital is None:
+            return risk_amount, position_size, allocated_capital
+        if allocated_capital <= remaining_overnight_capital:
+            return risk_amount, position_size, allocated_capital
+
+        if not candidate.is_options:
+            return None
+
+        per_contract_capital = self._options_per_contract_capital(candidate)
+        if per_contract_capital <= 0:
+            return None
+
+        overnight_contract_cap = int(remaining_overnight_capital / per_contract_capital)
+        if overnight_contract_cap <= 0:
+            return None
+
+        if options_contract_cap is not None:
+            overnight_contract_cap = min(overnight_contract_cap, int(options_contract_cap))
+        overnight_contract_cap = min(overnight_contract_cap, self._max_contracts_hard_cap)
+        if overnight_contract_cap <= 0:
+            return None
+
+        capped = self._allocation_for_candidate(
+            candidate,
+            options_contract_cap=overnight_contract_cap,
+        )
+        if capped[2] > remaining_overnight_capital:
+            return None
+
+        self._log.info(
+            "overnight_exposure_contract_cap_applied",
+            strategy=candidate.strategy_name,
+            symbol=candidate.symbol,
+            requested_contracts=position_size,
+            effective_contracts=capped[1],
+            remaining_overnight_capital=round(remaining_overnight_capital, 2),
+            per_contract_capital=round(per_contract_capital, 2),
+        )
+        return capped
+
+    def _options_per_contract_capital(self, candidate: TradeCandidate) -> float:
+        base_contracts = max(candidate.contracts, candidate.suggested_qty, 1)
+        if candidate.max_loss > 0:
+            return candidate.max_loss / base_contracts
+        if candidate.risk_dollars > 0:
+            return candidate.risk_dollars / base_contracts
+        return 0.0
 
     def _compute_trade_risk(
         self,
