@@ -177,7 +177,7 @@ class Orchestrator:
 
                     brain_cfg = settings.strategy_selector.brain
                     self._brain = DailyBrain(
-                        total_capital=settings.trading.total_capital,
+                        total_capital=starting_equity,
                         regime_config=regime_config,
                         trade_journal=self._trade_journal,
                         event_calendar=self._event_calendar,

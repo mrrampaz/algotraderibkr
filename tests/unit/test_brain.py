@@ -70,6 +70,24 @@ class _FakeCalendar:
         return self._event_day
 
 
+class _FakeLogger:
+    def __init__(self) -> None:
+        self.infos: list[tuple[str, dict]] = []
+        self.warnings: list[tuple[str, dict]] = []
+
+    def info(self, event: str, **kwargs) -> None:
+        self.infos.append((event, kwargs))
+
+    def warning(self, event: str, **kwargs) -> None:
+        self.warnings.append((event, kwargs))
+
+    def debug(self, event: str, **kwargs) -> None:
+        pass
+
+    def exception(self, event: str, **kwargs) -> None:
+        pass
+
+
 def _regime(regime_type: RegimeType = RegimeType.TRENDING_UP, vix: float = 18.0) -> MarketRegime:
     return MarketRegime(
         regime_type=regime_type,
@@ -171,6 +189,36 @@ def _candidate(
         credit_received=credit_received,
         max_loss=max_loss,
         metadata=metadata or {},
+    )
+
+
+def _option_candidate(
+    *,
+    symbol: str,
+    confidence: float = 0.80,
+    edge: float = 1.0,
+    risk_dollars: float = 2800.0,
+    contracts: int = 8,
+    credit_received: float = 700.0,
+) -> TradeCandidate:
+    return _candidate(
+        symbol=symbol,
+        strategy_name="options_premium",
+        candidate_type=CandidateType.CREDIT_SPREAD,
+        direction="neutral",
+        entry_price=500.0,
+        stop_price=495.0,
+        target_price=500.0,
+        risk_dollars=risk_dollars,
+        confidence=confidence,
+        rr=0.43,
+        edge=edge,
+        options_structure="put_spread",
+        contracts=contracts,
+        suggested_qty=contracts,
+        credit_received=credit_received,
+        max_loss=risk_dollars,
+        metadata={"win_rate": 0.80},
     )
 
 
@@ -405,7 +453,7 @@ def test_adaptive_risk_tier_severe_drawdown_halves_and_clamps() -> None:
     assert limits["max_contracts"] == 5
 
 
-def test_decide_applies_adaptive_options_contract_override() -> None:
+def test_decide_applies_adaptive_options_contract_cap() -> None:
     brain = _brain(
         adaptive_sizing=True,
         max_daily_risk_pct=6.0,
@@ -422,15 +470,15 @@ def test_decide_applies_adaptive_options_contract_override() -> None:
         entry_price=500.0,
         stop_price=495.0,
         target_price=500.0,
-        risk_dollars=1425.0,
+        risk_dollars=5700.0,
         confidence=0.80,
         rr=0.35,
         edge=0.9,
         options_structure="put_spread",
-        contracts=3,
-        suggested_qty=3,
-        credit_received=300.0,
-        max_loss=1425.0,
+        contracts=12,
+        suggested_qty=12,
+        credit_received=1200.0,
+        max_loss=5700.0,
         metadata={"win_rate": 0.90},
     )
 
@@ -445,6 +493,120 @@ def test_decide_applies_adaptive_options_contract_override() -> None:
     selected = decision.selected_trades[0]
     assert selected.position_size == 10
     assert selected.risk_amount == 4750.0
+
+
+def test_adaptive_options_contract_cap_does_not_upsize_candidate() -> None:
+    brain = _brain(
+        adaptive_sizing=True,
+        max_daily_risk_pct=6.0,
+        max_capital_per_trade_pct=25.0,
+    )
+    brain._get_recent_win_rate = lambda lookback_trades=15: 0.90  # type: ignore[method-assign]
+    brain._get_current_drawdown = lambda: 0.0  # type: ignore[method-assign]
+
+    options = _option_candidate(
+        symbol="SPY",
+        risk_dollars=2800.0,
+        contracts=8,
+        credit_received=800.0,
+    )
+
+    decision = brain.decide(
+        regime=_regime(RegimeType.HIGH_VOL, vix=24.0),
+        assessments={"options_premium": OpportunityAssessment(candidates=[options])},
+        current_positions=[],
+        daily_pnl=0.0,
+    )
+
+    assert decision.num_trades == 1
+    selected = decision.selected_trades[0]
+    assert selected.position_size == 8
+    assert selected.risk_amount == 2800.0
+
+
+def test_brain_accepts_one_when_two_exceed_daily_cap() -> None:
+    """When 2 candidates would exceed daily risk cap, Brain accepts the higher-EV one."""
+    brain = _brain(
+        adaptive_sizing=False,
+        max_daily_risk_pct=6.0,
+        max_capital_per_trade_pct=25.0,
+    )
+    spy = _option_candidate(
+        symbol="SPY",
+        confidence=0.85,
+        edge=1.2,
+        risk_dollars=3500.0,
+        contracts=10,
+        credit_received=900.0,
+    )
+    qqq = _option_candidate(
+        symbol="QQQ",
+        confidence=0.80,
+        edge=1.0,
+        risk_dollars=3500.0,
+        contracts=10,
+        credit_received=900.0,
+    )
+
+    decision = brain.decide(
+        regime=_regime(RegimeType.HIGH_VOL, vix=24.0),
+        assessments={"options_premium": OpportunityAssessment(candidates=[qqq, spy])},
+        current_positions=[],
+        daily_pnl=0.0,
+    )
+
+    assert [s.candidate.symbol for s in decision.selected_trades] == ["SPY"]
+    rejected = {(r.candidate.symbol, r.reason) for r in decision.rejected_trades}
+    assert ("QQQ", "daily_risk_limit") in rejected
+
+
+def test_brain_logs_actionable_diagnostics_on_full_rejection() -> None:
+    """When all candidates are risk-rejected, log includes per-candidate risk and cap."""
+    brain = _brain(
+        adaptive_sizing=False,
+        max_daily_risk_pct=2.0,
+        max_capital_per_trade_pct=25.0,
+    )
+    fake_log = _FakeLogger()
+    brain._log = fake_log  # type: ignore[assignment]
+    spy = _option_candidate(symbol="SPY", risk_dollars=3000.0, contracts=10, credit_received=900.0)
+    qqq = _option_candidate(symbol="QQQ", risk_dollars=3000.0, contracts=10, credit_received=900.0)
+
+    decision = brain.decide(
+        regime=_regime(RegimeType.HIGH_VOL, vix=24.0),
+        assessments={"options_premium": OpportunityAssessment(candidates=[spy, qqq])},
+        current_positions=[],
+        daily_pnl=0.0,
+    )
+
+    assert decision.is_cash_day
+    event, payload = next(item for item in fake_log.warnings if item[0] == "brain_risk_limit_blocked_all")
+    assert event == "brain_risk_limit_blocked_all"
+    assert payload["daily_risk_cap_pct"] == 2.0
+    assert payload["total_requested_risk_pct"] == 6.0
+    assert payload["individual_risk_pcts"] == [3.0, 3.0]
+    assert payload["daily_risk_rejections"] == 2
+
+
+def test_paired_spreads_fit_within_daily_risk_at_3pct_per_position() -> None:
+    """SPY + QQQ paired spreads at 3% each fit under 6% daily cap."""
+    brain = _brain(
+        adaptive_sizing=False,
+        max_daily_risk_pct=6.0,
+        max_capital_per_trade_pct=25.0,
+    )
+    spy = _option_candidate(symbol="SPY", risk_dollars=3000.0, contracts=8, credit_received=800.0)
+    qqq = _option_candidate(symbol="QQQ", risk_dollars=3000.0, contracts=8, credit_received=800.0)
+
+    decision = brain.decide(
+        regime=_regime(RegimeType.HIGH_VOL, vix=24.0),
+        assessments={"options_premium": OpportunityAssessment(candidates=[spy, qqq])},
+        current_positions=[],
+        daily_pnl=0.0,
+    )
+
+    assert [s.candidate.symbol for s in decision.selected_trades] == ["SPY", "QQQ"]
+    assert decision.total_risk_pct == 6.0
 
 
 def test_options_only_brain_decision() -> None:

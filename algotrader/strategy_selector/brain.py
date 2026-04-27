@@ -409,6 +409,7 @@ class DailyBrain:
         max_daily_risk_dollars = self._total_capital * (effective_max_risk_pct / 100.0)
         max_trade_capital = self._total_capital * (self._max_capital_per_trade_pct / 100.0)
         remaining_overnight_capital = self._remaining_overnight_capital(current_positions)
+        risk_budget_requests: list[dict[str, Any]] = []
 
         for candidate, score in scored:
             if len(selected) >= self._max_daily_trades:
@@ -436,8 +437,39 @@ class DailyBrain:
                 )
                 continue
             risk_amount, position_size, allocated_capital = capped_allocation
+            candidate_risk_pct = (
+                risk_amount / self._total_capital * 100.0
+                if self._total_capital > 0
+                else 0.0
+            )
+            risk_budget_requests.append(
+                {
+                    "strategy": candidate.strategy_name,
+                    "symbol": candidate.symbol,
+                    "risk_dollars": risk_amount,
+                    "risk_pct": candidate_risk_pct,
+                    "score": score,
+                }
+            )
 
             if total_risk_dollars + risk_amount > max_daily_risk_dollars:
+                self._log.info(
+                    "candidate_skipped_risk_budget",
+                    strategy=candidate.strategy_name,
+                    symbol=candidate.symbol,
+                    candidate_risk=round(risk_amount, 2),
+                    candidate_risk_pct=round(candidate_risk_pct, 4),
+                    cumulative_risk=round(total_risk_dollars, 2),
+                    cumulative_risk_pct=round(
+                        total_risk_dollars / self._total_capital * 100.0,
+                        4,
+                    )
+                    if self._total_capital > 0
+                    else 0.0,
+                    max_risk=round(max_daily_risk_dollars, 2),
+                    max_risk_pct=round(effective_max_risk_pct, 4),
+                    reason="Would exceed daily risk limit",
+                )
                 rejected.append(
                     TradeRejection(candidate=candidate, reason="daily_risk_limit", brain_score=score)
                 )
@@ -493,6 +525,42 @@ class DailyBrain:
         )
 
         if not selected and self._cash_is_default:
+            daily_risk_rejections = [r for r in rejected if r.reason == "daily_risk_limit"]
+            if daily_risk_rejections:
+                total_requested_risk = sum(item["risk_dollars"] for item in risk_budget_requests)
+                total_requested_risk_pct = (
+                    total_requested_risk / self._total_capital * 100.0
+                    if self._total_capital > 0
+                    else 0.0
+                )
+                self._log.warning(
+                    "brain_risk_limit_blocked_all",
+                    candidates=len(all_candidates),
+                    risk_evaluated_candidates=len(risk_budget_requests),
+                    daily_risk_rejections=len(daily_risk_rejections),
+                    total_requested_risk_dollars=round(total_requested_risk, 2),
+                    total_requested_risk_pct=round(total_requested_risk_pct, 4),
+                    daily_risk_cap_dollars=round(max_daily_risk_dollars, 2),
+                    daily_risk_cap_pct=round(effective_max_risk_pct, 4),
+                    capital_base=round(self._total_capital, 2),
+                    individual_risk_pcts=[
+                        round(float(item["risk_pct"]), 4) for item in risk_budget_requests
+                    ],
+                    individual_risks=[
+                        {
+                            "strategy": item["strategy"],
+                            "symbol": item["symbol"],
+                            "risk_dollars": round(float(item["risk_dollars"]), 2),
+                            "risk_pct": round(float(item["risk_pct"]), 4),
+                            "score": round(float(item["score"]), 4),
+                        }
+                        for item in risk_budget_requests
+                    ],
+                    suggestion=(
+                        "Candidate risk exceeds daily cap. Reduce per-position risk, "
+                        "verify Brain capital base, or keep greedy selection enabled."
+                    ),
+                )
             self._log.info("brain_cash_day", reason=reasoning)
 
         total_risk_pct = (total_risk_dollars / self._total_capital * 100.0) if self._total_capital > 0 else 0.0
@@ -769,13 +837,20 @@ class DailyBrain:
         options_contract_cap: int | None = None,
     ) -> tuple[float, int, float]:
         max_trade_capital = self._total_capital * (self._max_capital_per_trade_pct / 100.0)
-        risk_amount = self._compute_trade_risk(
-            candidate,
-            options_contracts=options_contract_cap if candidate.is_options else None,
-        )
+        option_contracts: int | None = None
+        if candidate.is_options:
+            candidate_contracts = max(candidate.contracts, candidate.suggested_qty, 1)
+            option_contracts = min(candidate_contracts, self._max_contracts_hard_cap)
+            if options_contract_cap is not None:
+                option_contracts = min(option_contracts, max(1, int(options_contract_cap)))
+            option_contracts = max(1, option_contracts)
+            risk_amount = self._compute_trade_risk(candidate, options_contracts=option_contracts)
+            position_size = option_contracts
+        else:
+            risk_amount = self._compute_trade_risk(candidate)
 
-        if candidate.is_options and options_contract_cap is not None:
-            position_size = max(1, min(int(options_contract_cap), self._max_contracts_hard_cap))
+        if candidate.is_options:
+            position_size = max(1, int(position_size))
         elif candidate.suggested_qty > 0:
             position_size = candidate.suggested_qty
         elif candidate.entry_price > 0:
