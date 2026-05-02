@@ -3,10 +3,58 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
+import time
+from datetime import datetime, timedelta
+from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import structlog
+
+ET = ZoneInfo("America/New_York")
+
+
+class ETMidnightHandler(TimedRotatingFileHandler):
+    """TimedRotatingFileHandler that rotates at midnight US/Eastern."""
+
+    rollover_timezone = ET
+
+    def computeRollover(self, currentTime: float) -> int:
+        """Return the next midnight timestamp in US/Eastern."""
+
+        current_et = datetime.fromtimestamp(currentTime, self.rollover_timezone)
+        next_midnight_et = (current_et + timedelta(days=1)).replace(
+            hour=0,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        return int(next_midnight_et.timestamp())
+
+    def doRollover(self) -> None:
+        """Rotate using an ET date suffix, independent of system timezone."""
+
+        current_time = int(time.time())
+        rollover_et = datetime.fromtimestamp(self.rolloverAt, self.rollover_timezone)
+        suffix_date = rollover_et - timedelta(days=1)
+        dfn = self.rotation_filename(
+            self.baseFilename + "." + suffix_date.strftime(self.suffix)
+        )
+        if os.path.exists(dfn):
+            return
+
+        if self.stream:
+            self.stream.close()
+            self.stream = None
+        self.rotate(self.baseFilename, dfn)
+        if self.backupCount > 0:
+            for filename in self.getFilesToDelete():
+                os.remove(filename)
+        if not self.delay:
+            self.stream = self._open()
+        self.rolloverAt = self.computeRollover(current_time)
 
 
 class _IBKRFilledOrderNoiseFilter(logging.Filter):
@@ -67,7 +115,15 @@ def setup_logging(level: str = "INFO", log_file: str | None = None, json_format:
 
     # File handler — JSON format
     if log_file:
-        file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        file_handler = ETMidnightHandler(
+            filename=log_file,
+            when="midnight",
+            interval=1,
+            backupCount=30,
+            encoding="utf-8",
+            utc=False,
+        )
+        file_handler.suffix = "%Y-%m-%d"
         file_handler.setLevel(numeric_level)
 
         if json_format:
