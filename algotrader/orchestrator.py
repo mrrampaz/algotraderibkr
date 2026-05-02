@@ -36,6 +36,7 @@ from algotrader.strategies.registry import registry
 from algotrader.strategy_selector.scorer import StrategyScorer
 from algotrader.strategy_selector.allocator import CapitalAllocator
 from algotrader.strategy_selector.reviewer import MidDayReviewer
+from algotrader.tracking.broker_ledger import BrokerLedger
 from algotrader.tracking.journal import TradeJournal
 from algotrader.tracking.portfolio import PortfolioTracker
 from algotrader.tracking.metrics import MetricsCalculator
@@ -79,6 +80,7 @@ class Orchestrator:
         self._event_bus = EventBus()
         self._data_cache = DataCache()
         self._ibkr_conn = None
+        self._broker_ledger: BrokerLedger | None = None
 
         broker_provider = settings.broker.provider.lower()
         if broker_provider == "ibkr":
@@ -95,6 +97,10 @@ class Orchestrator:
 
             self._data_provider = IBKRDataProvider(connection=self._ibkr_conn)
             self._executor = IBKRExecutor(connection=self._ibkr_conn)
+            self._broker_ledger = BrokerLedger(
+                db_path="data/journal/trades.db",
+                ib=self._ibkr_conn.ib,
+            )
             self._log.info("broker_initialized", provider="ibkr")
         else:
             # Data provider
@@ -207,6 +213,7 @@ class Orchestrator:
                         max_overnight_exposure_pct=settings.risk.max_overnight_exposure_pct,
                         recent_win_rate_lookback_trades=brain_cfg.recent_win_rate_lookback_trades,
                         recent_win_rate_fallback=brain_cfg.recent_win_rate_fallback,
+                        broker_ledger=self._broker_ledger,
                     )
                     self._use_brain = True
                     self._log.info("strategy_selector_initialized", mode="brain")
@@ -624,6 +631,12 @@ class Orchestrator:
         # Evict expired cache entries periodically
         self._data_cache.evict_expired()
 
+        # Reconcile broker fills vs strategy state (log-only, cheap SQLite read)
+        try:
+            self._reconcile_broker_vs_strategy()
+        except Exception:
+            self._log.exception("reconcile_broker_vs_strategy_failed")
+
         # Write dashboard state every 5th cycle
         self._cycle_count += 1
         if self._cycle_count % 5 == 0:
@@ -922,9 +935,12 @@ class Orchestrator:
             except Exception:
                 self._log.exception("strategy_state_save_failed", name=name)
 
-        # Log daily summary
+        # Log daily summary — prefer broker ledger as source of truth when available
         try:
-            summary = self._trade_journal.get_daily_summary()
+            if self._broker_ledger is not None:
+                summary = self._broker_ledger.get_daily_summary()
+            else:
+                summary = self._trade_journal.get_daily_summary()
             portfolio = self._portfolio_tracker.get_snapshot()
             self._log.info(
                 "daily_summary",
@@ -933,6 +949,7 @@ class Orchestrator:
                 losses=summary["losses"],
                 total_pnl=round(summary["total_pnl"], 2),
                 equity=portfolio["equity"],
+                source=summary.get("source", "strategy_journal"),
             )
         except Exception:
             self._log.exception("summary_generation_failed")
@@ -992,9 +1009,12 @@ class Orchestrator:
         except Exception:
             self._log.exception("weight_learning_failed")
 
-        # Post-market analysis: daily summary alert
+        # Post-market analysis: daily summary alert (broker ledger as source of truth)
         try:
-            summary = self._trade_journal.get_daily_summary()
+            if self._broker_ledger is not None:
+                summary = self._broker_ledger.get_daily_summary()
+            else:
+                summary = self._trade_journal.get_daily_summary()
             self._alert_manager.send_daily_summary(summary)
         except Exception:
             self._log.exception("daily_summary_alert_failed")
@@ -1026,6 +1046,101 @@ class Orchestrator:
             except Exception:
                 self._log.debug("strategy_symbol_map_failed", strategy=name)
         return symbol_map
+
+    def _reconcile_broker_vs_strategy(self) -> None:
+        """
+        Compare broker open option legs (from broker_fills) against
+        legs tracked in strategy._trades.  Log warnings for any mismatch.
+
+        Reconciliation is log-only: no auto-recovery in Phase 1.
+        """
+        if self._broker_ledger is None:
+            return
+
+        try:
+            broker_legs = {
+                (r["symbol"], r["expiry"], r["strike"], r["right"])
+                for r in self._broker_ledger.get_open_option_legs()
+            }
+        except Exception:
+            self._log.exception("reconcile_broker_legs_failed")
+            return
+
+        strategy_legs: set[tuple] = set()
+        try:
+            strategy_legs = self._collect_strategy_tracked_legs()
+        except Exception:
+            self._log.exception("reconcile_strategy_legs_failed")
+            return
+
+        broker_only = broker_legs - strategy_legs
+        strategy_only = strategy_legs - broker_legs
+
+        if broker_only:
+            self._log.warning(
+                "orphaned_broker_legs",
+                count=len(broker_only),
+                legs=[
+                    {"symbol": sym, "expiry": exp, "strike": stk, "right": r}
+                    for sym, exp, stk, r in broker_only
+                ],
+                severity="HIGH",
+                note="Broker holds option legs that no strategy is tracking. "
+                     "Same-day-expiry guard or manual intervention required.",
+            )
+
+        if strategy_only:
+            self._log.warning(
+                "phantom_strategy_legs",
+                count=len(strategy_only),
+                legs=[
+                    {"symbol": sym, "expiry": exp, "strike": stk, "right": r}
+                    for sym, exp, stk, r in strategy_only
+                ],
+                severity="HIGH",
+                note="Strategy thinks it has legs that broker does not. "
+                     "Possibly missed exit fill or stale state.",
+            )
+
+    def _collect_strategy_tracked_legs(self) -> set[tuple[str, str, float, str]]:
+        """
+        Walk all strategies and collect their tracked option legs.
+
+        Returns a set of (symbol, expiry_YYYYMMDD, strike, right) tuples.
+        Only OptionsPremiumStrategy implements _trades with PremiumTrade objects;
+        other strategies are skipped gracefully.
+        """
+        legs: set[tuple[str, str, float, str]] = set()
+        for strategy in self._strategies.values():
+            trades_dict = getattr(strategy, "_trades", None)
+            if not isinstance(trades_dict, dict):
+                continue
+            for trade in trades_dict.values():
+                expiration = getattr(trade, "expiration", None)
+                if expiration is None:
+                    continue
+                expiry_str = expiration.strftime("%Y%m%d")
+                underlying = getattr(trade, "underlying", "")
+                structure = getattr(trade, "structure", "")
+                short_strike = getattr(trade, "short_strike", None)
+                long_strike = getattr(trade, "long_strike", None)
+                call_short = getattr(trade, "call_short_strike", None)
+                call_long = getattr(trade, "call_long_strike", None)
+
+                if structure in ("put_spread", "iron_condor"):
+                    if short_strike is not None:
+                        legs.add((underlying, expiry_str, float(short_strike), "P"))
+                    if long_strike is not None:
+                        legs.add((underlying, expiry_str, float(long_strike), "P"))
+
+                if structure in ("call_spread", "iron_condor"):
+                    cs = call_short if structure == "iron_condor" else short_strike
+                    cl = call_long if structure == "iron_condor" else long_strike
+                    if cs is not None:
+                        legs.add((underlying, expiry_str, float(cs), "C"))
+                    if cl is not None:
+                        legs.add((underlying, expiry_str, float(cl), "C"))
+        return legs
 
     def _write_dashboard_state(self) -> None:
         """Write state files for the Streamlit dashboard to read."""

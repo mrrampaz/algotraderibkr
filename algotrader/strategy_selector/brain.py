@@ -168,10 +168,12 @@ class DailyBrain:
         max_overnight_exposure_pct: float = 40.0,
         recent_win_rate_lookback_trades: int = 15,
         recent_win_rate_fallback: float = 0.80,
+        broker_ledger: Any | None = None,
     ) -> None:
         self._log = logger.bind(component="daily_brain")
         self._total_capital = total_capital
         self._trade_journal = trade_journal or TradeJournal()
+        self._broker_ledger = broker_ledger
         self._event_calendar = event_calendar or EventCalendar()
         regime_config = regime_config or {}
         adaptive_risk_tiers = adaptive_risk_tiers or {}
@@ -982,7 +984,40 @@ class DailyBrain:
         return self._total_capital * 0.0025
 
     def _get_recent_win_rate(self, lookback_trades: int = 15) -> float | None:
-        """Get recent win rate from the last N closed trades in journal DB."""
+        """
+        Get recent win rate from the last N closed round-trips.
+
+        Uses broker_ledger (IBKR fill truth) when available; falls back to
+        the strategy-internal trades table otherwise.
+        """
+        # --- Broker ledger path (source of truth) ---
+        if self._broker_ledger is not None:
+            try:
+                round_trips = self._broker_ledger.get_recent_closed_round_trips(
+                    n=max(1, int(lookback_trades)),
+                )
+                if len(round_trips) < 5:
+                    self._log.debug(
+                        "recent_win_rate_ledger_insufficient",
+                        round_trips=len(round_trips),
+                        needed=5,
+                    )
+                    return None
+                wins = sum(1 for rt in round_trips if rt["net_pnl"] > 0)
+                win_rate = wins / len(round_trips)
+                self._log.debug(
+                    "recent_win_rate_computed",
+                    recent_win_rate_source="broker_ledger",
+                    round_trips=len(round_trips),
+                    wins=wins,
+                    win_rate=round(win_rate, 3),
+                )
+                return win_rate
+            except Exception:
+                self._log.debug("recent_win_rate_ledger_failed", exc_info=True)
+                # Fall through to strategy-journal path
+
+        # --- Strategy journal fallback ---
         try:
             db_path = Path(getattr(self._trade_journal, "_db_path", "data/journal/trades.db"))
             if not db_path.exists():
@@ -1010,7 +1045,15 @@ class DailyBrain:
                 return None
 
             wins = sum(1 for row in rows if float(row[0]) > 0)
-            return wins / len(rows)
+            win_rate = wins / len(rows)
+            self._log.debug(
+                "recent_win_rate_computed",
+                recent_win_rate_source="strategy_journal",
+                trades=len(rows),
+                wins=wins,
+                win_rate=round(win_rate, 3),
+            )
+            return win_rate
         except Exception:
             self._log.debug("recent_win_rate_fetch_failed", exc_info=True)
             return None
