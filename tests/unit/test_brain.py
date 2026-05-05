@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -726,6 +727,47 @@ def test_adaptive_sizing_scales_down_in_drawdown() -> None:
     assert no_drawdown["max_contracts"] == 10
     assert moderate_drawdown["max_contracts"] == 9
     assert moderate_drawdown["max_daily_risk_pct"] < no_drawdown["max_daily_risk_pct"]
+
+
+def test_current_drawdown_ignores_stale_startup_snapshot(tmp_path, monkeypatch) -> None:
+    """Cold start should not use a broker snapshot left by a prior process."""
+    monkeypatch.chdir(tmp_path)
+    state_dir = tmp_path / "data" / "state"
+    state_dir.mkdir(parents=True)
+    brain = _brain()
+    stale_timestamp = brain._initialized_at - timedelta(seconds=1)
+    (state_dir / "broker_snapshot.json").write_text(
+        json.dumps(
+            {
+                "timestamp": stale_timestamp.isoformat(),
+                "equity": 104_198.0,
+                "drawdown_pct": 100.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert brain._get_current_drawdown() == 0.0
+
+
+def test_current_drawdown_reads_fresh_broker_snapshot(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    state_dir = tmp_path / "data" / "state"
+    state_dir.mkdir(parents=True)
+    brain = _brain()
+    fresh_timestamp = brain._initialized_at + timedelta(seconds=1)
+    (state_dir / "broker_snapshot.json").write_text(
+        json.dumps(
+            {
+                "timestamp": fresh_timestamp.isoformat(),
+                "equity": 104_198.0,
+                "drawdown_pct": 2.25,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert brain._get_current_drawdown() == 2.25
 
 
 def test_brain_strategy_specific_thresholds() -> None:

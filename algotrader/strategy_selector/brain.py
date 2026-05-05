@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 import sqlite3
 from dataclasses import dataclass
@@ -171,6 +172,7 @@ class DailyBrain:
         broker_ledger: Any | None = None,
     ) -> None:
         self._log = logger.bind(component="daily_brain")
+        self._initialized_at = datetime.now(pytz.UTC)
         self._total_capital = total_capital
         self._trade_journal = trade_journal or TradeJournal()
         self._broker_ledger = broker_ledger
@@ -1002,17 +1004,17 @@ class DailyBrain:
                         round_trips=len(round_trips),
                         needed=5,
                     )
-                    return None
-                wins = sum(1 for rt in round_trips if rt["net_pnl"] > 0)
-                win_rate = wins / len(round_trips)
-                self._log.debug(
-                    "recent_win_rate_computed",
-                    recent_win_rate_source="broker_ledger",
-                    round_trips=len(round_trips),
-                    wins=wins,
-                    win_rate=round(win_rate, 3),
-                )
-                return win_rate
+                else:
+                    wins = sum(1 for rt in round_trips if rt["net_pnl"] > 0)
+                    win_rate = wins / len(round_trips)
+                    self._log.debug(
+                        "recent_win_rate_computed",
+                        recent_win_rate_source="broker_ledger",
+                        round_trips=len(round_trips),
+                        wins=wins,
+                        win_rate=round(win_rate, 3),
+                    )
+                    return win_rate
             except Exception:
                 self._log.debug("recent_win_rate_ledger_failed", exc_info=True)
                 # Fall through to strategy-journal path
@@ -1076,9 +1078,33 @@ class DailyBrain:
         snapshot = self._load_broker_snapshot()
         if not snapshot:
             return 0.0
+        timestamp = snapshot.get("timestamp")
+        if not isinstance(timestamp, str) or not timestamp:
+            self._log.debug("broker_snapshot_missing_timestamp_ignored")
+            return 0.0
+        try:
+            snapshot_time = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        except ValueError:
+            self._log.debug(
+                "broker_snapshot_timestamp_invalid_ignored",
+                timestamp=timestamp,
+            )
+            return 0.0
+        if snapshot_time.tzinfo is None:
+            snapshot_time = pytz.UTC.localize(snapshot_time)
+        snapshot_time = snapshot_time.astimezone(pytz.UTC)
+        if snapshot_time < self._initialized_at:
+            self._log.debug(
+                "broker_snapshot_stale_ignored",
+                snapshot_timestamp=timestamp,
+                initialized_at=self._initialized_at.isoformat(),
+            )
+            return 0.0
         value = snapshot.get("drawdown_pct", 0.0)
         if isinstance(value, (int, float)):
-            return float(value)
+            drawdown_pct = float(value)
+            if math.isfinite(drawdown_pct):
+                return max(0.0, drawdown_pct)
         return 0.0
 
     def _already_positioned(

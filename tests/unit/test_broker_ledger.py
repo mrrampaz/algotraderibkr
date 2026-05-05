@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import tempfile
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from unittest.mock import MagicMock, patch
 
 import pytz
@@ -351,8 +351,10 @@ class TestBrainUsesLedger:
     def test_brain_falls_back_when_ledger_insufficient(self, tmp_path):
         """Brain returns None (→ fallback) when ledger has < 5 round-trips."""
         from algotrader.strategy_selector.brain import DailyBrain
+        from algotrader.tracking.journal import TradeJournal
 
         ledger = _make_ledger(tmp_path)
+        empty_journal = TradeJournal(db_path=str(tmp_path / "empty_journal.db"))
         ts = datetime.now(pytz.UTC).isoformat()
         # Only 3 round-trips — below the minimum of 5
         for i in range(3):
@@ -361,11 +363,52 @@ class TestBrainUsesLedger:
 
         brain = DailyBrain(
             total_capital=100_000,
+            trade_journal=empty_journal,
             broker_ledger=ledger,
             recent_win_rate_fallback=0.80,
         )
         rate = brain._get_recent_win_rate(lookback_trades=15)
         assert rate is None  # triggers fallback path in caller
+        empty_journal.close()
+
+    def test_brain_uses_journal_when_ledger_insufficient_but_journal_has_history(self, tmp_path):
+        """Insufficient broker-ledger history should not hide strategy-journal history."""
+        from algotrader.core.models import OrderSide, TradeRecord
+        from algotrader.strategy_selector.brain import DailyBrain
+        from algotrader.tracking.journal import TradeJournal
+
+        ledger = _make_ledger(tmp_path)
+        journal = TradeJournal(db_path=ledger._db_path)
+        ts = datetime.now(pytz.UTC).isoformat()
+        for i in range(3):
+            _fill(ledger, exec_id=f"L_{i}", perm_id=400 + i,
+                  realized_pnl=100.0, commission=0.65, ts=ts)
+
+        base_time = datetime.now(pytz.UTC) - timedelta(days=1)
+        for i, pnl in enumerate([100.0, 120.0, -50.0, 80.0, -25.0]):
+            journal.record_trade(
+                TradeRecord(
+                    strategy_name="options_premium",
+                    symbol="SPY",
+                    side=OrderSide.SELL,
+                    qty=1,
+                    entry_price=1.0,
+                    exit_price=0.5,
+                    entry_time=base_time + timedelta(minutes=i),
+                    exit_time=base_time + timedelta(minutes=i + 1),
+                    realized_pnl=pnl,
+                )
+            )
+
+        brain = DailyBrain(
+            total_capital=100_000,
+            trade_journal=journal,
+            broker_ledger=ledger,
+            recent_win_rate_fallback=0.80,
+        )
+        rate = brain._get_recent_win_rate(lookback_trades=15)
+        assert rate == pytest.approx(0.6)
+        journal.close()
 
     def test_brain_falls_back_to_journal_when_no_ledger(self, tmp_path):
         """Brain uses strategy-journal path when broker_ledger=None, returns None for empty DB."""
