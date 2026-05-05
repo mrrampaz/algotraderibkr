@@ -209,6 +209,7 @@ def test_qqq_strike_rounding_all_paths() -> None:
     entry_strategy.set_capital(100000.0)
     entry_strategy._get_atr = lambda _symbol: 14.44
     entry_strategy._get_sma5_bias = lambda _symbol, _price: "bullish"
+    entry_strategy._estimate_live_credit_per_contract = lambda **_kwargs: 150.0
 
     entry_signals = entry_strategy._scan_entries(
         datetime.now(pytz.timezone("America/New_York")),
@@ -246,6 +247,7 @@ def test_qqq_strike_rounding_all_paths() -> None:
     condor_strategy.set_capital(100000.0)
     condor_strategy._get_atr = lambda _symbol: 14.44
     condor_strategy._get_sma5_bias = lambda _symbol, _price: "neutral"
+    condor_strategy._estimate_live_credit_per_contract = lambda **_kwargs: 150.0
 
     condor_signals = condor_strategy._scan_entries(
         datetime.now(pytz.timezone("America/New_York")),

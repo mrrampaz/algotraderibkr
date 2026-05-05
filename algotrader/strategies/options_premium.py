@@ -471,14 +471,24 @@ class OptionsPremiumStrategy(StrategyBase):
             )
             selected_credit_per_contract = estimated_credit_per_contract
             if live_credit_per_contract is None:
-                log_fn = self._log.warning if self._require_live_credit_estimate else self._log.info
-                log_fn(
-                    "options_live_credit_unavailable",
-                    underlying=underlying,
-                    structure=structure,
-                    contracts=contracts,
-                    reason="falling_back_to_modeled_credit_estimate",
-                )
+                if self._require_live_credit_estimate:
+                    self._log.warning(
+                        "options_live_credit_unavailable",
+                        underlying=underlying,
+                        structure=structure,
+                        contracts=contracts,
+                        reason="live_credit_unavailable",
+                        skip_reason="live_credit_required",
+                    )
+                    continue
+                else:
+                    self._log.info(
+                        "options_live_credit_unavailable",
+                        underlying=underlying,
+                        structure=structure,
+                        contracts=contracts,
+                        reason="falling_back_to_modeled_credit_estimate",
+                    )
             else:
                 live_max_loss_per_contract = max(1.0, spread_width - live_credit_per_contract)
                 live_ok, live_ratio, live_reason = self._passes_credit_quality_gate(
