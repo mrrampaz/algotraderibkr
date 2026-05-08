@@ -6,6 +6,33 @@ Adaptive multi-strategy swing trading system on Interactive Brokers (or Alpaca f
 The Brain evaluates concrete `TradeCandidate` objects from 7 strategies and deploys capital only into the best setups.
 Cash is the default when no candidate clears thresholds; intraday-only behavior is explicitly scoped (for example, `gap_reversal` EOD flattening and expiry-risk guards).
 
+## Source of truth hierarchy
+
+When answering questions about what happened in the account (fills, P&L, position
+history), three data sources exist with different levels of authority. Always
+prefer the higher-authority source for the period in question.
+
+1. **`broker_fills` table (Phase 1 ledger)** — the system's source of truth for
+   what actually happened in the broker account. Populated from IBKR
+   `execDetailsEvent` and `commissionReportEvent`. Deployed in commit `e653ea7`
+   and is the authoritative record for any period after May 2 2026.
+2. **`trades.db` `trades` table** — strategy-internal accounting. May diverge
+   from broker truth when positions are orphaned, closed by safety guards (for
+   example `_check_expiry_risk()`), or otherwise closed outside normal strategy
+   exit logic. Historical rows before commit `498f041` (May 2 2026) may be
+   incomplete due to the pre-Phase-1 orphan bug. Use this for strategy state and
+   decision attribution, not for accounting.
+3. **IBKR statements (PDF)** — regulatory record. Use for tax purposes and for
+   any historical P&L verification covering periods before `broker_fills` was
+   deployed.
+
+For any P&L question, consult sources in this order:
+
+- Period is post-May-2 2026 -> `broker_fills`.
+- Period is pre-May-2 2026 (or pre-Phase-1) -> IBKR statements.
+- Do **not** trust `trades.db` for P&L summaries — it is for strategy state, not
+  accounting.
+
 ## Architecture Overview
 
 ### Decision Flow
