@@ -15,30 +15,49 @@ Cash is the default when no candidate clears thresholds; intraday-only behavior 
 4. Startup morning reconciliation runs `_morning_reconciliation()` and compares broker startup positions vs strategy-restored held symbols, logging `unexpected_position_found` when mismatches exist.
 5. Pre-market intelligence refresh runs before regular trading loop.
 6. Each cycle detects market regime and asks enabled strategies for `OpportunityAssessment` with explicit `TradeCandidate` rows.
-7. In `strategy_selector.mode: brain`, `DailyBrain` filters/scores/ranks candidates across strategies.
+7. In `strategy_selector.mode: brain`, `DailyBrain.decide_dynamic()` filters/scores/ranks candidates across strategies and emits close-early recommendations for open positions.
 8. Brain selects a concentrated set of trades under confidence/RR/edge/risk/capital limits and applies per-strategy capital (`set_capital`).
 9. Strategies still run cycles and manage existing positions even when new-entry capital is set to `0.0`.
 10. Morning open review (`_morning_position_review()`, ~9:30-11:00 AM ET) can trigger per-strategy `review_positions_at_open()` gap-stop exits.
-11. Midday review runs once and can tighten entry standards and emit close recommendations.
+11. Brain re-decides on cadence (`cadence_minutes`, default 60 min) and on event triggers (regime flip, VIX delta) within the configured entry window. Cumulative trade count is capped at `max_daily_trades` across the day.
 12. Near close, `_handle_market_close()` flattens intraday-only books, runs per-strategy `close_positions_for_eod()`, and keeps expiry/exercise safeguards active (`_check_expiry_risk()` around 3:45 PM ET).
 13. Decisions/state are persisted to `data/state/*.json` (including `brain_decision.json`, `assessments.json`, `broker_snapshot.json`).
 
+### Dynamic Brain Cadence
+- `brain.cadence_minutes` (default 60): minimum minutes between Brain decisions during the entry window.
+- `brain.entry_window_start` / `entry_window_end` (default 09:30 / 15:30 ET): outside this window the Brain does not run new-entry decisions; existing position management still happens.
+- `brain.regime_change_triggers_decision` (default true): if the regime flips between cadence ticks, the Brain re-decides immediately.
+- `brain.vix_delta_trigger` (default 1.5): re-decide if VIX has moved this many points from the prior decision's reading.
+- `brain.late_session_confidence_bump` (default 0.05): per-hour-past-noon-ET tightening of the confidence floor inside `decide_dynamic()`. So 1 PM = +0.05, 2 PM = +0.10, etc.
+- Cumulative trade cap: `_brain_trades_today` is incremented per `decide_dynamic()` call and the Brain refuses further runs once it hits `max_daily_trades`.
+- Idempotency guard: cadence-triggered runs are skipped when the candidate signature is unchanged AND no positions are open (avoids redundant identical decisions).
+- Reset: `_brain_decision_day` resets all counters at the start of each ET trading day.
+
 ## Active Strategies
 
-Currently only `options_premium` is enabled. The other 6 strategies are parked
-(`enabled: false` in their config files) because:
+All 7 strategies are enabled (re-enabled 2026-05-10 alongside the dynamic Brain).
+Capital allocations sum to 95% on full deployment; the Brain decides which slices
+get used per cycle and `cash_is_default` keeps unused capital flat.
 
-- 8 weeks of paper trading showed only options_premium produces real edge
-- Brain's EV-concentration correctly allocates 100% to options
-- Other strategies either don't produce candidates or produce candidates below threshold
-- This is a market regime issue, not a code issue
+| Strategy | Inline alloc % | Best regime |
+|---|---:|---|
+| pairs_trading | 25.0 | ranging |
+| momentum | 15.0 | trending |
+| options_premium | 15.0 | ranging / high_vol |
+| gap_reversal | 12.0 | mixed AM regimes |
+| vwap_reversion | 10.0 | ranging / low_vol |
+| sector_rotation | 10.0 | trending / ranging |
+| event_driven | 8.0 | event_day |
 
-Parked strategies (still in repo, code intact, tests passing):
-- momentum, vwap_reversion, gap_reversal, pairs_trading, sector_rotation, event_driven
+Disabling a strategy requires `enabled: false` in **either** its
+`config/strategies/<name>.yaml` file **or** its inline `config/settings.yaml`
+`strategies.<name>` block — the orchestrator merges them with logical AND
+([orchestrator.py:392](algotrader/orchestrator.py:392)).
 
-To re-enable any strategy: set `enabled: true` in its config YAML and the matching
-`config/settings.yaml` strategy override if present. The Brain's per-strategy
-threshold overrides remain in settings.yaml for future use.
+Historical context: an 8-week paper run from Feb-Apr 2026 had options_premium
+as the only consistent edge producer. The other six were parked but never
+removed. They're back on as of 2026-05-10 to give the dynamic Brain
+candidates to choose from across regimes.
 
 ### Brain Thresholds (from `config/settings.yaml`)
 Global gates:
@@ -126,6 +145,24 @@ Risk/capital caps:
 3. Regression tests added:
    - `tests/unit/test_ibkr_provider.py` validates ETF strike normalization behavior.
    - `tests/unit/test_swing_trading.py` adds nearest-expiry provider scenarios to verify `_find_expiry()` probing and fallback behavior.
+
+#### 2026-05-10 (Dynamic Brain + all-strategies-on)
+1. Dynamic-cadence Brain replaces the once-per-day open + midday gates:
+   - New `DailyBrain.decide_dynamic()` unifies entry decisions and close-early recommendations into one method that the orchestrator calls on a configurable cadence (`brain.cadence_minutes`, default 60) within a configurable entry window.
+   - Event triggers force out-of-cadence re-decides on regime flips and on VIX moves >= `brain.vix_delta_trigger`.
+   - Per-call selection cap threads `max_new_trades` into `_decide_impl` so cumulative selections across all cadence runs cannot exceed `max_daily_trades`.
+   - Time-of-day confidence tightening via `late_session_confidence_bump` (per hour past noon ET).
+   - Old methods kept: `decide()` / `review_midday()` still drive the classic-mode reviewer and existing tests.
+2. All 6 parked strategies re-enabled (`momentum`, `vwap_reversion`, `gap_reversal`, `pairs_trading`, `sector_rotation`, `event_driven`).
+   - Both per-strategy YAML and inline `settings.yaml` flipped to `enabled: true` (the merge is logical AND).
+   - Capital allocations sum to 95%; Brain selection + `cash_is_default` controls actual deployment.
+   - Per-strategy threshold overrides under `brain.strategy_overrides` were already in place from prior weeks; no changes needed.
+3. Regression tests added in `tests/unit/test_brain.py`:
+   - `test_decide_dynamic_caps_at_max_new_trades` — verifies per-call budget cap.
+   - `test_decide_dynamic_max_new_trades_zero_returns_no_selections` — verifies hard cumulative cap.
+   - `test_decide_dynamic_confidence_bump_rejects_borderline_candidates` — verifies time-of-day tightening.
+   - `test_decide_dynamic_halts_new_entries_at_pnl_stop` — verifies P&L kill mirrors `review_midday`.
+4. `tests/unit/test_swing_trading.py::test_disabled_strategy_not_loaded` rewritten to test the inline-override disabling **mechanism** rather than a snapshot of which strategies happened to be off.
 
 ### Strategy Toolbox
 All 7 strategies emit concrete `TradeCandidate` objects (top-ranked, max 3 per strategy).
