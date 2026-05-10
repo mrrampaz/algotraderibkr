@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 import sqlite3
 from dataclasses import dataclass
@@ -171,6 +172,7 @@ class DailyBrain:
         broker_ledger: Any | None = None,
     ) -> None:
         self._log = logger.bind(component="daily_brain")
+        self._initialized_at = datetime.now(pytz.UTC)
         self._total_capital = total_capital
         self._trade_journal = trade_journal or TradeJournal()
         self._broker_ledger = broker_ledger
@@ -244,6 +246,10 @@ class DailyBrain:
             max_contracts_hard_cap=self._max_contracts_hard_cap,
             max_overnight_exposure_pct=self._max_overnight_exposure_pct,
         )
+
+    @property
+    def max_daily_trades(self) -> int:
+        return self._max_daily_trades
 
     def decide(
         self,
@@ -339,6 +345,79 @@ class DailyBrain:
 
         return False, ""
 
+    def decide_dynamic(
+        self,
+        regime: MarketRegime | None,
+        assessments: dict[str, OpportunityAssessment],
+        current_positions: list[Position],
+        daily_pnl: float,
+        vix_level: float | None = None,
+        confidence_bump: float = 0.0,
+        max_new_trades: int | None = None,
+        include_close_recommendations: bool = True,
+    ) -> BrainDecision:
+        """Dynamic-cadence decision used by the orchestrator's repeating loop.
+
+        Differs from decide()/review_midday() in two ways:
+        1. confidence_bump tightens the entry floor as the day progresses.
+        2. max_new_trades caps selections at the remaining day-budget so
+           cumulative trades across multiple cadence runs cannot exceed
+           max_daily_trades.
+        """
+        normalized_regime = self._normalize_regime(regime)
+        close_recommendations: list[TradeRejection] = []
+
+        if include_close_recommendations:
+            for pos in current_positions:
+                synthetic = self._candidate_from_position(pos)
+                should_close, reason = self.should_close_early(
+                    synthetic, pos, normalized_regime,
+                )
+                if should_close:
+                    close_recommendations.append(
+                        TradeRejection(
+                            candidate=synthetic,
+                            reason=f"close_early:{reason}",
+                        ),
+                    )
+
+        pnl_pct = (
+            daily_pnl / self._total_capital * 100.0
+            if self._total_capital > 0 else 0.0
+        )
+        if pnl_pct <= self._midday_pnl_stop_pct:
+            reasoning = (
+                f"Daily P&L {pnl_pct:.2f}% <= stop "
+                f"{self._midday_pnl_stop_pct:.2f}%. No new entries."
+            )
+            return BrainDecision(
+                timestamp=datetime.now(pytz.UTC),
+                regime=normalized_regime,
+                selected_trades=[],
+                rejected_trades=close_recommendations,
+                cash_pct=100.0,
+                total_risk_pct=0.0,
+                reasoning=reasoning,
+            )
+
+        effective_min_confidence = min(1.0, self._min_confidence + max(0.0, confidence_bump))
+        decision = self._decide_impl(
+            regime=normalized_regime,
+            assessments=assessments,
+            current_positions=current_positions,
+            daily_pnl=daily_pnl,
+            vix_level=vix_level,
+            min_confidence=effective_min_confidence,
+            max_new_trades=max_new_trades,
+        )
+        if close_recommendations:
+            decision.rejected_trades.extend(close_recommendations)
+            decision.reasoning = (
+                f"{decision.reasoning} Close recommendations: "
+                f"{', '.join(r.candidate.symbol for r in close_recommendations)}."
+            )
+        return decision
+
     def _decide_impl(
         self,
         regime: MarketRegime,
@@ -347,6 +426,7 @@ class DailyBrain:
         daily_pnl: float,
         vix_level: float | None,
         min_confidence: float,
+        max_new_trades: int | None = None,
     ) -> BrainDecision:
         all_candidates, classic_fallback = self._collect_candidates(regime, assessments)
         active_strategy_count = len({candidate.strategy_name for candidate in all_candidates})
@@ -413,8 +493,14 @@ class DailyBrain:
         remaining_overnight_capital = self._remaining_overnight_capital(current_positions)
         risk_budget_requests: list[dict[str, Any]] = []
 
+        # Cap per-call selections at the smaller of the absolute daily limit
+        # and any caller-supplied remaining-budget (used by dynamic cadence).
+        per_call_cap = self._max_daily_trades
+        if max_new_trades is not None:
+            per_call_cap = min(per_call_cap, max(0, max_new_trades))
+
         for candidate, score in scored:
-            if len(selected) >= self._max_daily_trades:
+            if len(selected) >= per_call_cap:
                 break
 
             option_contract_cap: int | None = None
@@ -1002,17 +1088,17 @@ class DailyBrain:
                         round_trips=len(round_trips),
                         needed=5,
                     )
-                    return None
-                wins = sum(1 for rt in round_trips if rt["net_pnl"] > 0)
-                win_rate = wins / len(round_trips)
-                self._log.debug(
-                    "recent_win_rate_computed",
-                    recent_win_rate_source="broker_ledger",
-                    round_trips=len(round_trips),
-                    wins=wins,
-                    win_rate=round(win_rate, 3),
-                )
-                return win_rate
+                else:
+                    wins = sum(1 for rt in round_trips if rt["net_pnl"] > 0)
+                    win_rate = wins / len(round_trips)
+                    self._log.debug(
+                        "recent_win_rate_computed",
+                        recent_win_rate_source="broker_ledger",
+                        round_trips=len(round_trips),
+                        wins=wins,
+                        win_rate=round(win_rate, 3),
+                    )
+                    return win_rate
             except Exception:
                 self._log.debug("recent_win_rate_ledger_failed", exc_info=True)
                 # Fall through to strategy-journal path
@@ -1076,9 +1162,33 @@ class DailyBrain:
         snapshot = self._load_broker_snapshot()
         if not snapshot:
             return 0.0
+        timestamp = snapshot.get("timestamp")
+        if not isinstance(timestamp, str) or not timestamp:
+            self._log.debug("broker_snapshot_missing_timestamp_ignored")
+            return 0.0
+        try:
+            snapshot_time = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        except ValueError:
+            self._log.debug(
+                "broker_snapshot_timestamp_invalid_ignored",
+                timestamp=timestamp,
+            )
+            return 0.0
+        if snapshot_time.tzinfo is None:
+            snapshot_time = pytz.UTC.localize(snapshot_time)
+        snapshot_time = snapshot_time.astimezone(pytz.UTC)
+        if snapshot_time < self._initialized_at:
+            self._log.debug(
+                "broker_snapshot_stale_ignored",
+                snapshot_timestamp=timestamp,
+                initialized_at=self._initialized_at.isoformat(),
+            )
+            return 0.0
         value = snapshot.get("drawdown_pct", 0.0)
         if isinstance(value, (int, float)):
-            return float(value)
+            drawdown_pct = float(value)
+            if math.isfinite(drawdown_pct):
+                return max(0.0, drawdown_pct)
         return 0.0
 
     def _already_positioned(

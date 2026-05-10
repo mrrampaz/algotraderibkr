@@ -159,6 +159,26 @@ class OptionsMarkExecutor(StubExecutor):
         return f"{underlying}   {expiration.strftime('%y%m%d')}{right}{strike_code}"
 
 
+class RecordingLogger:
+    def __init__(self) -> None:
+        self.events: list[tuple[str, str, dict]] = []
+
+    def info(self, event: str, **kwargs) -> None:
+        self.events.append(("info", event, kwargs))
+
+    def warning(self, event: str, **kwargs) -> None:
+        self.events.append(("warning", event, kwargs))
+
+    def debug(self, event: str, **kwargs) -> None:
+        self.events.append(("debug", event, kwargs))
+
+    def error(self, event: str, **kwargs) -> None:
+        self.events.append(("error", event, kwargs))
+
+    def exception(self, event: str, **kwargs) -> None:
+        self.events.append(("exception", event, kwargs))
+
+
 def _regime(regime_type: RegimeType, vix: float = 18.0) -> MarketRegime:
     return MarketRegime(
         regime_type=regime_type,
@@ -385,6 +405,118 @@ def test_options_premium_entry_filters_low_live_credit_before_submit() -> None:
     assert not signals
     assert not strategy._trades
     assert executor.mleg_submissions == 0
+
+
+def test_options_premium_requires_live_credit_when_configured() -> None:
+    provider = StubDataProvider()
+    executor = OptionsMarkExecutor()
+    logger = RecordingLogger()
+    provider.set_price("SPY", 500.0)
+    provider.set_bars("SPY", "1Day", _bars_from_closes([490 + i for i in range(20)], 2_000_000))
+
+    strategy = OptionsPremiumStrategy(
+        name="options_premium",
+        config=StrategyConfig(
+            params={
+                "underlyings": ["SPY"],
+                "entry_start_hour": 0,
+                "entry_start_minute": 0,
+                "entry_end_hour": 23,
+                "entry_end_minute": 59,
+                "min_vix_proxy": 10.0,
+                "min_credit_per_contract": 10.0,
+                "min_credit_to_max_loss_ratio": 0.05,
+                "require_live_credit_estimate": True,
+            }
+        ),
+        data_provider=provider,
+        executor=executor,
+        event_bus=EventBus(),
+    )
+    strategy.set_capital(100000.0)
+    strategy._log = logger
+    strategy._get_current_price = lambda symbol: 500.0
+    strategy._get_atr = lambda symbol: 1.0
+    strategy._get_sma5_bias = lambda symbol, current_price: "bullish"
+    strategy._find_expiry = lambda underlying, min_dte=2, max_dte=5: et_now.date()
+    strategy._estimate_live_credit_per_contract = lambda **kwargs: None
+
+    et_now = datetime.now(pytz.timezone("America/New_York")).replace(
+        hour=11,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    signals = strategy._scan_entries(et_now, _regime(RegimeType.HIGH_VOL, vix=24.0))
+
+    assert not signals
+    assert not strategy._trades
+    assert executor.mleg_submissions == 0
+    assert (
+        "warning",
+        "options_live_credit_unavailable",
+        {
+            "underlying": "SPY",
+            "structure": "put_spread",
+            "contracts": 1,
+            "reason": "live_credit_unavailable",
+            "skip_reason": "live_credit_required",
+        },
+    ) in logger.events
+
+
+def test_options_premium_can_fall_back_to_modeled_credit_when_live_credit_not_required() -> None:
+    provider = StubDataProvider()
+    executor = OptionsMarkExecutor()
+    logger = RecordingLogger()
+    provider.set_price("SPY", 500.0)
+    provider.set_bars("SPY", "1Day", _bars_from_closes([490 + i for i in range(20)], 2_000_000))
+
+    strategy = OptionsPremiumStrategy(
+        name="options_premium",
+        config=StrategyConfig(
+            params={
+                "underlyings": ["SPY"],
+                "entry_start_hour": 0,
+                "entry_start_minute": 0,
+                "entry_end_hour": 23,
+                "entry_end_minute": 59,
+                "min_vix_proxy": 10.0,
+                "min_credit_per_contract": 10.0,
+                "min_credit_to_max_loss_ratio": 0.05,
+                "require_live_credit_estimate": False,
+            }
+        ),
+        data_provider=provider,
+        executor=executor,
+        event_bus=EventBus(),
+    )
+    strategy.set_capital(100000.0)
+    strategy._log = logger
+    strategy._get_current_price = lambda symbol: 500.0
+    strategy._get_atr = lambda symbol: 1.0
+    strategy._get_sma5_bias = lambda symbol, current_price: "bullish"
+    strategy._find_expiry = lambda underlying, min_dte=2, max_dte=5: et_now.date()
+    strategy._estimate_live_credit_per_contract = lambda **kwargs: None
+
+    et_now = datetime.now(pytz.timezone("America/New_York")).replace(
+        hour=11,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    signals = strategy._scan_entries(et_now, _regime(RegimeType.HIGH_VOL, vix=24.0))
+
+    assert signals
+    assert "SPY" in strategy._trades
+    assert executor.mleg_submissions == 1
+    assert any(
+        level == "info"
+        and event == "options_live_credit_unavailable"
+        and fields.get("reason") == "falling_back_to_modeled_credit_estimate"
+        for level, event, fields in logger.events
+    )
+    assert any(event == "premium_entry" for _, event, _ in logger.events)
 
 
 def test_options_premium_brain_contract_cap_override_applies_at_entry() -> None:

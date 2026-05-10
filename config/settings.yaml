@@ -109,6 +109,16 @@ strategy_selector:
     recent_loss_cooldown_hours: 4
     midday_confidence_multiplier: 1.2
     midday_pnl_stop_pct: -1.0
+    # Dynamic-cadence Brain: re-decide every cadence_minutes during the
+    # entry window, plus event-driven re-decides on regime flips and
+    # large VIX moves. late_session_confidence_bump tightens the
+    # confidence floor by this much per hour past noon ET.
+    cadence_minutes: 60
+    entry_window_start: "09:30"
+    entry_window_end: "15:30"
+    regime_change_triggers_decision: true
+    vix_delta_trigger: 1.5
+    late_session_confidence_bump: 0.05
 
   # Classic mode config (used when mode = "classic")
   min_activation_score: 0.35
@@ -131,7 +141,7 @@ strategy_selector:
 # (regime filtering). Actual deployed capital at any time should be 50-80%.
 strategies:
   pairs_trading:
-    enabled: false
+    enabled: true
     capital_allocation_pct: 25.0
     max_positions: 5
     params:
@@ -147,19 +157,19 @@ strategies:
       bar_timeframe: "5Min"
 
   gap_reversal:
-    enabled: false
+    enabled: true
     capital_allocation_pct: 12.0
     max_positions: 3
     params: {}  # Uses defaults from strategy or config/strategies/gap_reversal.yaml
 
   momentum:
-    enabled: false
+    enabled: true
     capital_allocation_pct: 15.0
     max_positions: 4
     params: {}
 
   vwap_reversion:
-    enabled: false
+    enabled: true
     capital_allocation_pct: 10.0
     max_positions: 3
     params: {}
@@ -171,13 +181,13 @@ strategies:
     params: {}
 
   sector_rotation:
-    enabled: false
+    enabled: true
     capital_allocation_pct: 10.0
     max_positions: 4
     params: {}
 
   event_driven:
-    enabled: false
+    enabled: true
     capital_allocation_pct: 8.0
     max_positions: 2
     params: {}

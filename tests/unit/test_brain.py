@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -728,6 +729,47 @@ def test_adaptive_sizing_scales_down_in_drawdown() -> None:
     assert moderate_drawdown["max_daily_risk_pct"] < no_drawdown["max_daily_risk_pct"]
 
 
+def test_current_drawdown_ignores_stale_startup_snapshot(tmp_path, monkeypatch) -> None:
+    """Cold start should not use a broker snapshot left by a prior process."""
+    monkeypatch.chdir(tmp_path)
+    state_dir = tmp_path / "data" / "state"
+    state_dir.mkdir(parents=True)
+    brain = _brain()
+    stale_timestamp = brain._initialized_at - timedelta(seconds=1)
+    (state_dir / "broker_snapshot.json").write_text(
+        json.dumps(
+            {
+                "timestamp": stale_timestamp.isoformat(),
+                "equity": 104_198.0,
+                "drawdown_pct": 100.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert brain._get_current_drawdown() == 0.0
+
+
+def test_current_drawdown_reads_fresh_broker_snapshot(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    state_dir = tmp_path / "data" / "state"
+    state_dir.mkdir(parents=True)
+    brain = _brain()
+    fresh_timestamp = brain._initialized_at + timedelta(seconds=1)
+    (state_dir / "broker_snapshot.json").write_text(
+        json.dumps(
+            {
+                "timestamp": fresh_timestamp.isoformat(),
+                "equity": 104_198.0,
+                "drawdown_pct": 2.25,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert brain._get_current_drawdown() == 2.25
+
+
 def test_brain_strategy_specific_thresholds() -> None:
     brain = _brain(
         strategy_threshold_overrides={
@@ -773,3 +815,84 @@ def test_momentum_passes_brain_at_lower_threshold() -> None:
 
     assert decision.num_trades == 1
     assert decision.selected_trades[0].candidate.symbol == "MOMO"
+
+
+def test_decide_dynamic_caps_at_max_new_trades() -> None:
+    """max_new_trades caps a single call below max_daily_trades so cumulative
+    cadence runs cannot exceed the daily budget."""
+    brain = _brain(max_daily_trades=5)
+    candidates = [
+        _candidate(symbol=f"SYM{i}", suggested_qty=50, risk_dollars=500.0)
+        for i in range(4)
+    ]
+    decision = brain.decide_dynamic(
+        regime=_regime(),
+        assessments={"momentum": OpportunityAssessment(candidates=candidates)},
+        current_positions=[],
+        daily_pnl=0.0,
+        max_new_trades=2,
+    )
+    assert decision.num_trades == 2
+
+
+def test_decide_dynamic_max_new_trades_zero_returns_no_selections() -> None:
+    """When the cumulative cap has been hit, max_new_trades=0 produces no
+    selections regardless of candidate quality."""
+    brain = _brain(max_daily_trades=5)
+    cand = _candidate(symbol="AAPL", suggested_qty=50, risk_dollars=500.0)
+    decision = brain.decide_dynamic(
+        regime=_regime(),
+        assessments={"momentum": OpportunityAssessment(candidates=[cand])},
+        current_positions=[],
+        daily_pnl=0.0,
+        max_new_trades=0,
+    )
+    assert decision.num_trades == 0
+
+
+def test_decide_dynamic_confidence_bump_rejects_borderline_candidates() -> None:
+    """A confidence_bump tightens the entry floor, which should turn a
+    borderline-pass candidate into a rejection."""
+    brain = _brain(min_confidence=0.60)
+    borderline = _candidate(
+        symbol="EDGE",
+        confidence=0.62,  # passes 0.60 but not 0.60 + 0.05 bump
+        suggested_qty=50,
+        risk_dollars=500.0,
+    )
+    decision_no_bump = brain.decide_dynamic(
+        regime=_regime(),
+        assessments={"momentum": OpportunityAssessment(candidates=[borderline])},
+        current_positions=[],
+        daily_pnl=0.0,
+        confidence_bump=0.0,
+    )
+    decision_bumped = brain.decide_dynamic(
+        regime=_regime(),
+        assessments={"momentum": OpportunityAssessment(candidates=[borderline])},
+        current_positions=[],
+        daily_pnl=0.0,
+        confidence_bump=0.05,
+    )
+    assert decision_no_bump.num_trades == 1
+    assert decision_bumped.num_trades == 0
+    assert any(
+        "low_confidence" in r.reason for r in decision_bumped.rejected_trades
+    )
+
+
+def test_decide_dynamic_halts_new_entries_at_pnl_stop() -> None:
+    """Mirrors review_midday's pnl-stop behavior: when daily P&L is below
+    the stop, the dynamic call returns no selections even with strong candidates."""
+    brain = _brain(midday_pnl_stop_pct=-1.0)
+    cand = _candidate(symbol="AAPL", suggested_qty=50, risk_dollars=500.0)
+    # daily_pnl = -1.5% of 100k capital
+    decision = brain.decide_dynamic(
+        regime=_regime(),
+        assessments={"momentum": OpportunityAssessment(candidates=[cand])},
+        current_positions=[],
+        daily_pnl=-1500.0,
+    )
+    assert decision.num_trades == 0
+    assert decision.cash_pct == 100.0
+    assert "stop" in decision.reasoning.lower()
