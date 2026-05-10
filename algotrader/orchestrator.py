@@ -163,8 +163,14 @@ class Orchestrator:
         self._reviewer: MidDayReviewer | None = None
         self._brain: DailyBrain | None = None
         self._use_brain: bool = False
-        self._last_brain_open_decision: date | None = None
-        self._last_brain_midday_review: date | None = None
+        # Dynamic-cadence Brain state. Reset at start of each ET trading day.
+        self._brain_decision_day: date | None = None
+        self._last_brain_decision_time: datetime | None = None
+        self._last_brain_regime: RegimeType | None = None
+        self._last_brain_vix: float | None = None
+        self._brain_decisions_today: int = 0
+        self._brain_trades_today: int = 0
+        self._last_assessment_signature: str | None = None
         self._expiry_guard_date: date | None = None
         self._expiry_guard_attempted_conids: set[int] = set()
         self._last_morning_position_review: date | None = None
@@ -516,59 +522,65 @@ class Orchestrator:
         # Check pending orders
         self._order_manager.check_orders()
 
-        # Daily Brain: open decision + mid-day review
+        # Daily Brain: dynamic cadence — re-decides on a fixed interval and
+        # on event triggers (regime flip, VIX delta) until daily trade cap.
         if self._use_brain and self._brain and self._current_regime:
             try:
-                if self._needs_brain_open_decision():
+                should_run, reason = self._needs_brain_decision()
+                if should_run:
+                    et_now = datetime.now(pytz.timezone("America/New_York"))
                     if self._is_overnight_exposure_limited():
-                        self._block_new_entries_for_exposure_limit(context="market_open")
+                        self._block_new_entries_for_exposure_limit(context=reason)
                     else:
-                        assessments = self._assess_all_strategies(self._current_regime)
-                        decision = self._brain.decide(
-                            regime=self._current_regime,
-                            assessments=assessments,
-                            current_positions=self._executor.get_positions(),
-                            daily_pnl=self._get_daily_pnl(),
-                            vix_level=self._current_regime.vix_level,
+                        brain_cfg = self._settings.strategy_selector.brain
+                        # Confidence tightens by late_session_confidence_bump
+                        # for every hour past noon ET.
+                        hours_past_noon = max(
+                            0.0,
+                            (et_now.hour - 12) + et_now.minute / 60.0,
                         )
-                        self._apply_brain_decision(decision, context="market_open")
-                    self._last_brain_open_decision = datetime.now(
-                        pytz.timezone("America/New_York"),
-                    ).date()
-
-                if self._needs_brain_midday_review():
-                    if self._is_overnight_exposure_limited():
-                        self._block_new_entries_for_exposure_limit(context="midday")
-                    else:
-                        assessments = self._assess_all_strategies(self._current_regime)
-                        decision = self._brain.review_midday(
-                            regime=self._current_regime,
-                            assessments=assessments,
-                            current_positions=self._executor.get_positions(),
-                            daily_pnl=self._get_daily_pnl(),
-                            vix_level=self._current_regime.vix_level,
+                        confidence_bump = (
+                            hours_past_noon * brain_cfg.late_session_confidence_bump
                         )
-                        self._apply_brain_decision(decision, context="midday")
 
-                        # Handle explicit close recommendations from the brain.
-                        for rejection in decision.rejected_trades:
-                            if not rejection.reason.startswith("close_early:"):
-                                continue
-                            symbol = rejection.candidate.symbol
-                            try:
-                                closed = self._executor.close_position(symbol)
-                                if closed:
-                                    self._log.info(
-                                        "brain_close_early_executed",
-                                        symbol=symbol,
-                                        reason=rejection.reason,
-                                    )
-                            except Exception:
-                                self._log.exception("brain_close_early_failed", symbol=symbol)
+                        assessments = self._assess_all_strategies(self._current_regime)
+                        sig = self._assessment_signature(assessments)
 
-                    self._last_brain_midday_review = datetime.now(
-                        pytz.timezone("America/New_York"),
-                    ).date()
+                        # Skip pure-cadence runs when nothing has changed.
+                        skip_no_new_info = (
+                            reason == "cadence"
+                            and sig == self._last_assessment_signature
+                            and not self._executor.get_positions()
+                        )
+                        if skip_no_new_info:
+                            self._log.debug(
+                                "brain_skip_no_new_info",
+                                signature_unchanged=True,
+                            )
+                        else:
+                            remaining = max(
+                                0,
+                                self._brain.max_daily_trades - self._brain_trades_today,
+                            )
+                            decision = self._brain.decide_dynamic(
+                                regime=self._current_regime,
+                                assessments=assessments,
+                                current_positions=self._executor.get_positions(),
+                                daily_pnl=self._get_daily_pnl(),
+                                vix_level=self._current_regime.vix_level,
+                                confidence_bump=confidence_bump,
+                                max_new_trades=remaining,
+                                include_close_recommendations=True,
+                            )
+                            self._apply_brain_decision(decision, context=reason)
+                            self._handle_brain_close_recommendations(decision)
+                            self._brain_trades_today += decision.num_trades
+                            self._last_assessment_signature = sig
+
+                    self._last_brain_decision_time = et_now
+                    self._last_brain_regime = self._current_regime.regime_type
+                    self._last_brain_vix = self._current_regime.vix_level
+                    self._brain_decisions_today += 1
             except Exception:
                 self._log.exception("brain_cycle_decision_failed")
 
@@ -1462,28 +1474,102 @@ class Orchestrator:
                     local_symbol=pos.get("local_symbol", ""),
                 )
 
-    def _needs_brain_open_decision(self) -> bool:
-        """Run one brain open decision shortly after market open each day."""
+    def _needs_brain_decision(self) -> tuple[bool, str]:
+        """Decide whether the dynamic Brain should run this cycle.
+
+        Returns (should_run, trigger_reason). Resets the per-day counters
+        on the first call of a new ET trading day.
+        """
+        if not self._current_regime:
+            return False, ""
+
         et_now = datetime.now(pytz.timezone("America/New_York"))
         today = et_now.date()
-        if self._last_brain_open_decision == today:
-            return False
+        cfg = self._settings.strategy_selector.brain
 
-        open_minutes = et_now.hour * 60 + et_now.minute
-        return open_minutes >= (9 * 60 + 30)
+        # Daily reset on new ET day.
+        if self._brain_decision_day != today:
+            self._brain_decision_day = today
+            self._last_brain_decision_time = None
+            self._last_brain_regime = None
+            self._last_brain_vix = None
+            self._brain_decisions_today = 0
+            self._brain_trades_today = 0
+            self._last_assessment_signature = None
 
-    def _needs_brain_midday_review(self) -> bool:
-        """Run one brain midday review per day at configured review time."""
-        et_now = datetime.now(pytz.timezone("America/New_York"))
-        today = et_now.date()
-        if self._last_brain_midday_review == today:
-            return False
+        # Entry window guard.
+        try:
+            start_h, start_m = (int(p) for p in cfg.entry_window_start.split(":"))
+            end_h, end_m = (int(p) for p in cfg.entry_window_end.split(":"))
+        except Exception:
+            self._log.warning("brain_entry_window_parse_failed")
+            start_h, start_m, end_h, end_m = 9, 30, 15, 30
+        minutes = et_now.hour * 60 + et_now.minute
+        if minutes < (start_h * 60 + start_m) or minutes >= (end_h * 60 + end_m):
+            return False, ""
 
-        review_hour = self._settings.strategy_selector.review_hour
-        review_minute = self._settings.strategy_selector.review_minute
-        current_minutes = et_now.hour * 60 + et_now.minute
-        review_minutes = review_hour * 60 + review_minute
-        return current_minutes >= review_minutes and et_now.hour < 16
+        # Cumulative cap across cadence runs.
+        if self._brain_trades_today >= self._brain.max_daily_trades:
+            return False, ""
+
+        # First decision of the day.
+        if self._last_brain_decision_time is None:
+            return True, "first_of_day"
+
+        # Cadence trigger.
+        elapsed_min = (et_now - self._last_brain_decision_time).total_seconds() / 60.0
+        if elapsed_min >= cfg.cadence_minutes:
+            return True, "cadence"
+
+        # Regime change trigger.
+        if (
+            cfg.regime_change_triggers_decision
+            and self._last_brain_regime is not None
+            and self._last_brain_regime != self._current_regime.regime_type
+        ):
+            return True, "regime_change"
+
+        # VIX delta trigger.
+        if (
+            self._last_brain_vix is not None
+            and self._current_regime.vix_level is not None
+            and abs(self._current_regime.vix_level - self._last_brain_vix)
+            >= cfg.vix_delta_trigger
+        ):
+            return True, "vix_delta"
+
+        return False, ""
+
+    def _assessment_signature(self, assessments: dict) -> str:
+        """Stable string signature of all candidates across strategies.
+
+        Used to skip cadence runs that bring no new information.
+        """
+        parts: list[str] = []
+        for name in sorted(assessments.keys()):
+            assessment = assessments[name]
+            for c in assessment.candidates:
+                parts.append(
+                    f"{name}:{c.symbol}:{c.confidence:.2f}:{c.risk_reward:.2f}",
+                )
+        return "|".join(parts)
+
+    def _handle_brain_close_recommendations(self, decision) -> None:
+        """Close positions the Brain flagged as close_early."""
+        for rejection in decision.rejected_trades:
+            if not rejection.reason.startswith("close_early:"):
+                continue
+            symbol = rejection.candidate.symbol
+            try:
+                closed = self._executor.close_position(symbol)
+                if closed:
+                    self._log.info(
+                        "brain_close_early_executed",
+                        symbol=symbol,
+                        reason=rejection.reason,
+                    )
+            except Exception:
+                self._log.exception("brain_close_early_failed", symbol=symbol)
 
     def _apply_brain_decision(self, decision: BrainDecision, context: str = "") -> None:
         """Apply a BrainDecision to strategy capital controls."""

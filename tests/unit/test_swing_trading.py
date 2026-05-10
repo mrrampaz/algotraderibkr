@@ -440,9 +440,19 @@ def test_orchestrator_holds_overnight(monkeypatch) -> None:
 
 
 def test_disabled_strategy_not_loaded() -> None:
-    """Strategy with enabled=false is skipped at orchestrator load."""
+    """Inline strategies override with enabled=false skips that strategy at load."""
+    settings = Settings()
+    # Force-disable a strategy that's enabled in the file config so we
+    # exercise the inline-override branch of _resolve_strategy_config.
+    settings.strategies["momentum"] = StrategyConfig(
+        enabled=False,
+        capital_allocation_pct=15.0,
+        max_positions=4,
+        params={},
+    )
+
     orch = Orchestrator.__new__(Orchestrator)
-    orch._settings = Settings()
+    orch._settings = settings
     orch._shutdown_requested = False
     orch._data_provider = StubDataProvider()
     orch._executor = StubExecutor()
@@ -454,15 +464,8 @@ def test_disabled_strategy_not_loaded() -> None:
     orch._import_strategies()
     strategies = orch._load_strategies()
 
-    assert set(strategies) == {"options_premium"}
-    assert set(orch._disabled_strategy_names) == {
-        "momentum",
-        "vwap_reversion",
-        "gap_reversal",
-        "pairs_trading",
-        "sector_rotation",
-        "event_driven",
-    }
+    assert "momentum" not in strategies
+    assert "momentum" in orch._disabled_strategy_names
 
 
 def test_orchestrator_closes_gap_reversal_at_eod(monkeypatch) -> None:

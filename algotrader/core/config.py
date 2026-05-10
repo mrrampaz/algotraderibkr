@@ -148,6 +148,14 @@ class BrainConfig(BaseModel):
     recent_loss_cooldown_hours: int = 4
     midday_confidence_multiplier: float = 1.2
     midday_pnl_stop_pct: float = -1.0
+    # Dynamic-cadence Brain: when set, the Brain re-decides multiple times
+    # per day instead of just at open + midday. Cadence and triggers below.
+    cadence_minutes: int = 60
+    entry_window_start: str = "09:30"
+    entry_window_end: str = "15:30"
+    regime_change_triggers_decision: bool = True
+    vix_delta_trigger: float = 1.5
+    late_session_confidence_bump: float = 0.05
     adaptive_sizing: bool = True
     adaptive_risk_tiers: AdaptiveRiskTiersConfig = Field(default_factory=AdaptiveRiskTiersConfig)
     drawdown_governor: DrawdownGovernorConfig = Field(default_factory=DrawdownGovernorConfig)
