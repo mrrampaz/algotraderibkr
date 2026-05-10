@@ -1,6 +1,6 @@
 """Pre-market gap detection scanner.
 
-Scans for stocks gapping >2% with volume >500K using Alpaca snapshots API.
+Scans for stocks gapping >2% with volume >500K using broker snapshot data.
 Classifies gaps as "gap_up" or "gap_down" and ranks by gap percentage.
 """
 

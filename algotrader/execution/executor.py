@@ -11,7 +11,7 @@ from algotrader.core.models import Order, OrderSide, OrderType, TimeInForce, Pos
 class Executor(Protocol):
     """Abstract execution interface.
 
-    Swap implementations (Alpaca, IBKR, paper) without changing strategy code.
+    Swap executor implementations without changing strategy code.
     """
 
     def submit_order(

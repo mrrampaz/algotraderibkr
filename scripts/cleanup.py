@@ -1,4 +1,4 @@
-"""Emergency cleanup: cancel all orders, close all positions.
+"""Emergency cleanup: cancel all orders, close all positions via IBKR.
 
 Usage: python scripts/cleanup.py --confirm
 """
@@ -24,7 +24,9 @@ def main() -> None:
         sys.exit(1)
 
     from algotrader.core.config import load_settings
-    from algotrader.execution.alpaca_executor import AlpacaExecutor
+    from algotrader.core.events import EventBus
+    from algotrader.execution.ibkr_connection import IBKRConnection
+    from algotrader.execution.ibkr_executor import IBKRExecutor
 
     settings = load_settings()
 
@@ -32,7 +34,13 @@ def main() -> None:
         print("ERROR: paper_mode is false. This script only runs in paper mode.")
         sys.exit(1)
 
-    executor = AlpacaExecutor(config=settings.alpaca)
+    event_bus = EventBus()
+    conn = IBKRConnection.get_instance(config=settings.broker.ibkr, event_bus=event_bus)
+    if not conn.connect():
+        print("ERROR: Could not connect to IBKR TWS/Gateway.")
+        sys.exit(1)
+
+    executor = IBKRExecutor(connection=conn)
 
     # Cancel all open orders
     orders = executor.get_open_orders()
@@ -62,6 +70,7 @@ def main() -> None:
     print(f"Closed {closed}/{len(positions)} positions.")
     print()
 
+    conn.disconnect()
     print("Cleanup complete.")
 
 

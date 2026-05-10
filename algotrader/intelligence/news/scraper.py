@@ -52,7 +52,7 @@ class EarningsEvent:
 class WebScraper:
     """Scraper for Finviz and Yahoo Finance.
 
-    Provides supplementary market intelligence beyond what Alpaca API offers.
+    Provides supplementary market intelligence from web sources.
     All requests use httpx with timeouts and error handling.
     """
 

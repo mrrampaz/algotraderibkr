@@ -20,14 +20,12 @@ from algotrader.core.config import Settings, StrategyConfig, load_strategy_confi
 from algotrader.core.events import EventBus, KILL_SWITCH, STRATEGY_DISABLED
 from algotrader.core.logging import setup_logging
 from algotrader.core.models import MarketRegime, OrderSide, RegimeType
-from algotrader.data.alpaca_provider import AlpacaDataProvider
 from algotrader.data.cache import DataCache
-from algotrader.execution.alpaca_executor import AlpacaExecutor
 from algotrader.execution.order_manager import OrderManager
 from algotrader.intelligence.regime import RegimeDetector
 from algotrader.intelligence.scanners.gap_scanner import GapScanner
 from algotrader.intelligence.scanners.volume_scanner import VolumeScanner
-from algotrader.intelligence.news.alpaca_news import AlpacaNewsClient
+from algotrader.intelligence.news.alpaca_news import NewsClient
 from algotrader.intelligence.calendar.events import EventCalendar
 from algotrader.risk.portfolio_risk import PortfolioRiskManager
 from algotrader.risk.position_sizer import PositionSizer
@@ -83,35 +81,29 @@ class Orchestrator:
         self._broker_ledger: BrokerLedger | None = None
 
         broker_provider = settings.broker.provider.lower()
-        if broker_provider == "ibkr":
-            from algotrader.data.ibkr_provider import IBKRDataProvider
-            from algotrader.execution.ibkr_connection import IBKRConnection
-            from algotrader.execution.ibkr_executor import IBKRExecutor
-
-            self._ibkr_conn = IBKRConnection.get_instance(
-                config=settings.broker.ibkr,
-                event_bus=self._event_bus,
-            )
-            if not self._ibkr_conn.connect():
-                raise RuntimeError("Failed to connect to IBKR TWS/Gateway")
-
-            self._data_provider = IBKRDataProvider(connection=self._ibkr_conn)
-            self._executor = IBKRExecutor(connection=self._ibkr_conn)
-            self._broker_ledger = BrokerLedger(
-                db_path="data/journal/trades.db",
-                ib=self._ibkr_conn.ib,
-            )
-            self._log.info("broker_initialized", provider="ibkr")
-        else:
-            # Data provider
-            self._data_provider = AlpacaDataProvider(
-                config=settings.alpaca,
-                feed=settings.data.feed,
+        if broker_provider != "ibkr":
+            raise RuntimeError(
+                f"Unsupported broker provider: {broker_provider!r}. Only 'ibkr' is supported."
             )
 
-            # Executor
-            self._executor = AlpacaExecutor(config=settings.alpaca)
-            self._log.info("broker_initialized", provider="alpaca")
+        from algotrader.data.ibkr_provider import IBKRDataProvider
+        from algotrader.execution.ibkr_connection import IBKRConnection
+        from algotrader.execution.ibkr_executor import IBKRExecutor
+
+        self._ibkr_conn = IBKRConnection.get_instance(
+            config=settings.broker.ibkr,
+            event_bus=self._event_bus,
+        )
+        if not self._ibkr_conn.connect():
+            raise RuntimeError("Failed to connect to IBKR TWS/Gateway")
+
+        self._data_provider = IBKRDataProvider(connection=self._ibkr_conn)
+        self._executor = IBKRExecutor(connection=self._ibkr_conn)
+        self._broker_ledger = BrokerLedger(
+            db_path="data/journal/trades.db",
+            ib=self._ibkr_conn.ib,
+        )
+        self._log.info("broker_initialized", provider="ibkr")
 
         # Order manager
         self._order_manager = OrderManager(
@@ -122,26 +114,35 @@ class Orchestrator:
         # Account info for initial capital
         account = self._executor.get_account()
         starting_equity = account.equity
-        self._log.info("account_loaded", equity=starting_equity, cash=account.cash)
+        max_cap = settings.trading.max_capital
+        self._effective_capital = (
+            starting_equity if max_cap <= 0 else min(starting_equity, max_cap)
+        )
+        self._log.info(
+            "account_loaded",
+            equity=starting_equity,
+            cash=account.cash,
+            effective_capital=self._effective_capital,
+        )
 
         # Risk management
         self._risk_manager = PortfolioRiskManager(
             config=settings.risk,
             executor=self._executor,
             event_bus=self._event_bus,
-            starting_equity=starting_equity,
+            starting_equity=self._effective_capital,
         )
 
         # Position sizer
         self._position_sizer = PositionSizer(
             config=settings.risk,
-            total_capital=starting_equity,
+            total_capital=self._effective_capital,
         )
 
         # Tracking
         self._portfolio_tracker = PortfolioTracker(
             executor=self._executor,
-            starting_equity=starting_equity,
+            starting_equity=self._effective_capital,
         )
         self._trade_journal = TradeJournal()
 
@@ -154,7 +155,7 @@ class Orchestrator:
         )
         self._gap_scanner = GapScanner(data_provider=self._data_provider)
         self._volume_scanner = VolumeScanner(data_provider=self._data_provider)
-        self._news_client = AlpacaNewsClient(data_provider=self._data_provider)
+        self._news_client = NewsClient(data_provider=self._data_provider)
         self._current_regime: MarketRegime | None = None
 
         # Strategy selector: Daily Brain (new) or classic scorer/allocator path.
@@ -189,7 +190,7 @@ class Orchestrator:
 
                     brain_cfg = settings.strategy_selector.brain
                     self._brain = DailyBrain(
-                        total_capital=starting_equity,
+                        total_capital=self._effective_capital,
                         regime_config=regime_config,
                         trade_journal=self._trade_journal,
                         event_calendar=self._event_calendar,
@@ -228,10 +229,10 @@ class Orchestrator:
                         regime_config=regime_config,
                         trade_journal=self._trade_journal,
                         event_calendar=self._event_calendar,
-                        total_capital=settings.trading.total_capital,
+                        total_capital=self._effective_capital,
                     )
                     self._allocator = CapitalAllocator(
-                        total_capital=settings.trading.total_capital,
+                        total_capital=self._effective_capital,
                         risk_config=settings.risk,
                         strategy_configs=settings.strategies,
                         min_allocation_pct=settings.strategy_selector.min_allocation_pct,
@@ -244,7 +245,7 @@ class Orchestrator:
                         allocator=self._allocator,
                         event_bus=self._event_bus,
                         strategy_configs=settings.strategies,
-                        total_capital=settings.trading.total_capital,
+                        total_capital=self._effective_capital,
                         review_hour=settings.strategy_selector.review_hour,
                         review_minute=settings.strategy_selector.review_minute,
                         scale_down_threshold_pct=settings.strategy_selector.scale_down_threshold_pct,
@@ -370,7 +371,7 @@ class Orchestrator:
 
             if strategy:
                 # Set capital allocation and trade journal
-                capital = self._settings.trading.total_capital * (config.capital_allocation_pct / 100)
+                capital = self._effective_capital * (config.capital_allocation_pct / 100)
                 strategy.set_capital(capital)
                 strategy.set_journal(self._trade_journal)
                 enabled_strategies[name] = strategy

@@ -1,10 +1,9 @@
 [project]
 name = "algotrader"
 version = "0.1.0"
-description = "Adaptive multi-strategy algorithmic trading system for Alpaca Markets"
+description = "Adaptive multi-strategy algorithmic trading system for Interactive Brokers"
 requires-python = ">=3.11"
 dependencies = [
-    "alpaca-py>=0.28.0",
     "ib_async>=2.0.1",
     "nest_asyncio>=1.6.0",
     "pandas>=2.2.0",

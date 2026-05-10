@@ -1,4 +1,4 @@
-"""Query live positions, orders, account from Alpaca.
+"""Query live positions, orders, and account from IBKR.
 
 Usage: python scripts/check_live.py
 """
@@ -17,11 +17,20 @@ load_dotenv()
 
 def main() -> None:
     from algotrader.core.config import load_settings
-    from algotrader.execution.alpaca_executor import AlpacaExecutor
+    from algotrader.core.events import EventBus
+    from algotrader.execution.ibkr_connection import IBKRConnection
+    from algotrader.execution.ibkr_executor import IBKRExecutor
     from algotrader.tracking.journal import TradeJournal
 
     settings = load_settings()
-    executor = AlpacaExecutor(config=settings.alpaca)
+    event_bus = EventBus()
+
+    conn = IBKRConnection.get_instance(config=settings.broker.ibkr, event_bus=event_bus)
+    if not conn.connect():
+        print("ERROR: Could not connect to IBKR TWS/Gateway.")
+        sys.exit(1)
+
+    executor = IBKRExecutor(connection=conn)
 
     # Account summary
     account = executor.get_account()
@@ -31,8 +40,6 @@ def main() -> None:
     print(f"  Equity:        ${account.equity:,.2f}")
     print(f"  Cash:          ${account.cash:,.2f}")
     print(f"  Buying Power:  ${account.buying_power:,.2f}")
-    print(f"  Day Trades:    {account.day_trade_count}")
-    print(f"  PDT Flag:      {account.pattern_day_trader}")
     print()
 
     # Open positions
@@ -88,6 +95,7 @@ def main() -> None:
     except Exception as e:
         print(f"  Journal unavailable: {e}")
 
+    conn.disconnect()
     print()
 
 

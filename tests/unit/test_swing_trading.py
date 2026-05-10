@@ -460,6 +460,7 @@ def test_disabled_strategy_not_loaded() -> None:
     orch._trade_journal = object()
     orch._log = _DummyLog()
     orch._disabled_strategy_names = []
+    orch._effective_capital = 100_000.0
 
     orch._import_strategies()
     strategies = orch._load_strategies()

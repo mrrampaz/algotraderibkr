@@ -1289,11 +1289,10 @@ class OptionsPremiumStrategy(StrategyBase):
         call_short_strike: float | None = None,
         call_long_strike: float | None = None,
     ) -> dict | None:
-        """Submit a credit spread or iron condor via Alpaca MLEG order.
+        """Submit a credit spread or iron condor via IBKR BAG (combo) order.
 
-        Looks up the OCC contract symbols for each leg, then submits a single
-        multi-leg market order (order_class="mleg"). Requires Level 3 options
-        approval on the Alpaca account (self-serve toggle in paper accounts).
+        Looks up the contract IDs for each leg, then submits a single
+        multi-leg BAG order. Requires options trading permissions on the IBKR account.
 
         Returns a dict with order details if a real order was placed:
             {"order_id": str, "short_occ": str, "long_occ": str,

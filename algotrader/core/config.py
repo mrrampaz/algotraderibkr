@@ -20,12 +20,12 @@ load_dotenv()
 
 class TradingConfig(BaseModel):
     paper_mode: bool = True
-    total_capital: float = 60000.0
+    max_capital: float = 0.0  # 0 = use full broker account equity
     timezone: str = "America/New_York"
 
 
 class DataConfig(BaseModel):
-    provider: str = "alpaca"
+    provider: str = "ibkr"
     feed: str = "iex"
     cycle_interval_seconds: int = 300
 
@@ -42,7 +42,7 @@ class RiskConfig(BaseModel):
 
 
 class ExecutionConfig(BaseModel):
-    broker: str = "alpaca"
+    broker: str = "ibkr"
     max_spread_pct: float = 0.3
     use_marketable_limits: bool = True
 
@@ -51,27 +51,6 @@ class LoggingConfig(BaseModel):
     level: str = "INFO"
     file: str = "data/logs/algotrader.log"
     json_format: bool = True
-
-
-class AlpacaConfig(BaseModel):
-    api_key: str = ""
-    secret_key: str = ""
-    paper: bool = True
-    base_url: str = ""
-
-    @classmethod
-    def from_env(cls) -> AlpacaConfig:
-        paper = os.getenv("ALPACA_PAPER_TRADE", "True").lower() in ("true", "1", "yes")
-        return cls(
-            api_key=os.getenv("ALPACA_API_KEY", ""),
-            secret_key=os.getenv("ALPACA_SECRET_KEY", ""),
-            paper=paper,
-            base_url=(
-                "https://paper-api.alpaca.markets"
-                if paper
-                else "https://api.alpaca.markets"
-            ),
-        )
 
 
 class IBKRConfig(BaseModel):
@@ -86,7 +65,7 @@ class IBKRConfig(BaseModel):
 
 
 class BrokerConfig(BaseModel):
-    provider: str = "alpaca"  # "alpaca" or "ibkr"
+    provider: str = "ibkr"
     ibkr: IBKRConfig = Field(default_factory=IBKRConfig)
 
 
@@ -197,7 +176,6 @@ class Settings(BaseModel):
     risk: RiskConfig = Field(default_factory=RiskConfig)
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
-    alpaca: AlpacaConfig = Field(default_factory=AlpacaConfig)
     broker: BrokerConfig = Field(default_factory=BrokerConfig)
     strategies: dict[str, StrategyConfig] = Field(default_factory=dict)
     strategy_selector: StrategySelectorConfig = Field(default_factory=StrategySelectorConfig)
@@ -211,7 +189,6 @@ class Settings(BaseModel):
             if path.exists():
                 data = load_yaml(path)
         super().__init__(**data)
-        self.alpaca = AlpacaConfig.from_env()
 
 
 # ── Loader ───────────────────────────────────────────────────────────────────
@@ -228,22 +205,13 @@ def load_yaml(path: Path | str) -> dict[str, Any]:
 
 
 def load_settings(config_path: Path | str | None = None) -> Settings:
-    """Load global settings from YAML, overlay Alpaca creds from env."""
+    """Load global settings from YAML."""
     if config_path is None:
         config_path = os.getenv("ALGOTRADER_CONFIG", "config/settings.yaml")
 
     path = Path(config_path)
-    if path.exists():
-        raw = load_yaml(path)
-    else:
-        raw = {}
-
-    settings = Settings(**raw)
-
-    # Always overlay Alpaca creds from environment
-    settings.alpaca = AlpacaConfig.from_env()
-
-    return settings
+    raw = load_yaml(path) if path.exists() else {}
+    return Settings(**raw)
 
 
 def load_strategy_config(strategy_name: str, config_dir: Path | str = "config/strategies") -> StrategyConfig:

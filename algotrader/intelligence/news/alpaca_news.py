@@ -1,8 +1,4 @@
-"""Alpaca news API client.
-
-Pulls news feed from Alpaca, categorizes by symbol and sector,
-and provides simple sentiment scoring.
-"""
+"""News client: fetches news via the DataProvider, categorizes by symbol and sector."""
 
 from __future__ import annotations
 
@@ -71,16 +67,12 @@ class CategorizedNews:
     neutral_count: int = 0
 
 
-class AlpacaNewsClient:
-    """Client for fetching and categorizing Alpaca news.
-
-    Fetches news from the Alpaca news API, scores sentiment using
-    keyword matching, and groups by symbol/sector.
-    """
+class NewsClient:
+    """Fetches news via the broker DataProvider, scores sentiment, and groups by symbol/sector."""
 
     def __init__(self, data_provider: DataProvider) -> None:
         self._data = data_provider
-        self._log = logger.bind(component="alpaca_news")
+        self._log = logger.bind(component="news_client")
 
     def fetch_news(
         self,

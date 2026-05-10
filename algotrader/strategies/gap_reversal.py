@@ -4,7 +4,7 @@ Trades stocks that gap significantly at the open. Two sub-strategies:
 - Gap-and-Go: Continue in gap direction when catalyst (news) confirms
 - Gap Fade: Fade the gap when no catalyst and gap starts to fill
 
-Uses GapScanner for candidates and AlpacaNewsClient for catalyst detection.
+Uses GapScanner for candidates and NewsClient for catalyst detection.
 """
 
 from __future__ import annotations

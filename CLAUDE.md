@@ -2,7 +2,7 @@
 
 ## What this repo is
 
-Adaptive multi-strategy swing trading system on Interactive Brokers (or Alpaca fallback) with a Daily Brain decision engine.
+Adaptive multi-strategy swing trading system on Interactive Brokers with a Daily Brain decision engine.
 The Brain evaluates concrete `TradeCandidate` objects from 7 strategies and deploys capital only into the best setups.
 Cash is the default when no candidate clears thresholds; intraday-only behavior is explicitly scoped (for example, `gap_reversal` EOD flattening and expiry-risk guards).
 
@@ -173,6 +173,21 @@ Risk/capital caps:
    - `tests/unit/test_ibkr_provider.py` validates ETF strike normalization behavior.
    - `tests/unit/test_swing_trading.py` adds nearest-expiry provider scenarios to verify `_find_expiry()` probing and fallback behavior.
 
+#### 2026-05-10 (Repo audit + Alpaca removal + dynamic capital)
+1. Alpaca fully removed:
+   - Deleted `algotrader/data/alpaca_provider.py` and `algotrader/execution/alpaca_executor.py`.
+   - Removed `AlpacaConfig` from `core/config.py` and `settings.alpaca` from `Settings`.
+   - Removed `alpaca-py` from `pyproject.toml`.
+   - `scripts/check_live.py` and `scripts/cleanup.py` ported to `IBKRExecutor`.
+   - Orchestrator now raises immediately on any `broker.provider` other than `ibkr`.
+   - `AlpacaNewsClient` renamed to `NewsClient` (class uses generic `DataProvider`, name was misleading).
+2. Dynamic capital from broker account:
+   - `trading.total_capital` (hardcoded 60000) replaced by `trading.max_capital: 0`.
+   - `0` = use full `NetLiquidation` from IBKR at startup; positive value caps trading capital.
+   - `self._effective_capital` flows into Brain, risk manager, position sizer, portfolio tracker, and all strategy capital slices.
+3. Config correctness: `data.provider` and `execution.broker` fields corrected to `"ibkr"` (they were stale `"alpaca"` and never read by the orchestrator for routing, but confusing).
+4. Deleted `architecture_plan.md` (superseded by `architecture.md`).
+
 #### 2026-05-10 (Dynamic Brain + all-strategies-on)
 1. Dynamic-cadence Brain replaces the once-per-day open + midday gates:
    - New `DailyBrain.decide_dynamic()` unifies entry decisions and close-early recommendations into one method that the orchestrator calls on a configurable cadence (`brain.cadence_minutes`, default 60) within a configurable entry window.
@@ -217,11 +232,11 @@ Observed by March 2-4 paper sessions: 3 of 7 strategies produced candidates.
 - `OpportunityAssessment` (`algotrader/strategies/base.py`): strategy opportunity summary + candidate list.
 
 ### Broker Layer
-- Broker selection: `settings.broker.provider` (`ibkr` or `alpaca`).
+- Broker: IBKR only (`settings.broker.provider: ibkr`).
 - IBKR connection: `IBKRConnection` singleton (`algotrader/execution/ibkr_connection.py`).
 - IBKR data adapter: `IBKRDataProvider` (`algotrader/data/ibkr_provider.py`).
 - IBKR executor: `IBKRExecutor` (`algotrader/execution/ibkr_executor.py`).
-- Orchestrator switches broker implementation at startup based on config.
+- Capital: loaded from `NetLiquidation` at startup. `trading.max_capital` (default `0`) caps it; `0` = use full equity.
 
 ## Week 1 Performance
 
@@ -240,8 +255,8 @@ Important context:
 ```text
 algotrader/
 |- core/                # Models, config, events, logging
-|- data/                # DataProvider protocol + Alpaca/IBKR implementations
-|- execution/           # Executor protocol + Alpaca/IBKR + order manager + IBKR connection
+|- data/                # DataProvider protocol + IBKR implementation + cache
+|- execution/           # Executor protocol + IBKR implementation + order manager + IBKR connection
 |- intelligence/        # Regime detector, scanners, calendar, news
 |- strategies/          # 7 strategy plugins (emit TradeCandidate)
 |  |- base.py           # StrategyBase + OpportunityAssessment

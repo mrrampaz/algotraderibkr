@@ -6,11 +6,11 @@
 
 ## What this system is
 
-A single-process Python trading system that runs against Interactive Brokers (paper) with an Alpaca fallback. Each cycle, every enabled strategy emits concrete `TradeCandidate` rows; the **Daily Brain** filters, scores, and ranks them across strategies and deploys capital only into the highest-EV setups. Cash is the default posture.
+A single-process Python trading system that runs against Interactive Brokers. Each cycle, every enabled strategy emits concrete `TradeCandidate` rows; the **Daily Brain** filters, scores, and ranks them across strategies and deploys capital only into the highest-EV setups. Cash is the default posture.
 
 As of 2026-05-10, **all seven strategies are enabled**. The system was previously running options-only because the original Brain only made two decisions per day (open + midday), which couldn't react to intraday regime shifts. The new **dynamic-cadence Brain** re-decides every 60 minutes during the entry window plus on event triggers (regime flip, VIX delta ≥ 1.5), making it safe to bring the parked strategies back online.
 
-Capital: $60,000 paper account. Broker: IBKR via TWS/Gateway on paper port `7497`/`4002`.
+Capital: loaded dynamically from the broker account at startup (`NetLiquidation`). Set `trading.max_capital` in `config/settings.yaml` to a positive value to cap the trading capital at that amount (e.g. `max_capital: 60000`); `0` means use the full account equity. Broker: IBKR via TWS/Gateway on paper port `7497`/`4002`.
 
 ---
 
@@ -32,8 +32,8 @@ Capital: $60,000 paper account. Broker: IBKR via TWS/Gateway on paper port `7497
 ┌───────┐  ┌──────────┐  ┌──────────────┐  ┌────────────┐  ┌──────────┐
 │ Data  │  │ Executor │  │ Intelligence │  │ Strategies │  │   Risk   │
 │Provider│  │          │  │              │  │            │  │          │
-│ IBKR/ │  │  IBKR/   │  │ • Regime     │  │ 7 plugins  │  │ Portfolio│
-│Alpaca │  │  Alpaca  │  │ • Scanners   │  │ all active │  │ + Sizer  │
+│ IBKR  │  │  IBKR    │  │ • Regime     │  │ 7 plugins  │  │ Portfolio│
+│       │  │          │  │ • Scanners   │  │ all active │  │ + Sizer  │
 └───────┘  └──────────┘  │ • News       │  └─────┬──────┘  └──────────┘
                          │ • Calendar   │        │
                          └──────────────┘        ▼
@@ -147,15 +147,12 @@ To disable a strategy: flip `enabled: false` in `config/strategies/<name>.yaml` 
 
 ## Broker layer
 
-Broker selection via `settings.broker.provider` ∈ {`ibkr`, `alpaca`}. Currently `ibkr`.
+Only IBKR is supported (`settings.broker.provider: ibkr`). The orchestrator raises at startup on any other value.
 
 ### IBKR stack
 - **Connection**: `IBKRConnection` singleton ([algotrader/execution/ibkr_connection.py](algotrader/execution/ibkr_connection.py)) — manages the `ib_async` connection, reconnect attempts, shared by data + executor.
 - **Data**: `IBKRDataProvider` ([algotrader/data/ibkr_provider.py](algotrader/data/ibkr_provider.py)) — bars, quotes, snapshots, option chains, news bridge. Persistent VIX index subscription. ETF option strike normalization snaps malformed secdef strikes to ladder increments before contract qualification.
 - **Executor**: `IBKRExecutor` ([algotrader/execution/ibkr_executor.py](algotrader/execution/ibkr_executor.py)) — equity orders, BAG multi-leg combos with explicit leg actions, option position helpers (`get_option_positions()` via `ib.portfolio()`, `close_option_position()` qualified by conId).
-
-### Alpaca stack
-Maintained as fallback for headless environments (no TWS). Same `DataProvider` / `Executor` interfaces, same strategy code runs against either.
 
 ### Broker fill ledger
 [algotrader/tracking/broker_ledger.py](algotrader/tracking/broker_ledger.py) consumes `ib_async` `execDetailsEvent` + `commissionReportEvent` and persists every fill into a `broker_fills` table in `trades.db`. **This is the source of truth** for daily P&L, Brain win-rate inputs, and position reconciliation. The strategy-internal `trades` table is preserved as a separate accounting record.
@@ -199,7 +196,7 @@ Two layers, both active at all times:
 | `intelligence/scanners/gap_scanner.py` | Pre-market gap detection |
 | `intelligence/scanners/volume_scanner.py` | Unusual-volume detection |
 | `intelligence/scanners/breakout_scanner.py` | Technical breakout detection |
-| `intelligence/news/alpaca_news.py` | Alpaca news API client |
+| `intelligence/news/alpaca_news.py` | `NewsClient` — fetches news via DataProvider, sentiment scoring |
 | `intelligence/news/scraper.py` | Web scrape (finviz/yahoo) |
 | `intelligence/calendar/events.py` | Seeded economic + earnings calendar; drives `event_day` regime flag |
 
@@ -251,8 +248,8 @@ YAML (not JSON), loaded via pydantic settings.
 algotrader/
 ├── orchestrator.py              # Lifecycle controller
 ├── core/                        # Models, config, events, logging
-├── data/                        # DataProvider + Alpaca/IBKR impls + cache
-├── execution/                   # Executor + Alpaca/IBKR impls + connection + order_manager
+├── data/                        # DataProvider protocol + IBKR impl + cache
+├── execution/                   # Executor protocol + IBKR impl + connection + order_manager
 ├── intelligence/                # Regime, scanners (gap/volume/breakout), news, calendar
 ├── strategies/                  # 7 plugins + base + registry
 ├── strategy_selector/           # brain.py (active), candidate.py, scorer/allocator (legacy), reviewer
@@ -263,7 +260,7 @@ algotrader/
 config/                          # YAML configs
 dashboard/app.py                 # Streamlit dashboard
 scripts/                         # run.py, check_live.py, cleanup.py, test_ibkr_connection.py, analyze_trades.py
-tests/unit/  tests/integration/  # pytest (93 tests passing)
+tests/unit/  tests/integration/  # pytest (98 tests passing)
 data/state/  data/logs/          # runtime state and logs (gitignored)
 ```
 

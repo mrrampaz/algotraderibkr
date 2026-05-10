@@ -14,8 +14,8 @@ from algotrader.core.models import Bar, Quote, Snapshot, MarketClock, NewsItem
 class DataProvider(Protocol):
     """Abstract data provider interface.
 
-    Swap implementations (Alpaca IEX, Alpaca SIP, IBKR) without changing
-    strategy code. All methods should handle retries internally.
+    Swap data provider implementations without changing strategy code.
+    All methods should handle retries internally.
     """
 
     def get_bars(
@@ -40,7 +40,7 @@ class DataProvider(Protocol):
             Index is datetime (UTC). Sorted ascending (oldest first).
 
         Note:
-            Alpaca returns the FIRST N bars, not the last. Implementations
+            Some providers return the FIRST N bars, not the last. Implementations
             must handle this (e.g. use .tail(limit) or pass start datetime).
         """
         ...
