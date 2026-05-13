@@ -1,5 +1,6 @@
 {
-    "python.defaultInterpreterPath": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
+    "python.defaultInterpreterPath": "C:\\algotraderibkr\\.venv\\Scripts\\python.exe",
+    "python.pythonPath": "C:\\algotraderibkr\\.venv\\Scripts\\python.exe",
     "python.terminal.activateEnvironment": true,
     "python.terminal.activateEnvInCurrentTerminal": true,
     "python.terminal.executeInFileDir": false,
@@ -8,5 +9,6 @@
     "code-runner.runInTerminal": true,
     "code-runner.executorMap": {
         "python": "\"${workspaceFolder}\\\\.venv\\\\Scripts\\\\python.exe\" -u"
-    }
+    },
+    "chatgpt.openOnStartup": false
 }

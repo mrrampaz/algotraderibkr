@@ -206,6 +206,19 @@ Risk/capital caps:
    - `test_decide_dynamic_halts_new_entries_at_pnl_stop` — verifies P&L kill mirrors `review_midday`.
 4. `tests/unit/test_swing_trading.py::test_disabled_strategy_not_loaded` rewritten to test the inline-override disabling **mechanism** rather than a snapshot of which strategies happened to be off.
 
+#### 2026-05-13 (Silent orchestrator logger fix + IBKR session conflict diagnosis)
+1. Orchestrator logger silent-drop fix:
+   - Root cause: `Orchestrator.__init__` ran `self._log = logger.bind(component="orchestrator")` BEFORE calling `setup_logging()`. With `structlog`'s `cache_logger_on_first_use=True`, the bound logger captured a no-handler config and every orchestrator log call (`brain_decision`, `cycle_error`, `brain_cycle_decision_failed`, `premarket_refresh_starting`, `morning_reconciliation`, etc.) was silently dropped from disk for the lifetime of the process.
+   - How it surfaced: on 2026-05-13 the Brain stopped firing mid-day for 3.5 hours after a midday IBKR session conflict, and the silent exception that wedged the cycle never produced a `brain_cycle_decision_failed` entry in the log — making the bug invisible until cross-referenced via indirect logs from other modules (`capital_set` from `algotrader.strategies.base`, `adaptive_risk_computed` from `algotrader.strategy_selector.brain`).
+   - Fix: moved `setup_logging()` to run before the first `logger.bind()` call in `Orchestrator.__init__` ([orchestrator.py:64](algotrader/orchestrator.py:64)). Other modules (brain, strategies, providers) were unaffected because their loggers were bound after `Orchestrator.__init__` finished and the cache was already configured.
+2. `options_premium.require_live_credit_estimate: false`:
+   - Was `true`. Strategy now falls back to modeled credit estimate when live option-chain credit cannot be fetched. Limit orders at fill protect the execution price.
+   - Tradeoff: more candidates produced; each sized on modeled (not market-observed) credit. Monitor fill quality against estimates to catch overstated edge.
+3. IBKR Error 162 / session-ownership conflict diagnosis:
+   - Symptom: "Historical Market Data Service error message: Trading TWS session is connected from a different IP address" — repeated across every `reqHistoricalData` call for every symbol. 191 occurrences observed in a single session.
+   - Despite the misleading text, this is IBKR's real session-ownership check. When the same paper account is logged in from elsewhere (mobile app, Client Portal, another TWS/Gateway install), the OTHER session becomes the "primary" trading session, and this client's historical data requests are rejected — even though order routing keeps working through the existing API socket.
+   - Mitigation: log out of the IBKR account everywhere except this server's TWS, then restart TWS to reclaim primary session ownership. The `_is_retryable_historical_error` filter already catches `"historical data"` in the error text, so retries fire automatically — but retries against the same broken session can't recover; only the session-ownership reset does.
+
 ### Strategy Toolbox
 All 7 strategies emit concrete `TradeCandidate` objects (top-ranked, max 3 per strategy).
 
@@ -316,6 +329,10 @@ grep "expiry_risk\|pre_expiry_close\|check_expiry\|closing_expiring_option\|expi
 5. Verify strategy state files and latest `brain_decision.json` timestamp are current.
 6. Verify VIX feed is live in logs.
    - `grep "vix_fetch\|ibkr_index_subscription_opened\|vix_quote_stale" data/logs/*.log | tail -20`
+7. Confirm TWS nightly behavior is set to auto-restart, not auto-logout.
+   - TWS → `Global Configuration → Lock and Exit → Auto restart`. Without it, TWS logs out around 23:45 ET and the bot cannot reconnect overnight.
+8. Confirm only this server is logged into the IBKR account.
+   - Force-quit IBKR Mobile on phone, log out of Client Portal in any browser, and stop any other TWS/Gateway installs. A second login triggers Error 162 (see IBKR Quirks #13) and silently kills historical data without breaking trading — a particularly hard failure mode to spot.
 
 ## IBKR Quirks (Live Paper Lessons)
 1. TWS or IB Gateway must already be running; bot is a client connection.
@@ -337,6 +354,14 @@ grep "expiry_risk\|pre_expiry_close\|check_expiry\|closing_expiring_option\|expi
    - `ib.portfolio()` is the reliable path used by executor helper `get_option_positions()`.
 12. Commission reality.
    - Options often cost about `$0.65-$1.05` per contract per leg.
+13. Session-ownership conflict (Error 162).
+   - Error text: "Historical Market Data Service error message: Trading TWS session is connected from a different IP address." Misleading — it is not really about the IP, it is about which login holds the trading-session lock.
+   - Triggered when the same account is logged in from another device (mobile app, Client Portal, another TWS/Gateway). Order routing keeps working through this client's socket, but `reqHistoricalData` is rejected for every contract until the conflicting session is closed and TWS is restarted to reclaim ownership.
+   - Practical impact: candidate generation silently collapses across all strategies that depend on historical bars. Brain ends up evaluating 0 candidates and cash-defaults despite tradeable market conditions.
+   - Detection: grep `data/logs/algotrader.log` for `Error 162` clustered across multiple symbols within seconds; that pattern is diagnostic.
+14. TWS nightly logout.
+   - Default TWS configuration auto-logs-out around 23:45 ET. The bot's reconnect loop will fail repeatedly until TWS is manually restarted.
+   - Switch TWS to auto-restart (`Global Configuration → Lock and Exit → Auto restart`) for overnight reliability. The bot's reconnect logic will then re-establish session shortly after TWS restarts itself.
    - Tiny credits are not tradable after fees.
 
 ## Safety Rules

@@ -31,7 +31,7 @@ params:
   min_credit_per_spread: 50.0     # Skip low-credit setups (pre-commission)
   min_credit_per_contract: 30.0   # Hard floor: $30 credit minimum per contract (0.30 option price)
   min_credit_to_max_loss_ratio: 0.05  # Credit must be at least 5% of max loss per contract
-  require_live_credit_estimate: true  # Skip entries when live option-chain credit cannot be estimated
+  require_live_credit_estimate: false  # Fall back to modeled credit estimate when live option-chain price unavailable; limit order protects fill
   max_commission_per_spread: 4.0  # Est. round-trip commission per 1-lot spread
   win_rate_credit_spread: 0.70    # Baseline win rate assumption for credit spreads
   win_rate_iron_condor: 0.72      # Baseline win rate assumption for iron condors

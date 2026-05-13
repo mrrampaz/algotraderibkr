@@ -65,14 +65,17 @@ class Orchestrator:
         self._settings = settings
         self._running = False
         self._shutdown_requested = False
-        self._log = logger.bind(component="orchestrator")
 
-        # Set up logging
+        # Set up logging BEFORE binding the orchestrator's logger so that
+        # structlog's first-use cache picks up the configured handlers
+        # (otherwise the bound logger captures a no-op config and silently
+        # drops every orchestrator log call).
         setup_logging(
             level=settings.logging.level,
             log_file=settings.logging.file,
             json_format=settings.logging.json_format,
         )
+        self._log = logger.bind(component="orchestrator")
 
         # Core components
         self._event_bus = EventBus()
