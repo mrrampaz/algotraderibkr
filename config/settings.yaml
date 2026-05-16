@@ -2,6 +2,9 @@ trading:
   paper_mode: true
   max_capital: 0  # 0 = use full broker account equity; positive value caps trading capital (e.g. 60000)
   timezone: "America/New_York"
+  # Capital reserved for the standalone single-stock tool running in a
+  # separate process. Must be >= singlestock.capital_pct below.
+  reserved_for_singlestock_pct: 20.0
 
 data:
   provider: "ibkr"
@@ -191,3 +194,61 @@ strategies:
     capital_allocation_pct: 8.0
     max_positions: 2
     params: {}
+
+# Standalone single-stock day-trading tool. Runs as its own process
+# (scripts/run_singlestock.py) with its own IBKR client_id and lockfile.
+# Trades one configurable major stock via slightly-ITM weekly options,
+# held 1-3 days, guided by 5 investigation agents (3 LLM + 2 deterministic).
+singlestock:
+  enabled: true
+  symbol: "AAPL"
+  capital_pct: 20.0           # Must be <= trading.reserved_for_singlestock_pct
+  min_conviction: 0.65
+  max_hold_days: 3
+
+  # Hard risk caps
+  max_position_premium_pct: 5.0
+  daily_loss_kill_pct: 3.0
+  max_contracts_per_trade: 5
+  exercise_exposure_cap_pct: 20.0
+
+  # Position management
+  premium_loss_close_pct: 35.0
+  premium_gain_target_pct: 50.0
+  enable_trailing_stop: true
+  intraday_check_minutes: 20
+  news_recheck_minutes: 30
+
+  # Options selection
+  target_delta: 0.70
+  min_dte: 10
+  max_dte: 14
+
+  # IBKR session
+  ibkr_client_id: 118
+
+  # PDT
+  pdt_safe_mode: false
+
+  # Blackouts
+  earnings_blackout_days: 2
+  iv_rank_max: 0.75
+
+  # LLM
+  llm_enabled: true
+  llm_model_news: "claude-sonnet-4-6"
+  llm_model_announcements: "claude-sonnet-4-6"
+  llm_model_decision: "claude-opus-4-7"
+  llm_max_calls_per_day: 10
+  llm_timeout_seconds: 60
+
+  # Schedule (ET)
+  premarket_investigate_time: "08:00"
+  entry_time: "09:35"
+  eod_review_time: "15:50"
+  expiry_day_close_time: "15:30"
+
+  # Paths
+  log_file: "data/logs/singlestock.log"
+  state_file: "data/state/singlestock.json"
+  lock_file: "data/.singlestock.lock"

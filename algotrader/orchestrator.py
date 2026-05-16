@@ -118,13 +118,22 @@ class Orchestrator:
         account = self._executor.get_account()
         starting_equity = account.equity
         max_cap = settings.trading.max_capital
-        self._effective_capital = (
-            starting_equity if max_cap <= 0 else min(starting_equity, max_cap)
-        )
+        capped = starting_equity if max_cap <= 0 else min(starting_equity, max_cap)
+
+        # Carve out the slice reserved for the standalone single-stock tool
+        # (runs in a separate process with its own client_id). Without this
+        # subtraction both processes would size against full NetLiq and
+        # buying-power can go negative under stress.
+        reserved_pct = max(0.0, float(settings.trading.reserved_for_singlestock_pct))
+        reserved_capital = capped * (reserved_pct / 100.0)
+        self._effective_capital = max(0.0, capped - reserved_capital)
         self._log.info(
             "account_loaded",
             equity=starting_equity,
             cash=account.cash,
+            capped_capital=capped,
+            reserved_for_singlestock=reserved_capital,
+            reserved_pct=reserved_pct,
             effective_capital=self._effective_capital,
         )
 
@@ -1554,7 +1563,7 @@ class Orchestrator:
             assessment = assessments[name]
             for c in assessment.candidates:
                 parts.append(
-                    f"{name}:{c.symbol}:{c.confidence:.2f}:{c.risk_reward:.2f}",
+                    f"{name}:{c.symbol}:{c.confidence:.2f}:{c.risk_reward_ratio:.2f}",
                 )
         return "|".join(parts)
 

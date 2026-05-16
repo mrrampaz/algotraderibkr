@@ -51,6 +51,16 @@ OPTION_STRIKE_INCREMENTS = {
     "SPY": 0.5,
     "QQQ": 0.5,
     "IWM": 0.5,
+    # Mega-caps targeted by the single-stock tool. Standard 1.0 strike
+    # ladders on weeklies; protects against malformed secdef offsets.
+    "AAPL": 1.0,
+    "MSFT": 1.0,
+    "NVDA": 1.0,
+    "GOOGL": 1.0,
+    "GOOG": 1.0,
+    "META": 1.0,
+    "TSLA": 1.0,
+    "AMZN": 1.0,
 }
 
 

@@ -32,6 +32,9 @@ def test_normalize_option_strikes_snaps_malformed_etf_strikes() -> None:
 
 
 def test_normalize_option_strikes_keeps_generic_underlying_unchanged() -> None:
+    # Use a symbol that is not in OPTION_STRIKE_INCREMENTS so the
+    # snap-to-increment branch is bypassed and raw strikes are returned
+    # sorted and deduplicated only.
     raw = [102.25, 100.0, 101.5]
-    normalized = IBKRDataProvider._normalize_option_strikes("AAPL", raw)
+    normalized = IBKRDataProvider._normalize_option_strikes("ZZZ", raw)
     assert normalized == [100.0, 101.5, 102.25]

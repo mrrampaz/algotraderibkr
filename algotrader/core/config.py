@@ -22,6 +22,10 @@ class TradingConfig(BaseModel):
     paper_mode: bool = True
     max_capital: float = 0.0  # 0 = use full broker account equity
     timezone: str = "America/New_York"
+    # Capital carved out for the single-stock tool running in a separate
+    # process. The main orchestrator subtracts this slice from
+    # _effective_capital so the two processes don't double-count NetLiq.
+    reserved_for_singlestock_pct: float = 0.0
 
 
 class DataConfig(BaseModel):
@@ -168,6 +172,72 @@ class StrategySelectorConfig(BaseModel):
     concentration_power: float = 2.0
 
 
+class SingleStockConfig(BaseModel):
+    """Config for the standalone single-stock day-trading tool.
+
+    The tool runs in its own process (scripts/run_singlestock.py) with its
+    own IBKR client_id and lockfile. It investigates a configurable symbol
+    each morning via 5 agents, opens at most one slightly-ITM weekly option
+    position, and manages it for up to max_hold_days.
+    """
+
+    enabled: bool = True
+    symbol: str = "AAPL"
+    # Slice of NetLiquidation this tool may use. Main bot must set
+    # trading.reserved_for_singlestock_pct >= this value to prevent
+    # buying-power double-count.
+    capital_pct: float = 20.0
+    min_conviction: float = 0.65
+    max_hold_days: int = 3
+
+    # Hard risk caps
+    max_position_premium_pct: float = 5.0
+    daily_loss_kill_pct: float = 3.0
+    max_contracts_per_trade: int = 5
+    exercise_exposure_cap_pct: float = 20.0
+
+    # Position management
+    premium_loss_close_pct: float = 35.0
+    premium_gain_target_pct: float = 50.0
+    enable_trailing_stop: bool = True
+    intraday_check_minutes: int = 20
+    news_recheck_minutes: int = 30
+
+    # Options selection
+    target_delta: float = 0.70
+    min_dte: int = 10
+    max_dte: int = 14
+
+    # IBKR session (own client_id, separate from main bot)
+    ibkr_client_id: int = 118
+
+    # PDT
+    pdt_safe_mode: bool = False
+
+    # Blackouts
+    earnings_blackout_days: int = 2
+    iv_rank_max: float = 0.75
+
+    # LLM
+    llm_enabled: bool = True
+    llm_model_news: str = "claude-sonnet-4-6"
+    llm_model_announcements: str = "claude-sonnet-4-6"
+    llm_model_decision: str = "claude-opus-4-7"
+    llm_max_calls_per_day: int = 10
+    llm_timeout_seconds: int = 60
+
+    # Schedule (ET)
+    premarket_investigate_time: str = "08:00"
+    entry_time: str = "09:35"
+    eod_review_time: str = "15:50"
+    expiry_day_close_time: str = "15:30"
+
+    # Paths
+    log_file: str = "data/logs/singlestock.log"
+    state_file: str = "data/state/singlestock.json"
+    lock_file: str = "data/.singlestock.lock"
+
+
 class Settings(BaseModel):
     """Top-level application settings."""
 
@@ -180,6 +250,7 @@ class Settings(BaseModel):
     strategies: dict[str, StrategyConfig] = Field(default_factory=dict)
     strategy_selector: StrategySelectorConfig = Field(default_factory=StrategySelectorConfig)
     alerts: AlertsConfig = Field(default_factory=AlertsConfig)
+    singlestock: SingleStockConfig = Field(default_factory=SingleStockConfig)
 
     def __init__(self, **data: Any) -> None:
         """Load config/settings.yaml by default when called with no overrides."""
